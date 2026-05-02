@@ -157,3 +157,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+CLAUDE.md
+.claude/settings.local.json
