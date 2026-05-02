@@ -23,7 +23,12 @@
 - ❌ Routing（adapter 由请求显式指定，不做 prompt → adapter 分类器）
 - ❌ Multi-modal（vision / audio 都不做，纯文本）
 - ❌ NPU backend（OpenCL only；Hexagon QNN 留 future work）
-- ❌ Heterogeneous rank batching（第一版假设池内所有 adapter 同 rank=16）
+- 🟡 ~~Heterogeneous rank batching（第一版假设池内所有 adapter 同 rank=16）~~
+       **scope cut lifted in M6 (2026-05-02)**：池内 adapter 可以是 r=8/16/32/64
+       任意混合，scheduler 自动按 adapter_id 分组（同 adapter 同 rank），M5 fused
+       kernel 把 R 当 runtime arg。R > 64 时 M5 fusion skip，自动回落到 4-op
+       chain（byte-equal 已验过）。详见 `docs/multi-lora/M6.md`。
+       仍**不做**：跨 rank 批 batching（同 batch 内不同 rank 的 adapter 一起跑）。
 - ❌ Compositional / multi-LoRA 同时激活
 - ❌ 加密 / TEE / 多租户隔离
 - ❌ 分布式 / 跨设备
