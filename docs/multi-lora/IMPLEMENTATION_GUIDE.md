@@ -980,6 +980,27 @@ adb shell cat /sys/class/power_supply/battery/uevent > $HOST_OUT/$scenario.batte
 - TTFT p99、throughput、cache hit rate 三个数字与 M3 验收时手测一致
 - 跨 scenario 对比表（手工汇总）：cache hit 高的 scenario TTFT 更低，吞吐更高
 
+#### Implementation Notes (M4, 2026-05-02)
+
+完整记录见 `docs/multi-lora/M4.md`。要点：
+
+1. **harness scope deviation**：
+   - adapter pool 用 3 个真 r=16 LoRA（reasoning / hebrew / summary），不是 spec
+     §8.3 的 10 / 30 / 50。harness 机制跟池子大小无关，做 paper 跑前再扩。
+   - duration 60 s 不是 600 s。延长只是把曲线压平，不验证 harness 正确性。
+2. **`gen_workload.py` 加 `--config FILE.yaml`**：CLI flag 覆盖 YAML 值，YAML 覆盖
+   built-in 默认。新增 dep 仅 PyYAML（matplotlib + pandas + tabulate 是现有的）。
+3. **`run_all.sh`**：device 自动选第一个 `adb devices` 但可以 `DEV=...` env 覆盖。
+   首次跑挂在 OnePlus 13（无 prior payload），用 `DEV=5ae7a43d` pin 到 OnePlus 12
+   修好。M4-paper 跑前最好多机器都铺一遍 payload 再不指定 DEV。
+4. **M4 scenarios 用 Poisson arrival，不进 byte-equality gate**——§7.4 已经写明
+   Poisson trace 跨运行 admit 顺序非确定性。M4 的 `output_dump/` 是 snapshot，不是
+   regression baseline。harness 没引入新的 bench config knob，M2/M3 的
+   deterministic-trace byte-equality 验证向前继承到 M4。
+5. **不达"hit rate 高的 scenario TTFT 更低"那条验收**——pool=3 + budget=0
+   下 3 个 scenario hit rate 都 ≥ 0.988，差异淹了；TTFT 反而被 offered load
+   主导（rate=0.1 → TTFT 1.4 s；rate=1.0 → 107 s）。要让 cache-hit 那条曲线
+   显出来需要在每个 scenario 内部再扫 budget（M3 的玩法）；M4-paper 阶段补。
 
 ---
 

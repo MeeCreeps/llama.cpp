@@ -1,0 +1,18 @@
+# M4 scenario S3: high load
+#
+# High arrival rate, mild Pareto skew (closer to uniform). Stresses
+# both batching and adapter swap amortisation.
+#
+# Spec deviation: pool 3 instead of 50, duration 60 s instead of 600 s
+# (see M4.md). 60 reqs at rate=1.0 already saturate Adreno decode.
+tokenizer: unsloth/Llama-3.2-3B-Instruct
+adapters:
+  - reasoning
+  - hebrew
+  - summary
+duration: 60.0          # spec: 600
+rate: 1.0               # ~60 reqs over 60s
+pareto-alpha: 1.2
+max-output: 32
+seed: 33
+out: workloads/m4-high_load.json

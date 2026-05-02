@@ -1,0 +1,18 @@
+# M4 scenario S2: typical
+#
+# Moderate arrival rate, moderate Pareto skew. Models a phone running
+# mixed multi-task LoRA serving. Cache miss rate should be visible but
+# small.
+#
+# Spec deviation: pool 3 instead of 30 (see M4.md).
+tokenizer: unsloth/Llama-3.2-3B-Instruct
+adapters:
+  - reasoning
+  - hebrew
+  - summary
+duration: 60.0          # spec: 600
+rate: 0.5               # ~30 reqs over 60s
+pareto-alpha: 1.5
+max-output: 32
+seed: 22
+out: workloads/m4-typical.json

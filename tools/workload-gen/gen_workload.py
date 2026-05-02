@@ -135,20 +135,62 @@ def generate(args: argparse.Namespace) -> list[dict]:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tokenizer", required=True,
+    # --config feeds defaults from a YAML; CLI flags override YAML values.
+    p.add_argument("--config", type=Path, default=None,
+                   help="optional YAML scenario file; CLI flags override YAML values")
+    p.add_argument("--tokenizer",
                    help="HF model id or local path; tokenizer must have an instruct chat_template")
-    p.add_argument("--adapters", nargs="+", required=True,
+    p.add_argument("--adapters", nargs="+",
                    help="adapter ids (matching <adapter_dir>/<id>.gguf on the device)")
-    p.add_argument("--duration", type=float, default=60.0, help="trace span in seconds (default: 60)")
-    p.add_argument("--rate", type=float, default=0.5, help="Poisson arrival rate, req/s (default: 0.5)")
-    p.add_argument("--pareto-alpha", type=float, default=1.5,
+    p.add_argument("--duration", type=float, help="trace span in seconds (default: 60)")
+    p.add_argument("--rate", type=float, help="Poisson arrival rate, req/s (default: 0.5)")
+    p.add_argument("--pareto-alpha", type=float,
                    help="adapter Pareto skew; 0 = uniform (default: 1.5)")
-    p.add_argument("--max-output", type=int, default=128, help="max decode tokens per request (default: 128)")
+    p.add_argument("--max-output", type=int, help="max decode tokens per request (default: 128)")
     p.add_argument("--prompts-file", type=Path, default=None,
                    help="optional JSON array of prompt strings; otherwise built-in pool is used")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", required=True, help="output trace JSON path")
-    args = p.parse_args()
+    p.add_argument("--seed", type=int)
+    p.add_argument("--out", help="output trace JSON path")
+    cli = p.parse_args()
+
+    # Merge YAML <- CLI. CLI wins. Unset CLI values fall back to YAML, then defaults.
+    yaml_cfg = {}
+    if cli.config is not None:
+        try:
+            import yaml
+        except ImportError:
+            sys.exit("PyYAML required for --config; pip install pyyaml")
+        with open(cli.config, "r", encoding="utf-8") as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+
+    def pick(name, default):
+        cli_val = getattr(cli, name.replace("-", "_"), None)
+        if cli_val is not None:
+            return cli_val
+        if name in yaml_cfg:
+            return yaml_cfg[name]
+        return default
+
+    args = argparse.Namespace(
+        tokenizer     = pick("tokenizer",     None),
+        adapters      = pick("adapters",      None),
+        duration      = float(pick("duration", 60.0)),
+        rate          = float(pick("rate",     0.5)),
+        pareto_alpha  = float(pick("pareto-alpha", 1.5)),
+        max_output    = int(pick("max-output", 128)),
+        prompts_file  = pick("prompts-file",  cli.prompts_file),
+        seed          = int(pick("seed", 42)),
+        out           = pick("out", None),
+    )
+
+    if not args.tokenizer:
+        sys.exit("--tokenizer (or YAML 'tokenizer') is required")
+    if not args.adapters:
+        sys.exit("--adapters (or YAML 'adapters') is required")
+    if not args.out:
+        sys.exit("--out (or YAML 'out') is required")
+    if isinstance(args.prompts_file, str):
+        args.prompts_file = Path(args.prompts_file)
 
     requests = generate(args)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

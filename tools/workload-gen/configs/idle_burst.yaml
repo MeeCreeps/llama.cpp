@@ -1,0 +1,20 @@
+# M4 scenario S1: idle-burst
+#
+# Spec section 8.3: low arrival rate, narrow Pareto pool, sharp skew.
+# Models a phone where one or two adapters dominate (e.g. always-on
+# personal assistant). Cache hit rate should be very high.
+#
+# Deviation from spec section 8.3: pool is 3 (our actual r=16 LoRA set)
+# rather than 10. M4.md notes the implication and the path to a real
+# 10-adapter pool (download more r=16 LoRAs from HF).
+tokenizer: unsloth/Llama-3.2-3B-Instruct
+adapters:
+  - reasoning
+  - hebrew
+  - summary
+duration: 60.0          # spec: 600
+rate: 0.1               # 0.1 req/s -> ~6 reqs over 60s
+pareto-alpha: 2.5
+max-output: 32
+seed: 11
+out: workloads/m4-idle_burst.json
