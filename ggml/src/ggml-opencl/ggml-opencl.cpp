@@ -453,6 +453,7 @@ struct ggml_backend_opencl_context {
     cl_program program_norm;
     cl_program program_relu;
     cl_program program_rms_norm;
+    cl_program program_lora_delta;
     cl_program program_group_norm;
     cl_program program_rope;
     cl_program program_silu;
@@ -500,6 +501,7 @@ struct ggml_backend_opencl_context {
               kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_geglu_erf_f16, kernel_geglu_quick_f16;
     cl_kernel kernel_norm, kernel_norm_mul_add;
     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+    cl_kernel kernel_lora_delta_f16_f32;
     cl_kernel kernel_l2_norm_f32;
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
@@ -1766,6 +1768,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
         CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // lora_delta (multi-LoRA M5 fused kernel: out = base + scale * (B @ (A @ x)))
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "lora_delta_f16.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("lora_delta_f16.cl");
+#endif
+        backend_ctx->program_lora_delta =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_lora_delta_f16_f32 = clCreateKernel(backend_ctx->program_lora_delta, "kernel_lora_delta_f16_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4004,6 +4022,17 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+// M5: fused LoRA delta. Replaces a 4-op chain (mul_mat A -> mul_mat B ->
+// scale -> add(base, scaled)) with one kernel. Detection key is a
+// tensor-name signature (.lora_a / .lora_b) that survives ggml_set_name
+// in src/llama-adapter.cpp. See docs/multi-lora/M5-design.md.
+static bool ggml_opencl_match_lora_delta_chain(const struct ggml_cgraph * cgraph, int node_idx);
+static void ggml_opencl_op_lora_delta_fused(ggml_backend_t backend,
+                                            const ggml_tensor * mul_mat_a,
+                                            const ggml_tensor * mul_mat_b,
+                                            const ggml_tensor * scale_node,
+                                            ggml_tensor       * add_node);
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -4036,6 +4065,16 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && ggml_opencl_match_lora_delta_chain(cgraph, i)) {
+            ggml_opencl_op_lora_delta_fused(
+                backend,
+                cgraph->nodes[i],
+                cgraph->nodes[i+1],
+                cgraph->nodes[i+2],
+                cgraph->nodes[i+3]);
+            i += 3;  // loop will i++ for the 4th
             continue;
         }
 
@@ -8472,6 +8511,124 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float)*sgs,     NULL));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// ---------- M5: fused LoRA delta op ---------- //
+
+// Returns true if the tensor's GGUF-given name ends with the given suffix.
+// Identifies LoRA A/B factors carried by name through ggml_set_name in
+// src/llama-adapter.cpp:373-374.
+static bool ggml_opencl_tensor_name_endswith(const ggml_tensor * t, const char * suffix) {
+    if (!t) return false;
+    const char * name = t->name;
+    if (!name || name[0] == '\0') return false;
+    const size_t nlen = strnlen(name, GGML_MAX_NAME);
+    const size_t slen = strlen(suffix);
+    if (nlen < slen) return false;
+    return memcmp(name + nlen - slen, suffix, slen) == 0;
+}
+
+static bool ggml_opencl_match_lora_delta_chain(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes) return false;
+
+    const ggml_tensor * mat_a = cgraph->nodes[node_idx];
+    const ggml_tensor * mat_b = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scl   = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * adn   = cgraph->nodes[node_idx + 3];
+
+    if (mat_a->op != GGML_OP_MUL_MAT) return false;
+    if (mat_b->op != GGML_OP_MUL_MAT) return false;
+    if (scl  ->op != GGML_OP_SCALE)   return false;
+    if (adn  ->op != GGML_OP_ADD)     return false;
+
+    // tensor name signatures (set by llama-adapter.cpp); preserved through
+    // mul_mat src[0]
+    if (!ggml_opencl_tensor_name_endswith(mat_a->src[0], ".lora_a")) return false;
+    if (!ggml_opencl_tensor_name_endswith(mat_b->src[0], ".lora_b")) return false;
+
+    // dependency chain: mat_b consumes mat_a, scale consumes mat_b, add
+    // has scale on either side
+    if (mat_b->src[1] != mat_a) return false;
+    if (scl->src[0]   != mat_b) return false;
+    if (adn->src[0] != scl && adn->src[1] != scl) return false;
+
+    // type constraints (v0 only supports f16 A/B with f32 x and f32 output)
+    if (mat_a->src[0]->type != GGML_TYPE_F16) return false;  // A
+    if (mat_b->src[0]->type != GGML_TYPE_F16) return false;  // B
+    if (mat_a->src[1]->type != GGML_TYPE_F32) return false;  // x
+    if (adn->type != GGML_TYPE_F32)            return false; // base / out
+
+    // R must fit the kernel's local-mem buffer (LORA_R_MAX = 64)
+    if (mat_a->src[0]->ne[1] > 64) return false;
+
+    // base must be f32 (the OTHER src of add_node)
+    const ggml_tensor * base = (adn->src[0] == scl) ? adn->src[1] : adn->src[0];
+    if (base->type != GGML_TYPE_F32) return false;
+
+    return true;
+}
+
+static void ggml_opencl_op_lora_delta_fused(ggml_backend_t backend,
+                                            const ggml_tensor * mul_mat_a,
+                                            const ggml_tensor * mul_mat_b,
+                                            const ggml_tensor * scale_node,
+                                            ggml_tensor       * add_node)
+{
+    GGML_ASSERT(mul_mat_a && mul_mat_b && scale_node && add_node);
+
+    const ggml_tensor * A    = mul_mat_a->src[0];                                                     // (H_in,  R) f16
+    const ggml_tensor * x    = mul_mat_a->src[1];                                                     // (H_in,  seq) f32
+    const ggml_tensor * B    = mul_mat_b->src[0];                                                     // (R, H_out)  f16
+    const ggml_tensor * base = (add_node->src[0] == scale_node) ? add_node->src[1] : add_node->src[0]; // (H_out, seq) f32
+    ggml_tensor       * out  = add_node;                                                              // same shape as base
+
+    GGML_ASSERT(A->extra && x->extra && B->extra && base->extra && out->extra);
+
+    auto * extra_A    = (ggml_tensor_extra_cl *)A->extra;
+    auto * extra_x    = (ggml_tensor_extra_cl *)x->extra;
+    auto * extra_B    = (ggml_tensor_extra_cl *)B->extra;
+    auto * extra_base = (ggml_tensor_extra_cl *)base->extra;
+    auto * extra_out  = (ggml_tensor_extra_cl *)out->extra;
+
+    cl_ulong offset_A    = extra_A   ->offset + A   ->view_offs;
+    cl_ulong offset_x    = extra_x   ->offset + x   ->view_offs;
+    cl_ulong offset_B    = extra_B   ->offset + B   ->view_offs;
+    cl_ulong offset_base = extra_base->offset + base->view_offs;
+    cl_ulong offset_out  = extra_out ->offset + out ->view_offs;
+
+    // ggml_scale stores a single float at op_params[0]
+    float scale = 0.0f;
+    memcpy(&scale, scale_node->op_params, sizeof(float));
+
+    const int H_in  = (int)A->ne[0];
+    const int R     = (int)A->ne[1];
+    const int H_out = (int)B->ne[1];
+    const int seq   = (int)out->ne[1];
+
+    auto * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    cl_kernel kernel = backend_ctx->kernel_lora_delta_f16_f32;
+
+    int idx = 0;
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_A->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_A));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_x->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_x));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_B->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_B));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_base->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_base));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_out->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_out));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &H_in));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &R));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &H_out));
+
+    // One workgroup per token (s); 64 lanes cooperatively compute tmp_a then loop over h_out chunks
+    size_t local_work_size[]  = { 64, 1, 1 };
+    size_t global_work_size[] = { 64, (size_t)seq, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, out);
 }
 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
