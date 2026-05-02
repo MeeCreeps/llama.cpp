@@ -320,28 +320,27 @@ python plot_results.py ../results/baseline_results.csv
 
 ## 3. llama.cpp 现状与改造点
 
-### 3.1 LoRA 现状（截至 2024 末）
+### 3.1 LoRA 现状
 
-llama.cpp 已经支持的 LoRA 操作（**注意：API 名字会变，每次 M1 / M2 起手前先 grep 确认实际签名**）：
-- 加载 adapter，返回 handle（旧名 `llama_lora_adapter_init`，可能已改 `llama_adapter_lora_init`）
-- 应用 adapter 到 context，可带 scale（旧名 `llama_lora_adapter_set`）
-- 清除当前 context 的所有 adapter（旧名 `llama_lora_adapter_clear`）
-- 多个 adapter 可以以不同 scale 叠加（additive blending）
+> ⚠️ 本节里出现的 C API 符号都已迁移。**实际签名以 `docs/multi-lora/api-versions.md`
+> 为准**——那份文件 pin 在具体 commit 上、给出真实参数表，跟下面的概念性
+> 描述配合看。本节后续 pseudocode（§1.1.2 / §5.1 / §5.3 等）也是概念草图，不是
+> 可直接 copy-paste 的代码。
 
-**Verify 流程**（M1 / M2 起手第一步）：
-```bash
-# 在 fork 根目录跑
-grep -rn "lora_adapter\|adapter_lora" include/llama.h src/llama-adapter.* | head -30
-# 找到正确的 symbol 名字，记录在 docs/multi-lora/api-versions.md
-```
+llama.cpp 当前支持的 LoRA 操作（概念层面）：
+- **加载 adapter**：`llama_adapter_lora_init(model, path)` 返回 `llama_adapter_lora *` 句柄
+- **设置 / 清空 adapter set**：`llama_set_adapters_lora(ctx, adapters[], n_adapters, scales[])`
+  *单次调用替换整个 active adapter set*；`n_adapters=0` 即清空。**不再是 `set` / `clear`
+  两个独立 API**；旧版本里"设置后会与已有 adapter 累加"的隐式语义没了。
+- **多 adapter additive blending**：通过传多个 `(adapter, scale)` 一次性激活
+- **释放**：`llama_adapter_lora_free(adapter)`
 
-**Model / Context API 同样要 verify**：
-- 旧 `llama_load_model_from_file` 可能改成 `llama_model_load_from_file`
-- 旧 `llama_new_context_with_model` 可能改成 `llama_init_from_model`
+`llama_set_adapters_lora` 内部有快速路径："如果 ctx 里当前激活的 adapter set 跟新传入
+的相同就不动"——所以 hot-cache 命中时反复传同一个 handle 是廉价操作，AdapterPool
+不必自己缓存 "currently set" 状态。
 
-如果 spec 里的 API 名字跟 master 实际不符——**先改 spec，再写代码**（§12.4）。
-
-**所以单 context 内多 adapter 应用是支持的——但是 *additive blending*，不是 *per-request dispatch*。**
+**所以单 context 内多 adapter 共存是支持的——但仍是 *additive blending*，不是
+*per-token / per-slot dispatch*。M2 group-by-adapter 调度策略由此而来。**
 
 ### 3.2 缺失的能力
 
@@ -358,7 +357,7 @@ grep -rn "lora_adapter\|adapter_lora" include/llama.h src/llama-adapter.* | head
 **最小改动原则**：
 - 第一版**不改 ggml** —— 完全用 llama.cpp 现有 LoRA API
 - **不改 OpenCL kernel** —— LoRA 在 cpu 张量上做，因为 adapter 占比小
-- 主要工作在 `examples/multi-lora-server/` 新增代码 + 极少 `llama-adapter.cpp` patch
+- 主要工作在 `examples/multi-lora-bench/` 新增代码 + 极少 `llama-adapter.cpp` patch
 
 ### 3.4 不改的边界
 
@@ -555,6 +554,30 @@ int main(int argc, char** argv) {
 - 输出对得上：每个 adapter 输出风格不同（人工抽检 5 条）
 - Cold vs hot acquire 时间能从 metric 拆出
 
+#### Implementation Notes (M1, 2026-05-02)
+
+完整记录见 `docs/multi-lora/M1.md` + `docs/multi-lora/api-versions.md`。要点：
+
+1. **API 重命名全部走 `api-versions.md`**——本节及上游 §1.1.2 / §5.1 / §5.2 / §5.3
+   伪代码里写的 `llama_lora_adapter_set/_clear/_init/_free`、`llama_load_model_from_file`、
+   `llama_token_eos(model)` 等等已经全部不存在；M1 实际代码用 `llama_set_adapters_lora`
+   (replace-semantics)、`llama_model_load_from_file`、`llama_vocab_is_eog(vocab,tok)` 等。
+2. **`AdapterPool` / `Metrics` 不要加 mutex**——CLAUDE.md 单线程 main loop。spec §5.1
+   伪代码里的 `std::mutex mu_;` 在实际实现里删掉了。
+3. **CMake 里 common 库的 target 名字是 `llama-common`，不是 `common`**——例子工程
+   要写 `target_link_libraries(... PRIVATE llama llama-common)`，否则 `<nlohmann/json.hpp>`
+   找不到。
+4. **CSV schema 加了 `acquire_ms` 一列**：spec §4.M4 的 schema
+   `id,adapter_id,arrival,first_token,finish,n_input_tokens,n_output_tokens,cache_hit`
+   不足以从 metric 拆出 cold/hot acquire 时间（§4.M1 acceptance 第五条要求的）。
+   M1 实现增加 `acquire_ms` 列（hit 时为 0，miss 时为 LoRA load + bind 总耗时）。
+   M4 的 plot/summarize 脚本届时同步更新 schema 期望。
+5. **Workload generator 的 `apply_chat_template(tokenize=True)` 返回 `BatchEncoding`
+   dict，不是 token list**（transformers 5.x）。`gen_workload.py` 显式传
+   `return_dict=False`。
+6. **adapter_id → 文件名约定** `<adapter_dir>/<id>.gguf`，但若 id 含 `/` 或以 `.gguf`
+   结尾则视为字面路径透传。文件 layout 上对外推荐 symlink 到短 id（设备端：
+   `models/lora/reasoning.gguf -> reasoning-r16-f16.gguf`）。
 
 ---
 
@@ -1102,16 +1125,24 @@ void Scheduler::finalize_and_record(Slot* slot, double now_s) {
 
 ### 5.3 Group LoRA Inference（M2 集成 llama.cpp 的 LoRA API）
 
-第一版**不写自定义 OpenCL kernel**——直接用 llama.cpp 现有 multi-adapter API：
+第一版**不写自定义 OpenCL kernel**——直接用 llama.cpp 现有 multi-adapter API（实际
+签名见 `docs/multi-lora/api-versions.md`）：
 
 ```cpp
-// 切到 batch 对应 adapter 之前，先 clear 当前
-llama_lora_adapter_clear(ctx);
-// 设置新 adapter，scale = 1.0
-llama_lora_adapter_set(ctx, adapter, 1.0f);
+// 切 active adapter set —— 一次调用替换整组，不是先 clear 再 set
+struct llama_adapter_lora * adapters[1] = { handle_for_target_id };
+float scales[1] = { 1.0f };
+llama_set_adapters_lora(ctx, adapters, 1, scales);
+
 // 然后 llama_decode 正常跑
 llama_decode(ctx, batch);
+
+// 清空（adapter 设回 base-only）：传 nullptr / 0
+llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
 ```
+
+`llama_set_adapters_lora` 自带 fast-path："如果 ctx 里当前 active set 跟传入参数完全
+一致就不动"，所以反复传同一 handle 不会做多余工作。
 
 **性能假设**：因为 batch 里所有 slot 用同一 adapter，llama.cpp 现有逻辑就能正确处理——LoRA 计算对整个 batch 生效。
 
@@ -1133,13 +1164,19 @@ llama.cpp 的 tokenizer 是 base model 自带的——adapter 不会改 tokenize
 
 ### 5.6 KV cache
 
-`llama_context` 内有 KV cache，slot-based 时每个 slot 是 *独立 sequence*：
+`llama_context` 内置 KV cache，slot-based 时每个 slot 是 *独立 sequence*。当前 API
+通过一个 `llama_memory_t` 句柄操作（旧 `llama_kv_cache_*` 全部迁到 `llama_memory_*`，
+详见 `api-versions.md`）：
+
 ```cpp
 slot[0].seq_id = 0;
 slot[1].seq_id = 1;
-// 用 llama_kv_cache_seq_rm() 清掉某个 seq 的 KV
+// 清掉某个 seq 的 KV：
+llama_memory_t mem = llama_get_memory(ctx);
+llama_memory_seq_rm(mem, /*seq_id=*/0, /*p0=*/-1, /*p1=*/-1);
 ```
-这是 llama.cpp 现有功能，不需要新写。
+
+是 llama.cpp 现有功能，不需要新写。
 
 ---
 
@@ -1314,7 +1351,9 @@ Prompt 来自 ShareGPT（400 条采样）。
 2. **OpenCL kernel cache 第一次启动慢**（~30s），不要误认为挂了。
 3. **Android `/data/local/tmp/` 没有持久化保证**，重启可能清空——加载脚本要重 push。
 4. **GGUF adapter 必须用 *相同 base model* 训练**——直接用别的 base 训的 LoRA 加载会输出乱码。
-5. **`llama_lora_adapter_set` 多次调用会累加**——记得先 `clear`。
+5. **`llama_set_adapters_lora` 是 *replace* 语义**，**不是** 旧 API 那种 set/clear-then-set
+   的累加语义——一次传整个 active set，scale 数组一一对应。N 个 adapter 同时激活就一次
+   传 N 个 handle。详见 `docs/multi-lora/api-versions.md` LoRA 一节。
 6. **Slot 内 KV cache 用错 `seq_id`** = output 互相污染。每个 slot 必须有独立 seq_id。
 7. **多线程 + llama.cpp** 不安全——所有 `llama_*` 调用串行化（用 scheduler 主线程）。
 8. **TTFT 必须在 *第一个 sample 出来的瞬间* 记录**——不要等整个请求完成再算，否则 metric 失真。在 `Scheduler::step` 里 `sample_token` 之后立刻打时间戳。
