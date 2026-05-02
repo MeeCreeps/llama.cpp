@@ -501,7 +501,8 @@ struct ggml_backend_opencl_context {
               kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_geglu_erf_f16, kernel_geglu_quick_f16;
     cl_kernel kernel_norm, kernel_norm_mul_add;
     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
-    cl_kernel kernel_lora_delta_f16_f32;
+    cl_kernel kernel_lora_a_f16_f32;
+    cl_kernel kernel_lora_b_scale_add_f16_f32;
     cl_kernel kernel_l2_norm_f32;
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
@@ -1783,7 +1784,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         backend_ctx->program_lora_delta =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_lora_delta_f16_f32 = clCreateKernel(backend_ctx->program_lora_delta, "kernel_lora_delta_f16_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_lora_a_f16_f32           = clCreateKernel(backend_ctx->program_lora_delta, "kernel_lora_a_f16_f32",           &err), err));
+        CL_CHECK((backend_ctx->kernel_lora_b_scale_add_f16_f32 = clCreateKernel(backend_ctx->program_lora_delta, "kernel_lora_b_scale_add_f16_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -8606,29 +8608,54 @@ static void ggml_opencl_op_lora_delta_fused(ggml_backend_t backend,
     const int seq   = (int)out->ne[1];
 
     auto * backend_ctx = (ggml_backend_opencl_context *)backend->context;
-    cl_kernel kernel = backend_ctx->kernel_lora_delta_f16_f32;
+    const size_t WG_SIZE = 64;
 
-    int idx = 0;
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_A->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_A));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_x->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_x));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_B->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_B));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_base->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_base));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_out->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset_out));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &H_in));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &R));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &H_out));
+    // We reuse mul_mat_a's existing GGML output buffer as the scratch for
+    // tmp_a. mul_mat_a's compute is bypassed by this fusion, but its
+    // buffer is still allocated and shaped (R, seq) f32 — exactly what
+    // kernel A wants to write.
+    auto * extra_tmp_a = (ggml_tensor_extra_cl *)mul_mat_a->extra;
+    cl_ulong offset_tmp_a = extra_tmp_a->offset + mul_mat_a->view_offs;
 
-    // One workgroup per token (s); 64 lanes cooperatively compute tmp_a then loop over h_out chunks
-    size_t local_work_size[]  = { 64, 1, 1 };
-    size_t global_work_size[] = { 64, (size_t)seq, 1 };
+    // ---- Launch A: tmp_a = A @ x ----
+    {
+        cl_kernel ka = backend_ctx->kernel_lora_a_f16_f32;
+        int idx = 0;
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_mem),   &extra_A->data_device));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_ulong), &offset_A));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_mem),   &extra_x->data_device));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_ulong), &offset_x));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_mem),   &extra_tmp_a->data_device));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(cl_ulong), &offset_tmp_a));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(int),      &H_in));
+        CL_CHECK(clSetKernelArg(ka, idx++, sizeof(int),      &R));
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, out);
+        size_t lws_a[] = { WG_SIZE, 1, 1 };
+        size_t gws_a[] = { (size_t)R * WG_SIZE, (size_t)seq, 1 };
+        backend_ctx->enqueue_ndrange_kernel(ka, 3, gws_a, lws_a, mul_mat_a);
+    }
+
+    // ---- Launch B: out = base + scale * (B @ tmp_a) ----
+    {
+        cl_kernel kb = backend_ctx->kernel_lora_b_scale_add_f16_f32;
+        int idx = 0;
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_mem),   &extra_B->data_device));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_ulong), &offset_B));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_mem),   &extra_tmp_a->data_device));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_ulong), &offset_tmp_a));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_mem),   &extra_base->data_device));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_ulong), &offset_base));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_mem),   &extra_out->data_device));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(cl_ulong), &offset_out));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(float),    &scale));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(int),      &R));
+        CL_CHECK(clSetKernelArg(kb, idx++, sizeof(int),      &H_out));
+
+        const size_t h_out_groups = ((size_t)H_out + WG_SIZE - 1) / WG_SIZE;
+        size_t lws_b[] = { WG_SIZE, 1, 1 };
+        size_t gws_b[] = { h_out_groups * WG_SIZE, (size_t)seq, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kb, 3, gws_b, lws_b, out);
+    }
 }
 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
