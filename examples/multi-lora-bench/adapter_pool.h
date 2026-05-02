@@ -3,85 +3,103 @@
 #include "llama.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <string>
 #include <unordered_map>
 
-// AdapterPool: count-based LRU cache of llama_adapter_lora handles.
+// AdapterPool: size-aware (byte-budget) LRU cache of llama_adapter_lora handles.
 //
-// M1 scope per docs/multi-lora/IMPLEMENTATION_GUIDE.md section 4 M1:
-//   - At most max_resident adapters live in the cache simultaneously.
-//   - acquire(ctx, id) loads the adapter on miss, sets it as the only active
-//     LoRA on the context, bumps the ref-count, marks it MRU, and returns
-//     the handle. The set-on-context step uses llama_set_adapters_lora,
-//     which replaces (does not stack with) any currently active LoRA.
-//   - release(id) decrements the ref-count; eviction is deferred to the
-//     next miss. Adapters with ref_count > 0 are pinned and skipped during
-//     eviction so they cannot be freed while a slot is mid-decode.
+// M3 scope (spec section 4 M3):
+//   - Constraint is total resident bytes, not count. The byte cost of an
+//     adapter is approximated as the size of its on-disk GGUF file (see
+//     known-issues.md I-2 for the rationale; this is the cheap and
+//     reproducible option).
+//   - The cache is split into two intrusive lists:
+//       lru_free_  — entries with ref_count == 0; eviction-eligible,
+//                    ordered front=MRU / back=LRU
+//       pinned_    — entries with ref_count > 0; never evicted, no order
+//     This is the I-2 fix: the M1 sketch's "splice in-use entry to MRU"
+//     trick contaminated the LRU order. Two lists keep ref_count and
+//     LRU semantics decoupled.
+//   - acquire / release move entries between the two lists at ref-count
+//     boundaries (0->1 to pinned_, 1->0 to lru_free_ MRU end).
+//   - evict_until walks lru_free_ from the back; if even after draining
+//     all free entries we still don't have room, the load proceeds and
+//     the cache temporarily exceeds max_bytes (caller is warned via stderr).
 //
-// M3 will replace max_resident (count) with max_bytes (byte budget); the
-// public surface here keeps the door open for that without forcing it now.
-//
-// Single-threaded by design: no mutex. The main loop is the sole caller
-// per CLAUDE.md "single-thread main loop is the design".
+// Single-threaded by design: no mutex. Main loop is the sole caller.
 class multilora_adapter_pool {
 public:
     struct stats_t {
-        size_t hits     = 0;
-        size_t misses   = 0;
-        size_t evicts   = 0;
-        size_t resident = 0;
+        size_t hits           = 0;
+        size_t misses         = 0;
+        size_t evicts         = 0;
+        size_t resident_count = 0;
+        size_t resident_bytes = 0;
+        // Highest current_bytes_ ever observed (useful for spotting the
+        // "budget exceeded because everything was pinned" pathology).
+        size_t peak_bytes     = 0;
     };
 
+    // max_bytes == 0 -> unbounded (no eviction); behaves like a pure
+    // load-on-demand pool. Use SIZE_MAX or any large value for the same
+    // effect — 0 is the explicit sentinel main.cpp passes when the user
+    // omits --max-adapter-mem-mb.
     multilora_adapter_pool(struct llama_model * model,
                            std::string          adapter_dir,
-                           size_t               max_resident);
+                           size_t               max_bytes);
 
     ~multilora_adapter_pool();
 
     multilora_adapter_pool(const multilora_adapter_pool &)             = delete;
     multilora_adapter_pool & operator=(const multilora_adapter_pool &) = delete;
 
-    // Result of a single acquire. Caller uses cache_hit + load_ms for metrics.
     struct acquire_result {
-        struct llama_adapter_lora * handle   = nullptr;
+        struct llama_adapter_lora * handle    = nullptr;
         bool                        cache_hit = false;
         double                      load_ms   = 0.0;  // 0 on hit
+        size_t                      bytes     = 0;    // adapter's accounted bytes
     };
 
-    // Resolve, load if needed, set as the sole active LoRA on ctx, return handle.
-    // Throws std::runtime_error on failure (file missing, init failed, OOM).
     acquire_result acquire(struct llama_context * ctx, const std::string & id);
 
-    // Decrement ref-count; entry stays resident until evicted by LRU.
     void release(const std::string & id);
 
-    // Free every cached adapter and forget all state. Call before model_free.
     void shutdown();
 
     stats_t stats() const { return stats_; }
+    double  hit_rate() const {
+        const size_t total = stats_.hits + stats_.misses;
+        return total == 0 ? 0.0 : double(stats_.hits) / double(total);
+    }
 
 private:
     struct entry {
-        std::string                 id;
-        struct llama_adapter_lora * adapter   = nullptr;
-        int                         ref_count = 0;
-        std::list<std::string>::iterator lru_it;  // position in lru_order_
+        std::string                      id;
+        struct llama_adapter_lora *      adapter   = nullptr;
+        size_t                           bytes     = 0;
+        int                              ref_count = 0;
+        bool                             in_pinned = false;
+        std::list<std::string>::iterator list_it;
     };
 
-    // Free one adapter that is not currently referenced; returns true if
-    // anything was evicted. LRU end is the eviction candidate; we walk
-    // backwards to find the first ref_count == 0 entry.
-    bool evict_one_lru();
+    void   evict_until(size_t bytes_needed);
+    void   detach_from_current_list(entry & e);
+    void   attach_to_pinned(entry & e);
+    void   attach_to_lru_free(entry & e);
 
     std::string path_for(const std::string & id) const;
+    static size_t file_bytes(const std::string & path);
 
     struct llama_model *                    model_;
     std::string                             adapter_dir_;
-    size_t                                  max_resident_;
+    size_t                                  max_bytes_;       // 0 = unbounded
 
-    std::unordered_map<std::string, entry> resident_;
-    std::list<std::string>                  lru_order_;  // front = MRU, back = LRU
+    std::unordered_map<std::string, entry>  resident_;
+    std::list<std::string>                  lru_free_;        // ref==0
+    std::list<std::string>                  pinned_;          // ref>0
 
+    size_t                                  current_bytes_ = 0;
     stats_t                                 stats_;
 };

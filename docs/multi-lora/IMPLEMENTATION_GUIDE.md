@@ -783,6 +783,30 @@ private:
 - **行为正确性**：连续访问 A → B → C 各 1 次，再访问 A（budget 容 2 个），B 应被 evict
 - **不会 evict 正在用的**：构造一个边界 case（budget = 1 个 adapter），同时有 2 个 active slot 用同一 adapter，第 3 个 adapter 来时不 evict 当前 in-use 的
 
+#### Implementation Notes (M3, 2026-05-02)
+
+完整记录见 `docs/multi-lora/M3.md`。要点：
+
+1. **`--max-resident` 删除，换成 `--max-adapter-mem-mb`**——pool ctor 直接吃 `max_bytes`，
+   `0` 是 sentinel 表示 unbounded。adapter 的 byte 估算用 `stat()` GGUF 文件大小
+   （known-issues.md I-2 里说的"option 1"，便宜可重现，f16 LoRA 上跟 in-memory 几乎一致）。
+2. **LRU 真的拆成 `pinned_` + `lru_free_` 两个 list**——M1 sketch 那种"in-use entry
+   splice 到 MRU"会污染 LRU 顺序（known-issues.md I-2 的痛点）。`acquire` ref 0→1 时
+   从 `lru_free_` 拔出来塞进 `pinned_`；`release` ref 1→0 时塞回 `lru_free_` MRU 端；
+   `evict_until` 只扫 `lru_free_` 尾。
+3. **stats_t 扩展**：增加 `resident_bytes` / `peak_bytes` / `resident_count` / `hit_rate()`，
+   以及一个新的 `<csv>.summary.json` sidecar（schema 见 M3.md），给 M4 plot/summarize 脚本吃。
+4. **预算撑不下时不 throw**——如果所有 resident 都 pinned 而新 miss 又装不下，
+   pool 会打一行 "proceeding over-budget" 警告然后正常 load。`peak_bytes` 记下高水位。
+   研究 bench 里我们要数据而不是 abort。
+5. **Hit rate vs TTFT scaling 验收，hit rate ✓ 单调（0.954 → 0.972 → 0.994），
+   TTFT 信号被 decode 时间淹没**：Adreno OpenCL decode 大概 100 ms/tok × 24 token =
+   2.4s 每请求；adapter cold load 约 80 ms。23 misses 的总 swap overhead 大概 1.8s，
+   占 wall（~180s）的 1%，淹在噪声里。要让 TTFT-vs-budget 曲线干净需要要么 max_output
+   很短，要么 adapter 更大。这是 spec scenario 设计的问题，不是 cache 实现问题。
+6. **byte-equality verification 必须用 deterministic-arrival trace**（all `arrival_time=0`）。
+   Poisson trace 跨运行 admit 顺序受 wall clock 抖动影响，会在边缘 token 上偶发分歧
+   (M3 sweep 上 1/41，对照 t=0 trace 24/24 全等)。spec §7.4 已经写明这个要求。
 
 ---
 
@@ -1323,8 +1347,22 @@ done
 所以 byte-level diff 必须 0。任何差异都说明 scheduler / cache / 后端某处实际改
 变了 forward 路径，必须查到根因再继续，不允许"差几个 byte 算了"过关。
 
-**M2 已应用并通过**：burst8 + mix3 各 8 个请求，`--n-slots=1` vs `--n-slots=8`
-共 16 个 dump 全部 byte-level MATCH。详见 `docs/multi-lora/M2.md`。
+**Trace 必须是 deterministic-arrival**：byte-equality 验证用的 trace 所有
+`arrival_time = 0`（或者足够小，确保所有请求在第一次 `step` 之前都 admit 进
+scheduler）。**Poisson 到达的 trace 不能用作 byte-equality verification**——
+原因是 main loop 的 admit 时刻读 wall clock，跨运行的几毫秒抖动会让某些 admit
+落到不同的 step 边界，进而改变 batch 组成，进而改变 KV 状态，最终在边缘 token
+上得到不同 argmax。**这是 host-clock 驱动的调度非确定性，不是 cache / scheduler
+bug**。M3 sweep 上 Poisson 跑 1/41 字节不同，all-zero-arrival 跑 24/24 全等，已
+经验证过这个区别（详见 `docs/multi-lora/M3.md`）。
+
+Poisson trace 只用于 *performance / scaling* 实验，不进 byte-equality gate。
+
+**M2 / M3 已应用并通过**：
+- M2：burst8 + mix3（都是 t=0 trace），`--n-slots=1` vs `--n-slots=8` 共 16 个
+  dump 全部 byte-level MATCH。
+- M3：m2-mix3（t=0 trace）+ budget sweep `{0, 100, 50, 30} MiB`，24 个 dump 全
+  byte-level MATCH。
 
 ---
 

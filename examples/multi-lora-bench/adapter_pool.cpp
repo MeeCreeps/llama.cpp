@@ -1,17 +1,15 @@
 #include "adapter_pool.h"
 
 #include <chrono>
+#include <cstdio>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <utility>
 
 multilora_adapter_pool::multilora_adapter_pool(struct llama_model * model,
                                                std::string          adapter_dir,
-                                               size_t               max_resident)
-    : model_(model), adapter_dir_(std::move(adapter_dir)), max_resident_(max_resident) {
-    if (max_resident_ == 0) {
-        throw std::invalid_argument("multilora_adapter_pool: max_resident must be >= 1");
-    }
-}
+                                               size_t               max_bytes)
+    : model_(model), adapter_dir_(std::move(adapter_dir)), max_bytes_(max_bytes) {}
 
 multilora_adapter_pool::~multilora_adapter_pool() {
     shutdown();
@@ -25,13 +23,12 @@ void multilora_adapter_pool::shutdown() {
         }
     }
     resident_.clear();
-    lru_order_.clear();
+    lru_free_.clear();
+    pinned_.clear();
+    current_bytes_ = 0;
 }
 
 std::string multilora_adapter_pool::path_for(const std::string & id) const {
-    // Convention: <adapter_dir>/<adapter_id>.gguf. If the id already contains
-    // a slash or ends in .gguf, treat it as a literal path so callers can
-    // pass either an id or a fully-qualified path.
     const bool has_slash = id.find('/') != std::string::npos;
     const bool has_gguf  = id.size() >= 5 && id.compare(id.size() - 5, 5, ".gguf") == 0;
     if (has_slash || has_gguf) {
@@ -46,30 +43,68 @@ std::string multilora_adapter_pool::path_for(const std::string & id) const {
     return p;
 }
 
-bool multilora_adapter_pool::evict_one_lru() {
-    // Walk LRU back-to-front; skip pinned (ref_count > 0) entries. If every
-    // resident adapter is currently in use, give up — the caller (acquire)
-    // will then exceed the cap rather than block, and stats_.evicts records
-    // 0 for this attempt.
-    for (auto it = lru_order_.rbegin(); it != lru_order_.rend(); ++it) {
-        auto entry_it = resident_.find(*it);
-        if (entry_it == resident_.end()) {
-            continue;  // stale entry; skip defensively
-        }
-        if (entry_it->second.ref_count > 0) {
+size_t multilora_adapter_pool::file_bytes(const std::string & path) {
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        return 0;
+    }
+    return static_cast<size_t>(st.st_size);
+}
+
+// list/ref movement primitives: maintain the invariant
+//     in_pinned == (ref_count > 0)
+// for every resident entry, and list_it points to the entry in whichever
+// list it currently lives.
+void multilora_adapter_pool::detach_from_current_list(entry & e) {
+    if (e.in_pinned) {
+        pinned_.erase(e.list_it);
+    } else {
+        lru_free_.erase(e.list_it);
+    }
+}
+
+void multilora_adapter_pool::attach_to_pinned(entry & e) {
+    pinned_.push_front(e.id);
+    e.list_it   = pinned_.begin();
+    e.in_pinned = true;
+}
+
+void multilora_adapter_pool::attach_to_lru_free(entry & e) {
+    // MRU end is front; new arrivals at front, evictions from back.
+    lru_free_.push_front(e.id);
+    e.list_it   = lru_free_.begin();
+    e.in_pinned = false;
+}
+
+void multilora_adapter_pool::evict_until(size_t bytes_needed) {
+    if (max_bytes_ == 0) {
+        return;  // unbounded
+    }
+    while (current_bytes_ + bytes_needed > max_bytes_ && !lru_free_.empty()) {
+        const std::string victim_id = lru_free_.back();
+        auto it = resident_.find(victim_id);
+        if (it == resident_.end()) {
+            // defensive: stale entry; drop it from the list and move on
+            lru_free_.pop_back();
             continue;
         }
-        if (entry_it->second.adapter) {
-            llama_adapter_lora_free(entry_it->second.adapter);
+        if (it->second.adapter) {
+            llama_adapter_lora_free(it->second.adapter);
         }
-        // Convert reverse iterator to forward and erase.
-        auto fwd = std::next(it).base();
-        lru_order_.erase(fwd);
-        resident_.erase(entry_it);
+        current_bytes_ -= it->second.bytes;
+        lru_free_.pop_back();
+        resident_.erase(it);
         ++stats_.evicts;
-        return true;
     }
-    return false;
+    // If we still don't fit (everything left is pinned), give up cleanly.
+    // The caller will load anyway; cache will exceed max_bytes_ until
+    // some pin releases. peak_bytes records the high-water mark.
+    if (max_bytes_ != 0 && current_bytes_ + bytes_needed > max_bytes_) {
+        std::fprintf(stderr,
+            "adapter_pool: cannot fit %zu more bytes within budget %zu (current=%zu, "
+            "all remaining entries are pinned); proceeding over-budget\n",
+            bytes_needed, max_bytes_, current_bytes_);
+    }
 }
 
 multilora_adapter_pool::acquire_result
@@ -79,67 +114,86 @@ multilora_adapter_pool::acquire(struct llama_context * ctx, const std::string & 
 
     auto it = resident_.find(id);
     if (it != resident_.end()) {
-        // Hit: move to MRU, bump ref, set on context.
         ++stats_.hits;
-        lru_order_.erase(it->second.lru_it);
-        lru_order_.push_front(id);
-        it->second.lru_it = lru_order_.begin();
-        ++it->second.ref_count;
-        result.handle    = it->second.adapter;
-        result.cache_hit = true;
-    } else {
-        // Miss: ensure room, then load.
-        ++stats_.misses;
-        while (resident_.size() >= max_resident_) {
-            if (!evict_one_lru()) {
-                break;  // every entry pinned; we'll temporarily exceed the cap
-            }
+        entry & e = it->second;
+        if (e.ref_count == 0) {
+            // Was in lru_free_; promote to pinned now that someone uses it.
+            detach_from_current_list(e);
+            attach_to_pinned(e);
         }
+        ++e.ref_count;
+        result.handle    = e.adapter;
+        result.cache_hit = true;
+        result.bytes     = e.bytes;
+    } else {
+        ++stats_.misses;
+        const std::string path  = path_for(id);
+        const size_t      bytes = file_bytes(path);
+        if (bytes == 0) {
+            throw std::runtime_error("multilora_adapter_pool::acquire: stat failed for '" + path + "'");
+        }
+        evict_until(bytes);
 
         const auto load_t0 = clock::now();
-        struct llama_adapter_lora * h = llama_adapter_lora_init(model_, path_for(id).c_str());
+        struct llama_adapter_lora * h = llama_adapter_lora_init(model_, path.c_str());
         const auto load_t1 = clock::now();
         if (!h) {
-            throw std::runtime_error("multilora_adapter_pool::acquire: llama_adapter_lora_init failed for id='" + id + "' path='" + path_for(id) + "'");
+            throw std::runtime_error("multilora_adapter_pool::acquire: llama_adapter_lora_init failed for id='" + id + "' path='" + path + "'");
         }
         result.load_ms = std::chrono::duration<double, std::milli>(load_t1 - load_t0).count();
+        result.bytes   = bytes;
 
-        lru_order_.push_front(id);
         entry e;
         e.id        = id;
         e.adapter   = h;
+        e.bytes     = bytes;
         e.ref_count = 1;
-        e.lru_it    = lru_order_.begin();
         auto inserted = resident_.emplace(id, std::move(e));
+        attach_to_pinned(inserted.first->second);
+        current_bytes_ += bytes;
+        if (current_bytes_ > stats_.peak_bytes) {
+            stats_.peak_bytes = current_bytes_;
+        }
         result.handle    = inserted.first->second.adapter;
         result.cache_hit = false;
     }
 
-    // Set this single adapter as the active set on the context. The new API
-    // is replace-semantics: passing 1 entry clears any previously-active set.
+    // Bind as the sole active LoRA on the context (replace-semantics).
     struct llama_adapter_lora * adapters[1] = { result.handle };
     float                       scales[1]   = { 1.0f };
     int rc = llama_set_adapters_lora(ctx, adapters, 1, scales);
     if (rc != 0) {
-        // Roll back the ref bump so release(id) is balanced. The adapter
-        // stays loaded — the bind-to-ctx step is what failed.
+        // Roll back the ref bump so release(id) is balanced.
         auto it2 = resident_.find(id);
-        if (it2 != resident_.end() && it2->second.ref_count > 0) {
-            --it2->second.ref_count;
+        if (it2 != resident_.end()) {
+            entry & e = it2->second;
+            if (e.ref_count > 0) {
+                --e.ref_count;
+                if (e.ref_count == 0) {
+                    detach_from_current_list(e);
+                    attach_to_lru_free(e);
+                }
+            }
         }
         throw std::runtime_error("multilora_adapter_pool::acquire: llama_set_adapters_lora returned " + std::to_string(rc));
     }
 
-    stats_.resident = resident_.size();
+    stats_.resident_count = resident_.size();
+    stats_.resident_bytes = current_bytes_;
     return result;
 }
 
 void multilora_adapter_pool::release(const std::string & id) {
     auto it = resident_.find(id);
     if (it == resident_.end()) {
-        return;  // unknown id; silent — release should be tolerant
+        return;
     }
-    if (it->second.ref_count > 0) {
-        --it->second.ref_count;
+    entry & e = it->second;
+    if (e.ref_count > 0) {
+        --e.ref_count;
+    }
+    if (e.ref_count == 0 && e.in_pinned) {
+        detach_from_current_list(e);
+        attach_to_lru_free(e);
     }
 }

@@ -46,13 +46,13 @@ struct args_t {
     std::string out_path;
     std::string output_dir;     // optional: per-request detokenized text
 
-    int  n_ctx        = 4096;
-    int  n_batch      = 512;
-    int  n_gpu_layers = 99;
-    int  max_resident = 10;
-    int  n_slots      = 4;       // M2 new: max in-flight slots
-    int  seed         = 42;
-    bool verbose      = true;
+    int  n_ctx              = 4096;
+    int  n_batch            = 512;
+    int  n_gpu_layers       = 99;
+    int  max_adapter_mem_mb = 0;   // 0 = unbounded; M3 byte budget
+    int  n_slots            = 4;
+    int  seed               = 42;
+    bool verbose            = true;
 };
 
 void print_usage(const char * argv0) {
@@ -67,7 +67,7 @@ void print_usage(const char * argv0) {
         "  -o, --out FNAME              metrics CSV output path (required)\n"
         "      --output-dir DIR         optional: dump <req_id>.txt with detokenized\n"
         "                               output for each finished request (dir must exist)\n"
-        "      --max-resident N         adapters cached simultaneously (default: 10)\n"
+        "      --max-adapter-mem-mb N   adapter cache byte budget in MiB (default: 0 = unbounded)\n"
         "      --n-slots N              max in-flight requests / batch slots (default: 4)\n"
         "  -c, --n-ctx N                context size (default: 4096)\n"
         "  -b, --n-batch N              max tokens per llama_decode (default: 512)\n"
@@ -94,7 +94,7 @@ bool parse_args(int argc, char ** argv, args_t & a) {
         else if (s == "-w" || s == "--workload")       { if (!need(i)) return false; a.workload_path = argv[++i]; }
         else if (s == "-o" || s == "--out")            { if (!need(i)) return false; a.out_path      = argv[++i]; }
         else if (s == "--output-dir")                  { if (!need(i)) return false; a.output_dir    = argv[++i]; }
-        else if (s == "--max-resident")                { if (!need(i)) return false; a.max_resident  = std::stoi(argv[++i]); }
+        else if (s == "--max-adapter-mem-mb")          { if (!need(i)) return false; a.max_adapter_mem_mb = std::stoi(argv[++i]); }
         else if (s == "--n-slots")                     { if (!need(i)) return false; a.n_slots       = std::stoi(argv[++i]); }
         else if (s == "-c" || s == "--n-ctx")          { if (!need(i)) return false; a.n_ctx         = std::stoi(argv[++i]); }
         else if (s == "-b" || s == "--n-batch")        { if (!need(i)) return false; a.n_batch       = std::stoi(argv[++i]); }
@@ -178,9 +178,9 @@ int main(int argc, char ** argv) {
                      args.model_path.c_str(), args.adapter_dir.c_str(),
                      args.workload_path.c_str(), args.out_path.c_str());
         std::fprintf(stderr,
-            "[bench] n_ctx=%d n_batch=%d ngl=%d max_resident=%d n_slots=%d seed=%d\n",
+            "[bench] n_ctx=%d n_batch=%d ngl=%d max_adapter_mem_mb=%d n_slots=%d seed=%d\n",
             args.n_ctx, args.n_batch, args.n_gpu_layers,
-            args.max_resident, args.n_slots, args.seed);
+            args.max_adapter_mem_mb, args.n_slots, args.seed);
     }
 
     ggml_backend_load_all();
@@ -229,7 +229,8 @@ int main(int argc, char ** argv) {
     struct llama_sampler * smpl = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
-    multilora_adapter_pool pool(model, args.adapter_dir, static_cast<size_t>(args.max_resident));
+    const size_t max_bytes = static_cast<size_t>(args.max_adapter_mem_mb) * 1024ull * 1024ull;
+    multilora_adapter_pool pool(model, args.adapter_dir, max_bytes);
     multilora_metrics      metrics;
 
     int    exit_code = 0;
@@ -290,10 +291,38 @@ int main(int argc, char ** argv) {
         exit_code = (exit_code == 0) ? 6 : exit_code;
     } else {
         const auto s = pool.stats();
+        const double hr = pool.hit_rate();
         std::fprintf(stderr,
-            "[bench] done. %zu metrics written to %s. cache: hit=%zu miss=%zu evict=%zu resident=%zu\n",
+            "[bench] done. %zu metrics -> %s. cache: hit=%zu miss=%zu evict=%zu "
+            "resident=%zu (%zu MiB peak %zu MiB) hit_rate=%.3f budget=%zu MiB\n",
             metrics.size(), args.out_path.c_str(),
-            s.hits, s.misses, s.evicts, s.resident);
+            s.hits, s.misses, s.evicts, s.resident_count,
+            s.resident_bytes / (1024 * 1024),
+            s.peak_bytes / (1024 * 1024),
+            hr,
+            max_bytes / (1024 * 1024));
+
+        // JSON sidecar at <csv>.summary.json — single-line pool + run summary
+        // for plot scripts (M4) and post-hoc analysis. Keys mirror stats_t
+        // plus a few derived values; keep schema flat.
+        const std::string summary_path = args.out_path + ".summary.json";
+        std::FILE * sf = std::fopen(summary_path.c_str(), "w");
+        if (sf) {
+            std::fprintf(sf,
+                "{\"hits\":%zu,\"misses\":%zu,\"evicts\":%zu,"
+                "\"resident_count\":%zu,\"resident_bytes\":%zu,"
+                "\"peak_bytes\":%zu,\"hit_rate\":%.6f,"
+                "\"budget_bytes\":%zu,\"n_slots\":%d,\"n_ctx\":%d,"
+                "\"n_requests\":%zu}\n",
+                s.hits, s.misses, s.evicts,
+                s.resident_count, s.resident_bytes,
+                s.peak_bytes, hr,
+                max_bytes, args.n_slots, args.n_ctx,
+                metrics.size());
+            std::fclose(sf);
+        } else {
+            std::fprintf(stderr, "warning: failed to write summary to %s\n", summary_path.c_str());
+        }
     }
 
     pool.shutdown();
