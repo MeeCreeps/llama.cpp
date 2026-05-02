@@ -104,8 +104,85 @@ Three concrete policies become testable from the table:
   If a workload genuinely needs r=128 with fusion, lift the cap and
   re-measure.
 
+## Adaptive-rank policy — actual wall comparison
+
+The per-rank latency curve above tells you what one rank costs. The
+real adaptive-rank question is: **if half my requests can use a low
+rank (cheap) and half need a high rank (expensive), how much wall do
+I save vs running everything at the high rank?**
+
+Setup: 8 prompts, all `arrival_time=0`, `--n-slots=4`. The first 4
+("easy" — `What is 2+2?`, `Capital of France?`, …) and the last 4
+("hard" — `Explain quantum entanglement…`, `Why is the sky blue?
+detailed reasoning.`, …) are deterministic — no router, the trace
+itself encodes the policy.
+
+Five policies on the same 8 prompts:
+
+| policy | rank choice per req | wall (s) | tok/s | saved vs uniform-high |
+|---|---|---:|---:|---:|
+| fix_r8        | all r=8                       | 23.74 | 8.00 | — |
+| fix_r64       | all r=64                      | 27.47 | 6.92 | (baseline for r=64) |
+| **adaptive**  | r=8 × 4 + r=64 × 4            | **25.85** | 7.35 | **+5.9 % vs fix_r64** |
+| fix_r128      | all r=128 (fusion declines)   | 42.90 | 4.31 | (baseline for r=128) |
+| **adaptive_wide** | r=8 × 4 + r=128 × 4       | **36.96** | 5.14 | **+13.8 % vs fix_r128** |
+
+Output token counts are identical across all five policies (190 total),
+so the wall comparison is clean — no output-length confound.
+
+### Reading the table
+
+- **adaptive vs fix_r64 = 5.9 % wall saved.** Modest, because the
+  per-token gap between r=8 and r=64 within the fusion path is only
+  ~10 % (curve is flat in `8 ≤ R ≤ 32`, gentle slope to `R = 64`).
+  Half the requests at r=8 saves ~10 % on those, halved across the
+  whole batch ≈ 5 % wall.
+- **adaptive_wide vs fix_r128 = 13.8 % wall saved.** Big jump because
+  r=128 falls out of the fused path and pays the full ~18 ms LoRA
+  tax — gap r=8 vs r=128 is ~16 ms / token. Half the requests
+  shifted off the cliff buy back substantial wall.
+
+### When does adaptive rank actually help?
+
+**Roughly: only when the cheap-to-expensive rank gap is ≥ 10 % per
+token.** That's the case for:
+
+- **r=8 vs r=128** (one side fused, the other not) — 14 % wall save
+- **r=8 vs r=64** (both fused but at different cost) — 6 % save
+- **r=8 vs r=16** — basically zero save (the fused-kernel curve is
+  flat below R = 32)
+
+So the actually-useful "adaptive" knob on this hardware is
+**"escape the fusion ceiling"**: keep most requests at r ≤ 64 to
+benefit from M5 fusion, only push the requests that genuinely
+need higher capacity to r=128+ ranks.
+
+The other adaptive direction — varying rank in the 8…32 band based
+on workload — is **not worth the routing infrastructure**, the wall
+delta is below noise.
+
+### Caveats on this comparison
+
+- 8-prompt traces; not paper-quality sample size. The `fix_r128`
+  measurement is especially noisy because most of its 42.9 s is the
+  4 r=128 requests serial-batching at +18 ms/tok, which is sensitive
+  to OS scheduling.
+- All five policies use the SAME prompts. If "easy" reqs were
+  shorter and "hard" reqs were longer, the adaptive savings would
+  differ accordingly. We didn't model that here.
+- We did NOT measure output **quality** between r=8 and r=64 — the
+  premise is that the workload owner already knows which ranks
+  they need for which requests. The "adaptive policy" is the
+  classifier; we just measured the latency consequence.
+- Routing classifier itself (deciding easy-vs-hard at admit time)
+  is spec §0.2 scope-cut; the trace pre-encodes the policy
+  decision.
+
 ## Files
 
-- `workloads/m65-{r8,reasoning,r32,r64,r128}.json` — per-rank traces
+- `workloads/m65-{r8,reasoning,r32,r64,r128}.json` — per-rank latency traces
+- `workloads/m65b-{fix_r8,fix_r64,fix_r128,adaptive,adaptive_wide}.json`
+  — adaptive-policy traces
 - `results/M6.5/m65/{r8,reasoning,r32,r64,r128}_{off,on}.csv` — bench output
+- `results/M6.5b/m65b/*.csv` — adaptive-policy bench output
 - `results/M6.5/latency_vs_rank.png` — the plot
