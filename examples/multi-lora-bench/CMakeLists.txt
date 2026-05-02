@@ -4,6 +4,7 @@ add_executable(${TARGET}
     main.cpp
     adapter_pool.cpp
     metrics.cpp
+    scheduler.cpp
 )
 
 target_link_libraries(${TARGET} PRIVATE

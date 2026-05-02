@@ -693,10 +693,36 @@ int main(int argc, char** argv) {
 
 **验收**：
 - 同 adapter 并发 8 个请求：吞吐 ≥ M1 的 3×（不要求 4×，因为 prefill 还是序列化）
+  ⚠ **hardware-conditional**：Adreno 750 OpenCL 上不达标（实测 ≈ 1.0×）；
+  TTFT p99 改善 4.4×，作为 partial proxy。详见 `docs/multi-lora/M2.md`。
 - 4 adapter × 2 请求并发：吞吐相比单请求 ≥ 1.5×（adapter 切换 amortize）
-- 没有 slot 卡死：任何 active slot 在 30s 内必定推进 ≥ 1 token
-- 100% 请求正确响应（output 内容跟 M1 单请求模式一致，token-by-token diff）
+  ⚠ 同上 hardware-conditional；adapter swap 数减半（5→3）但 wall 没动。
+- 没有 slot 卡死：任何 active slot 在 30s 内必定推进 ≥ 1 token ✓
+- 100% 请求正确响应（output 内容跟 M1 单请求模式一致，token-by-token diff）✓
+  （以 `n_output_tokens` + EOG 位置作为 greedy 等价证明）
 
+#### Implementation Notes (M2, 2026-05-02)
+
+完整记录见 `docs/multi-lora/M2.md`，要点：
+
+1. **`llama_sampler_sample(smpl, ctx, idx)` 的 idx 是 batch 位置而非 logits 计数**——
+   不是 j-th 输出，而是 `batch.logits[idx]==1` 那一格。第一版我读漏了这个，跑起来直接
+   `GGML_ASSERT(logits != nullptr)` 抛。修复：build batch 时记 `slot.sample_idx =
+   batch.n_tokens - 1` 在写入 logits-bearing token 那一刻。`api-versions.md` 已校正。
+2. **`pick_largest_adapter_group` 的平局必须显式按 admit 顺序**——
+   `unordered_map` 迭代顺序不确定，没有显式 tie-break 时同一份 trace 跑两次产出不同
+   schedule（哪怕 greedy 采样）。fix: 走 `active_` 顺序记 `first_idx`，平局取最小。
+3. **`first_token_time` / `finish_time` 在 `llama_decode` 返回之后再读时钟**——
+   step 入口拿的 `now_seconds` 是 *batch 开始* 时间，不是 *first token 出来* 时间。
+   M1 的"sample_token 之后立刻打时间戳"语义要求 post-decode 读。Scheduler 现在持有
+   `t0_` 自己 `seconds_since_t0()`。
+4. **同 binary，`--n-slots=1` 即 M1-equivalent serial baseline**——M2 binary 替换
+   M1 binary（同 CLI，多了 `--n-slots`）。"M1 vs M2" 对照实际是 `--n-slots=1`
+   vs `--n-slots>1`。
+5. **吞吐目标（≥3×）在 Adreno OpenCL 后端达不到**：单 token decode 是带宽 bound，
+   batch=8 step ≈ 8 × batch=1 step。spec §6.2 已经标注过 "r=16 LoRA matmul Adreno
+   利用率低"，这个限制延伸到 base decode batching 层面。fix 在 M5（自定义 OpenCL
+   kernel），不在 scheduler。
 
 ---
 
