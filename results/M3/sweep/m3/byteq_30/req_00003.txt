@@ -1,0 +1,3 @@
+Here are five tips for writing clear code:
+
+1. **Use Meaningful Variable Names**: Choose variable names that accurately describe the data they hold. Avoid using single

@@ -1,0 +1,3 @@
+RAM (Random Access Memory) and ROM (Read-Only Memory) are two types of memory used in computers to store data.
+
+**RAM (Random Access Memory

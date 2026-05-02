@@ -1,0 +1,20 @@
+=== high_load.csv ===
+  requests:      58
+  wall time:     304.72 s
+  total in tok:  2645
+  total out tok: 1796
+  throughput:    req/s=0.19  tok/s=5.89
+
+  TTFT  mean=106639.4ms  p50=95614.1ms  p99=244991.9ms
+  TPOT  mean=387.8ms  p50=227.9ms  p99=770.7ms
+  e2e   mean=118275.2ms  p50=100861.3ms  p99=247898.5ms
+
+  cache  hit=821  miss=3  evict=0
+         hit_rate=0.9964
+         budget=0 MiB (0=unbounded)  peak=139 MiB  resident_count=3
+  config n_slots=4  n_ctx=4096
+
+  per-adapter:
+    hebrew         n= 14  ttft=109597.1ms  tpot= 341.1ms  out_tok= 32.0
+    reasoning      n= 37  ttft=98423.9ms  tpot= 444.5ms  out_tok= 30.4
+    summary        n=  7  ttft=144148.7ms  tpot= 181.3ms  out_tok= 32.0

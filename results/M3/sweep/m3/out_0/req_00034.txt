@@ -1,0 +1,1 @@
+1. Use clear and descriptive variable names. This will help other developers understand the purpose of your code and make it easier

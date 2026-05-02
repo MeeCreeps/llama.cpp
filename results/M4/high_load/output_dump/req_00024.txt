@@ -1,0 +1,1 @@
+Imagine you have a triangle with two shorter sides, let's call them A and B. The third side, which is the longest side, is called C.

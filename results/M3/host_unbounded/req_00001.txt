@@ -1,0 +1,4 @@
+RAM (Random Access Memory) and ROM (Read-Only Memory) are two types of memory technologies used in computers.
+
+**RAM (Random Access Memory):**
+

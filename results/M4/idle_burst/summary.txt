@@ -1,0 +1,19 @@
+=== idle_burst.csv ===
+  requests:      7
+  wall time:     66.07 s
+  total in tok:  351
+  total out tok: 224
+  throughput:    req/s=0.11  tok/s=3.39
+
+  TTFT  mean=1413.5ms  p50=920.3ms  p99=3827.8ms
+  TPOT  mean=188.4ms  p50=99.1ms  p99=338.2ms
+  e2e   mean=7252.4ms  p50=6917.0ms  p99=11323.2ms
+
+  cache  hit=160  miss=2  evict=0
+         hit_rate=0.9877
+         budget=0 MiB (0=unbounded)  peak=92 MiB  resident_count=2
+  config n_slots=4  n_ctx=4096
+
+  per-adapter:
+    hebrew         n=  1  ttft= 3983.8ms  tpot=  94.6ms  out_tok= 32.0
+    reasoning      n=  6  ttft=  985.1ms  tpot= 204.0ms  out_tok= 32.0

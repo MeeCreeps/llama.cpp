@@ -1,0 +1,1 @@
+To find when the two trains meet, we need to consider their relative speed and the distance between them. Here's the

@@ -157,9 +157,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
-CLAUDE.md
 .claude/settings.local.json
-results/
-docs/
-workloads/
-CLAUDE.md
+.claude/scheduled_tasks.lock

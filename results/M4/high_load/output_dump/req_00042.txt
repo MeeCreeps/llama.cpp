@@ -1,0 +1,1 @@
+To find when the two trains meet, we need to consider the distance they cover and the time it takes for them to meet. Here's the step-by-step

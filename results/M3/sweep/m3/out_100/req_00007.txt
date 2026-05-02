@@ -1,0 +1,1 @@
+RAM (Random Access Memory) and ROM (Read-Only Memory) are two types of computer memory that serve different purposes

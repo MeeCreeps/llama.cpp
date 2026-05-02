@@ -1,0 +1,1 @@
+{"hits":143,"misses":4,"evicts":3,"resident_count":1,"resident_bytes":48654624,"peak_bytes":48654624,"hit_rate":0.972789,"budget_bytes":52428800,"n_slots":4,"n_ctx":4096,"n_requests":5}

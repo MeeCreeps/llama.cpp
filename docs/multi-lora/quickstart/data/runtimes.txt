@@ -1,0 +1,28 @@
+Demo runtimes — OnePlus 12 (Snapdragon 8 Gen 3, Adreno 750, OpenCL 3.0)
+
+Trace: 5 requests, 3 LoRA adapters (reasoning, hebrew, summary),
+       max_output=24, arrival_time=0 for all.
+
+  vanilla per-process (5 × llama-completion --lora ...):
+      105.0 s   (≈ 21.0 s / req)
+
+  ours (multi-lora-bench --n-slots=4 --max-adapter-mem-mb 0):
+       34.0 s   (≈  6.8 s / req)
+
+  speedup: 3.09×
+
+Where the savings come from:
+  - vanilla pays model load (~1.7 GB GGUF mmap) + OpenCL backend init
+    + kernel cache reload PER request → ~3–4 s × 5 = ~15–20 s overhead
+  - ours pays it once at startup
+  - ours batches the two reasoning requests that arrive together
+    (req_00000 + req_00003) into a single decode step
+  - ours hits its adapter cache on req_00004 (reasoning already
+    resident) → acquire_ms = 0 vs ~80 ms cold load
+
+Per-request breakdown for ours (from ours.csv):
+  req_00000 reasoning  ttft=1.89s finish=6.56s  MISS  acquire=162ms
+  req_00003 reasoning  ttft=1.89s finish=6.56s  (same step as req_00000)
+  req_00001 hebrew     ttft=7.58s finish=9.76s  MISS  acquire=170ms
+  req_00002 summary    ttft=10.79s finish=13.00s  MISS  acquire=179ms
+  req_00004 reasoning  ttft=13.90s finish=16.07s  HIT   acquire=  0ms

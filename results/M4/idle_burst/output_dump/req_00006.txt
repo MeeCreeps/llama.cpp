@@ -1,0 +1,3 @@
+Weather and climate are two related but distinct concepts in the field of meteorology.
+
+**Weather** refers to the short-term and local conditions of the atmosphere at a

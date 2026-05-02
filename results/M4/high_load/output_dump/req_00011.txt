@@ -1,0 +1,2 @@
+So, you know how we can make triangles with sticks and blocks, right? And sometimes we want to know how long the longest side of the triangle is.
+
