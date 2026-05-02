@@ -44,6 +44,7 @@ struct args_t {
     std::string adapter_dir;
     std::string workload_path;
     std::string out_path;
+    std::string output_dir;     // optional: per-request detokenized text
 
     int  n_ctx        = 4096;
     int  n_batch      = 512;
@@ -64,6 +65,8 @@ void print_usage(const char * argv0) {
         "  -a, --adapter-dir DIR        directory holding <id>.gguf adapters (required)\n"
         "  -w, --workload FNAME         pre-tokenized trace JSON (required)\n"
         "  -o, --out FNAME              metrics CSV output path (required)\n"
+        "      --output-dir DIR         optional: dump <req_id>.txt with detokenized\n"
+        "                               output for each finished request (dir must exist)\n"
         "      --max-resident N         adapters cached simultaneously (default: 10)\n"
         "      --n-slots N              max in-flight requests / batch slots (default: 4)\n"
         "  -c, --n-ctx N                context size (default: 4096)\n"
@@ -90,6 +93,7 @@ bool parse_args(int argc, char ** argv, args_t & a) {
         else if (s == "-a" || s == "--adapter-dir")    { if (!need(i)) return false; a.adapter_dir   = argv[++i]; }
         else if (s == "-w" || s == "--workload")       { if (!need(i)) return false; a.workload_path = argv[++i]; }
         else if (s == "-o" || s == "--out")            { if (!need(i)) return false; a.out_path      = argv[++i]; }
+        else if (s == "--output-dir")                  { if (!need(i)) return false; a.output_dir    = argv[++i]; }
         else if (s == "--max-resident")                { if (!need(i)) return false; a.max_resident  = std::stoi(argv[++i]); }
         else if (s == "--n-slots")                     { if (!need(i)) return false; a.n_slots       = std::stoi(argv[++i]); }
         else if (s == "-c" || s == "--n-ctx")          { if (!need(i)) return false; a.n_ctx         = std::stoi(argv[++i]); }
@@ -237,6 +241,9 @@ int main(int argc, char ** argv) {
                                  static_cast<size_t>(args.n_slots),
                                  static_cast<int32_t>(args.n_batch),
                                  t0);
+    if (!args.output_dir.empty()) {
+        sched.set_output_dir(args.output_dir);
+    }
 
     while (next_idx < requests.size() || sched.active_count() > 0) {
         const double now = seconds_since(t0);

@@ -1286,6 +1286,46 @@ integration_tests/
 
 每个 milestone 验收时跑 `run_milestone_M{i}.sh`，输出 `results/M{i}.csv` 和 `results/M{i}.png`。结果不达标不进入下一 milestone。
 
+### 7.4 内容等价验证（M2 起，强制）
+
+**原则**：每个新 milestone 上线 / 每次新 config 引入（n_slots、max_resident、
+max_bytes …）都必须证明**生成内容字节级一致**，不能拿 `n_output_tokens` /
+EOG 位置当 proxy 收工。
+
+**机制**：`multi-lora-bench` 自带 `--output-dir DIR` flag，每个 finalize 的请求
+detokenize 后写到 `<dir>/<req_id>.txt`。验证流程：
+
+```bash
+# baseline 配置
+multi-lora-bench ... --n-slots 1 --output-dir results/M{i}/out_baseline ...
+# 新配置
+multi-lora-bench ... --n-slots 8 --output-dir results/M{i}/out_new      ...
+
+# 字节级比对
+for f in results/M{i}/out_baseline/*.txt; do
+  cmp -s "$f" "results/M{i}/out_new/$(basename $f)" \
+    && echo "$(basename $f) MATCH" \
+    || (echo "$(basename $f) DIFFER"; diff "$f" "results/M{i}/out_new/$(basename $f)" | head)
+done
+```
+
+**baseline 选取规则**：当前 milestone 的"最简 / 最串行"配置。具体：
+
+| Milestone | baseline 配置 | 对照配置 |
+|---|---|---|
+| M2 | `--n-slots 1` | `--n-slots 8` |
+| M3 | `--max-resident 大`（cache 全装下，不 evict） | `--max-resident 紧`（频繁 evict） |
+| M4 | M3 通过的配置 | scenario YAML 跑出来的配置 |
+| M5 | OpenCL 标准 LoRA path | 自定义 multi-LoRA kernel |
+
+**全等不等价 → milestone 不收**。 greedy 采样 + 同 prompt + 同 KV 数学
+（feed 同样的 token 在同样的 position）⇒ 同 logits ⇒ 同 argmax ⇒ 同 token，
+所以 byte-level diff 必须 0。任何差异都说明 scheduler / cache / 后端某处实际改
+变了 forward 路径，必须查到根因再继续，不允许"差几个 byte 算了"过关。
+
+**M2 已应用并通过**：burst8 + mix3 各 8 个请求，`--n-slots=1` vs `--n-slots=8`
+共 16 个 dump 全部 byte-level MATCH。详见 `docs/multi-lora/M2.md`。
+
 ---
 
 ## 8. 评估协议（最终 paper 跑的 scenario）

@@ -140,6 +140,31 @@ void multilora_scheduler::finalize_and_record(multilora_slot * s, double now_s) 
     m.acquire_ms       = s->acquire_ms;
     metrics_->record(std::move(m));
 
+    // Optional: dump detokenized output text for byte-level cross-config
+    // diff (see docs/multi-lora/IMPLEMENTATION_GUIDE.md section 9
+    // verification policy).
+    if (!output_dir_.empty()) {
+        std::string text;
+        text.reserve(8 * s->output.size());
+        char buf[256];
+        for (llama_token tok : s->output) {
+            const int n = llama_token_to_piece(vocab_, tok, buf, sizeof(buf),
+                                               /*lstrip=*/0, /*special=*/false);
+            if (n > 0) {
+                text.append(buf, static_cast<size_t>(n));
+            }
+        }
+        const std::string path = output_dir_ + "/" + s->req.id + ".txt";
+        std::FILE * f = std::fopen(path.c_str(), "wb");
+        if (f) {
+            std::fwrite(text.data(), 1, text.size(), f);
+            std::fclose(f);
+        } else {
+            std::fprintf(stderr, "scheduler: failed to open '%s' for output dump\n",
+                         path.c_str());
+        }
+    }
+
     // Free this slot's KV so the next admit on the same seq_id starts clean.
     llama_memory_t mem = llama_get_memory(ctx_);
     llama_memory_seq_rm(mem, s->seq_id, -1, -1);

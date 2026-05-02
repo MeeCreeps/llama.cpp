@@ -43,6 +43,12 @@ public:
                         int32_t                                         n_batch,
                         std::chrono::steady_clock::time_point           t0);
 
+    // If non-empty, every finalized request's detokenized output is written
+    // to <dir>/<req_id>.txt. Used for byte-level content-equality checks
+    // across configurations (see docs/multi-lora/IMPLEMENTATION_GUIDE.md
+    // section 9 verification policy). The directory must already exist.
+    void set_output_dir(std::string dir) { output_dir_ = std::move(dir); }
+
     ~multilora_scheduler();
 
     multilora_scheduler(const multilora_scheduler &)             = delete;
@@ -89,6 +95,7 @@ private:
     int32_t                          n_batch_;
 
     std::chrono::steady_clock::time_point        t0_;
+    std::string                                  output_dir_;
 
     std::vector<std::unique_ptr<multilora_slot>> active_;
     std::vector<llama_seq_id>                    free_seq_ids_;  // LIFO
