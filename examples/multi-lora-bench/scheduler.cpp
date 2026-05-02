@@ -181,26 +181,29 @@ bool multilora_scheduler::step() {
     }
 
     // Bind the group's adapter on the context (replace-semantics).
+    // In no_lora mode skip entirely — base model decodes the trace as-is.
     multilora_adapter_pool::acquire_result acq;
-    try {
-        acq = pool_->acquire(ctx_, group.front()->req.adapter_id);
-    } catch (const std::exception & e) {
-        std::fprintf(stderr, "scheduler: pool.acquire('%s') failed: %s; dropping group\n",
-                     group.front()->req.adapter_id.c_str(), e.what());
-        const double now_s = seconds_since_t0();
-        // Drop every slot in the group rather than spin-loop forever.
-        for (auto * s : group) {
-            finalize_and_record(s, now_s);
-            erase_active(s);
+    if (!no_lora_) {
+        try {
+            acq = pool_->acquire(ctx_, group.front()->req.adapter_id);
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "scheduler: pool.acquire('%s') failed: %s; dropping group\n",
+                         group.front()->req.adapter_id.c_str(), e.what());
+            const double now_s = seconds_since_t0();
+            for (auto * s : group) {
+                finalize_and_record(s, now_s);
+                erase_active(s);
+            }
+            return !active_.empty();
         }
-        return !active_.empty();
     }
 
     // Stamp first-acquire metric on each slot that hasn't seen one yet.
+    // Under no_lora, all slots show acquire as a synthetic "free hit".
     for (auto * s : group) {
         if (!s->first_acquire_recorded) {
-            s->acquire_cache_hit      = acq.cache_hit;
-            s->acquire_ms             = acq.load_ms;
+            s->acquire_cache_hit      = no_lora_ ? true : acq.cache_hit;
+            s->acquire_ms             = no_lora_ ? 0.0  : acq.load_ms;
             s->first_acquire_recorded = true;
         }
     }
@@ -237,7 +240,7 @@ bool multilora_scheduler::step() {
                         s->req.id.c_str(), to_feed, n_batch_);
                     finalize_and_record(s, seconds_since_t0());
                     erase_active(s);
-                    pool_->release(group.front()->req.adapter_id);
+                    if (!no_lora_) { pool_->release(group.front()->req.adapter_id); }
                     return !active_.empty();
                 }
                 continue;
@@ -269,7 +272,7 @@ bool multilora_scheduler::step() {
 
     if (batch_.n_tokens == 0) {
         // Nothing fit at all (shouldn't happen given size guards above).
-        pool_->release(group.front()->req.adapter_id);
+        if (!no_lora_) { pool_->release(group.front()->req.adapter_id); }
         return !active_.empty();
     }
 
@@ -283,7 +286,7 @@ bool multilora_scheduler::step() {
             finalize_and_record(s, now_s);
             erase_active(s);
         }
-        pool_->release(group.front()->req.adapter_id);
+        if (!no_lora_) { pool_->release(group.front()->req.adapter_id); }
         return !active_.empty();
     }
 
@@ -324,6 +327,6 @@ bool multilora_scheduler::step() {
         }
     }
 
-    pool_->release(group.front()->req.adapter_id);
+    if (!no_lora_) { pool_->release(group.front()->req.adapter_id); }
     return !active_.empty();
 }

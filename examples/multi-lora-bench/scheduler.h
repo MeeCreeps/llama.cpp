@@ -49,6 +49,12 @@ public:
     // section 9 verification policy). The directory must already exist.
     void set_output_dir(std::string dir) { output_dir_ = std::move(dir); }
 
+    // M6.5b baseline: skip AdapterPool::acquire entirely and never call
+    // llama_set_adapters_lora. The base model decodes the trace as-is,
+    // ignoring each request's adapter_id. Useful as the "no LoRA" ceiling
+    // baseline for adaptive-rank / fixed-rank comparisons.
+    void set_no_lora(bool v) { no_lora_ = v; }
+
     ~multilora_scheduler();
 
     multilora_scheduler(const multilora_scheduler &)             = delete;
@@ -96,6 +102,7 @@ private:
 
     std::chrono::steady_clock::time_point        t0_;
     std::string                                  output_dir_;
+    bool                                         no_lora_ = false;
 
     std::vector<std::unique_ptr<multilora_slot>> active_;
     std::vector<llama_seq_id>                    free_seq_ids_;  // LIFO

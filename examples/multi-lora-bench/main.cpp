@@ -53,6 +53,7 @@ struct args_t {
     int  n_slots            = 4;
     int  seed               = 42;
     bool verbose            = true;
+    bool no_lora            = false;   // M6.5b: bypass adapter binding for base-model baseline
 };
 
 void print_usage(const char * argv0) {
@@ -101,6 +102,7 @@ bool parse_args(int argc, char ** argv, args_t & a) {
         else if (s == "-ngl" || s == "--n-gpu-layers") { if (!need(i)) return false; a.n_gpu_layers  = std::stoi(argv[++i]); }
         else if (s == "-s" || s == "--seed")           { if (!need(i)) return false; a.seed          = std::stoi(argv[++i]); }
         else if (s == "--quiet")                       { a.verbose = false; }
+        else if (s == "--no-lora")                     { a.no_lora = true; }
         else {
             std::fprintf(stderr, "error: unknown arg '%s'\n", argv[i]);
             print_usage(argv[0]);
@@ -244,6 +246,9 @@ int main(int argc, char ** argv) {
                                  t0);
     if (!args.output_dir.empty()) {
         sched.set_output_dir(args.output_dir);
+    }
+    if (args.no_lora) {
+        sched.set_no_lora(true);
     }
 
     while (next_idx < requests.size() || sched.active_count() > 0) {

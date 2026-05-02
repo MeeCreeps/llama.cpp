@@ -107,28 +107,95 @@ Three concrete policies become testable from the table:
 ## Adaptive-rank policy — actual wall comparison
 
 The per-rank latency curve above tells you what one rank costs. The
-real adaptive-rank question is: **if half my requests can use a low
-rank (cheap) and half need a high rank (expensive), how much wall do
-I save vs running everything at the high rank?**
+real adaptive-rank question is: **what does picking a different rank
+per request buy you, vs running every request at one fixed rank?**
 
-Setup: 8 prompts, all `arrival_time=0`, `--n-slots=4`. The first 4
-("easy" — `What is 2+2?`, `Capital of France?`, …) and the last 4
-("hard" — `Explain quantum entanglement…`, `Why is the sky blue?
-detailed reasoning.`, …) are deterministic — no router, the trace
-itself encodes the policy.
+Setup: 8 prompts, all `arrival_time=0`, `--n-slots=4`,
+`--max-adapter-mem-mb=0` (no eviction — every adapter used stays
+resident in OpenCL device memory). 4 "easy" prompts (`What is 2+2?`,
+…) and 4 "hard" prompts (`Explain quantum entanglement…`, …),
+deterministic — no router, the trace itself encodes the policy.
 
-Five policies on the same 8 prompts:
+Reference baseline: `--no-lora` runs the same 8 prompts on the base
+Q4_0 model with no LoRA bound, no `pool.acquire`, no
+`llama_set_adapters_lora`. Provides the **absolute wall floor** for
+these 8 prompts.
 
-| policy | rank choice per req | wall (s) | tok/s | saved vs uniform-high |
+| policy | per-request rank | wall (s) | tok/s | tax vs no_lora |
 |---|---|---:|---:|---:|
-| fix_r8        | all r=8                       | 23.74 | 8.00 | — |
-| fix_r64       | all r=64                      | 27.47 | 6.92 | (baseline for r=64) |
-| **adaptive**  | r=8 × 4 + r=64 × 4            | **25.85** | 7.35 | **+5.9 % vs fix_r64** |
-| fix_r128      | all r=128 (fusion declines)   | 42.90 | 4.31 | (baseline for r=128) |
-| **adaptive_wide** | r=8 × 4 + r=128 × 4       | **36.96** | 5.14 | **+13.8 % vs fix_r128** |
+| **no_lora**        | base model only                                  | **22.33** | 8.51 | **0 % (ceiling)** |
+| fix_r8             | all r=8                                          | 23.74 | 8.00 | +6.3 % |
+| fix_r16            | all r=16                                         | 24.30 | 7.82 | +8.8 % |
+| fix_r32            | all r=32                                         | 25.30 | 7.51 | +13.3 % |
+| fix_r64            | all r=64                                         | 27.47 | 6.92 | +23.0 % |
+| fix_r128           | all r=128 (M5 fusion declines)                   | 42.90 | 4.31 | +92.2 % |
+| **adaptive_5rank** | r=8(1)+r=16(2)+r=32(2)+r=64(2)+r=128(1)           | **24.08** | 7.89 | **+7.9 %** |
 
-Output token counts are identical across all five policies (190 total),
-so the wall comparison is clean — no output-length confound.
+Output tokens identical across all policies except `fix_r128` (185 vs
+190 — r=128 EOGs 5 tokens earlier across the 8 reqs). Wall comparison
+clean — no output-length confound.
+
+### Reading the table
+
+- **no_lora at 22.33 s is the floor.** Any LoRA bound to the context
+  pays at least the model-and-decode cost of running 8 reqs through
+  the base model.
+- **`fix_r{8,16,32,64}` stack neatly with rank.** Tax goes
+  6.3 → 8.8 → 13.3 → 23.0 % — gentle increase across an 8× rank
+  jump, because the M5 fused kernel keeps cost roughly proportional
+  to R but doesn't blow up.
+- **`fix_r128` cliff.** Tax 92.2 % — almost 2× the no-LoRA wall. The
+  M5 pattern matcher refuses to fire above `LORA_R_MAX = 64`, so
+  every projection pays the full 4-op chain (the ~18 ms/tok un-fused
+  tax).
+- **`adaptive_5rank` is essentially tied with `fix_r8`/`fix_r16`**
+  while still including one r=128 request that would solo cost +92 %.
+  The "expensive tail" is amortised: only 1/8 reqs pay the full
+  fusion-fallback price; the other 7 stay in the cheap fusion path.
+
+### When does adaptive rank actually help?
+
+The adaptive savings depend on the **shape of your rank distribution**
+relative to the latency curve:
+
+- **All requests fit under R = 64 (the M5 fusion ceiling)**: adaptive
+  saves a few percent over picking the highest single rank you'd
+  consider. The fixed-rank baselines for r ∈ {8, 16, 32, 64} all
+  cluster within ~16 % of each other (23.7 → 27.5 s), so picking
+  the right per-request rank is at most a 4 s wall question on this
+  trace.
+- **Workload includes some r > 64 requests** (i.e. needs to step
+  outside the fusion path): adaptive's amortisation becomes
+  dramatic. `fix_r128` is 42.9 s; adaptive_5rank with one r=128 req
+  is 24.1 s. Putting those expensive requests in a tail keeps
+  total wall close to the fusion-only case.
+
+The actually-useful "adaptive" knob on this hardware is therefore
+**"keep the long tail of expensive ranks short — most requests at
+≤ 64, only the truly capacity-bound ones at higher rank"**. That
+matches what an "adaptive rank serving system" would do in practice:
+classify request difficulty, pick the smallest rank that meets the
+quality bar.
+
+### Caveats on this comparison
+
+- 8-prompt traces; not paper-quality sample size. The fix_r128
+  measurement is especially noisy because most of its 42.9 s is
+  4 × r=128 requests serial-batching at +18 ms/tok.
+- Output token counts are within 5 of each other — not perfectly
+  matched, but very close.
+- All 6 LoRA policies use unbounded adapter cache
+  (`--max-adapter-mem-mb 0`), so each adapter is loaded exactly
+  once on first use. Cold-load time scales with file size:
+  r=8 ≈ 31 ms, r=16 ≈ 89 ms, r=32 ≈ 191 ms, r=64 ≈ 284 ms,
+  r=128 ≈ 500+ ms. For adaptive_5rank that's ~1.1 s of cold-load
+  cost amortised across the 24 s wall.
+- We did NOT measure output **quality** as a function of rank — the
+  premise is that the workload owner's policy already encodes which
+  ranks they need for which requests. The adaptive policy = the
+  classifier; we just measured the latency consequence.
+- Routing classifier itself (deciding rank at admit time) is spec
+  §0.2 scope-cut; the trace pre-encodes the policy decision.
 
 ### Reading the table
 
@@ -181,8 +248,23 @@ delta is below noise.
 ## Files
 
 - `workloads/m65-{r8,reasoning,r32,r64,r128}.json` — per-rank latency traces
-- `workloads/m65b-{fix_r8,fix_r64,fix_r128,adaptive,adaptive_wide}.json`
-  — adaptive-policy traces
-- `results/M6.5/m65/{r8,reasoning,r32,r64,r128}_{off,on}.csv` — bench output
-- `results/M6.5b/m65b/*.csv` — adaptive-policy bench output
+- `workloads/m65b-{fix_r8,fix_r16,fix_r32,fix_r64,fix_r128,adaptive_5rank}.json`
+  — fixed-rank baseline + adaptive policy traces
+- `results/M6.5/m65/{r8,reasoning,r32,r64,r128}_{off,on}.csv` — per-rank bench output
+- `results/M6.5b/m65b/{no_lora,fix_*,adaptive_5rank}.csv` — policy bench output
 - `results/M6.5/latency_vs_rank.png` — the plot
+
+## Implementation note: `--no-lora` flag
+
+Added to `multi-lora-bench` to enable the no-LoRA baseline measurement
+on the same scheduler / batching path as the LoRA policies:
+
+```cpp
+sched.set_no_lora(true);  // skip pool.acquire / llama_set_adapters_lora
+```
+
+When set, scheduler short-circuits adapter binding entirely; the
+trace's `adapter_id` field is ignored. CSV still records each request,
+with `cache_hit=1` and `acquire_ms=0` (synthetic — no adapter was
+acquired). Used only for the M6.5 baseline; in normal operation leave
+it off.
