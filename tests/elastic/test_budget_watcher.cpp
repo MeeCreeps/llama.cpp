@@ -105,7 +105,7 @@ void test_csv_header_and_comments() {
     std::string p = write_tmp("bw_test_header.csv", csv);
 
     budget_watcher bw{};
-    int rc = budget_watcher_load_csv(&bw, p.c_str());
+    [[maybe_unused]] int rc = budget_watcher_load_csv(&bw, p.c_str());
     if (rc != 0) {
         std::fprintf(stderr, "load_csv 失败 rc=%d\n", rc);
         std::abort();
@@ -124,7 +124,7 @@ void test_csv_unsorted() {
     std::string p = write_tmp("bw_test_unsorted.csv", csv);
 
     budget_watcher bw{};
-    int rc = budget_watcher_load_csv(&bw, p.c_str());
+    [[maybe_unused]] int rc = budget_watcher_load_csv(&bw, p.c_str());
     assert(rc == 0);
     assert(bw.schedule.size() == 3);
     assert(bw.schedule[0].first == 0.0);
@@ -145,7 +145,7 @@ void test_end_to_end() {
     budget_watcher_config cfg;
     cfg.mode           = budget_watcher::INTERP_LINEAR;
     cfg.tick_period_ms = 10;
-    int rc = budget_watcher_init(&bw, p.c_str(), cfg);
+    [[maybe_unused]] int rc = budget_watcher_init(&bw, p.c_str(), cfg);
     assert(rc == 0);
 
     // init 时立刻 get 应为 t=0 处的 1000（init 已把 t=0 处的值预填进 atomic）

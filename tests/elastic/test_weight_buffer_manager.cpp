@@ -49,7 +49,7 @@ void check_eq_sz(size_t got, size_t want, const char *msg) {
 
 void register_uniform(weight_buffer_manager *wbm, int n, size_t each_bytes) {
     for (int i = 0; i < n; ++i) {
-        int rc = wbm_register_block(wbm, i, &fake_host_pool[i], each_bytes);
+        [[maybe_unused]] int rc = wbm_register_block(wbm, i, &fake_host_pool[i], each_bytes);
         assert(rc == 0);
     }
 }
@@ -75,7 +75,7 @@ void test_init_and_register() {
     }
 
     // 越界 register 应失败
-    int rc = wbm_register_block(&wbm, 100, &fake_host_pool[0], 1);
+    [[maybe_unused]] int rc = wbm_register_block(&wbm, 100, &fake_host_pool[0], 1);
     assert(rc != 0);
     // 0 字节 register 应失败
     rc = wbm_register_block(&wbm, 0, &fake_host_pool[0], 0);

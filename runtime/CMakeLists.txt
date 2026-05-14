@@ -13,14 +13,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
-add_library(elastic_runtime STATIC
+set(_ELASTIC_SOURCES
     budget_watcher.cpp
     metrics_logger.cpp
     weight_buffer_manager.cpp
 )
+
+# OpenCL 包装层只在 find_package 找到 OpenCL 时进静态库。
+# 桌面无 OpenCL 时 elastic_runtime 只含纯逻辑；Android 构建（build_android.sh
+# 通过 OpenCL_INCLUDE_DIR / OpenCL_LIBRARY 显式喂路径）会编进 wbm_opencl。
+find_package(OpenCL QUIET)
+if(OpenCL_FOUND)
+    message(STATUS "elastic_runtime: OpenCL 找到，构建 weight_buffer_manager_opencl")
+    list(APPEND _ELASTIC_SOURCES weight_buffer_manager_opencl.cpp)
+else()
+    message(STATUS "elastic_runtime: 未找到 OpenCL，跳过 weight_buffer_manager_opencl")
+endif()
+
+add_library(elastic_runtime STATIC ${_ELASTIC_SOURCES})
 target_include_directories(elastic_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(elastic_runtime PUBLIC Threads::Threads)
 target_compile_options(elastic_runtime PRIVATE -Wall -Wextra -Wpedantic)
+
+if(OpenCL_FOUND)
+    target_link_libraries(elastic_runtime PUBLIC ${OpenCL_LIBRARIES})
+    target_include_directories(elastic_runtime PUBLIC ${OpenCL_INCLUDE_DIRS})
+endif()
 
 option(ELASTIC_BUILD_TESTS "构建 elastic runtime 单测" ON)
 if(ELASTIC_BUILD_TESTS)
