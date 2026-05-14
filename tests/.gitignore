@@ -1,5 +1,6 @@
 *
 !*.*
+!elastic/
 *.o
 ggml-common.h
 **/*.swp

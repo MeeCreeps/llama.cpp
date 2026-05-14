@@ -20,3 +20,10 @@ add_library(elastic_runtime STATIC
 target_include_directories(elastic_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(elastic_runtime PUBLIC Threads::Threads)
 target_compile_options(elastic_runtime PRIVATE -Wall -Wextra -Wpedantic)
+
+option(ELASTIC_BUILD_TESTS "构建 elastic runtime 单测" ON)
+if(ELASTIC_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tests/elastic
+                     ${CMAKE_BINARY_DIR}/tests_elastic)
+endif()
