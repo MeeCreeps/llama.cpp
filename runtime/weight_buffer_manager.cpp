@@ -10,7 +10,7 @@
 namespace elastic {
 
 int wbm_init(weight_buffer_manager *wbm, int n_blocks) {
-    if (!wbm || n_blocks <= 0) return -1;
+    if (!wbm || n_blocks < 0) return -1;
     wbm->blocks.clear();
     wbm->blocks.resize(static_cast<size_t>(n_blocks));
     for (int i = 0; i < n_blocks; ++i) {
@@ -27,6 +27,22 @@ int wbm_init(weight_buffer_manager *wbm, int n_blocks) {
     wbm->n_resident     = 0;
     wbm->resident_bytes = 0;
     return 0;
+}
+
+int wbm_add_block(weight_buffer_manager *wbm, void *host_ptr, size_t byte_size) {
+    if (!wbm || !host_ptr || byte_size == 0) return -1;
+    int idx = static_cast<int>(wbm->blocks.size());
+    wbm->blocks.emplace_back();
+    block_meta &b = wbm->blocks.back();
+    b.block_idx       = idx;
+    b.host_ptr        = host_ptr;
+    b.byte_size       = byte_size;
+    b.resident        = false;
+    b.is_pinned       = false;
+    b.last_used_token = 0;
+    b.backend_handle  = nullptr;
+    b.last_use_event  = nullptr;
+    return idx;
 }
 
 int wbm_register_block(weight_buffer_manager *wbm,

@@ -55,6 +55,10 @@ int  wbm_register_block(weight_buffer_manager *wbm,
                         void  *host_ptr,
                         size_t byte_size);
 
+// Append 一个新 block 到末尾（动态增长）。返回分配的 block_idx；失败返回 -1。
+// 用于 ggml-opencl 集成中"每次 set_tensor 见到新权重就追加"的场景。
+int  wbm_add_block(weight_buffer_manager *wbm, void *host_ptr, size_t byte_size);
+
 // 标记 block 已被搬到 GPU（OpenCL 包装层 clCreateBuffer + write 完成后调）。
 // 更新 resident=true、resident_bytes += byte_size、n_resident += 1。
 // 重复调用同一 idx 会断言失败。

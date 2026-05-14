@@ -29,6 +29,13 @@
 #include <charconv>
 #include <mutex>
 
+// Elastic baseline 集成：runtime/ 模块的头文件由 ggml-opencl CMakeLists.txt 的
+// target_include_directories 把 runtime/ 加入搜索路径。
+#include "budget_watcher.h"
+#include "metrics_logger.h"
+#include "weight_buffer_manager.h"
+#include "weight_buffer_manager_opencl.h"
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -2503,11 +2510,15 @@ struct ggml_tensor_extra_cl {
     // The actual size of the cl_mem object. This is needed when returning the
     // block to the pool.
     size_t actual_size;
+    // elastic baseline 用：被 WBM 管理的 block_idx；-1 = 不归 WBM 管。
+    // 见 runtime/weight_buffer_manager.h 与 RUNTIME_PATCHES.md §3 H4。
+    int wbm_idx;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        wbm_idx = -1;
     }
 };
 
@@ -2785,11 +2796,125 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+// ============================================================
+// Elastic baseline: 全局 WBM + BudgetWatcher + MetricsLogger 单例
+// ============================================================
+//
+// 用 env 触发：
+//   GGML_OPENCL_ELASTIC=1           启用 per-tensor cl_mem (见 F2)
+//   GGML_ELASTIC_BUDGET_CSV=<path>  BudgetWatcher trace
+//   GGML_ELASTIC_METRICS_JSONL=<path>  MetricsLogger 写盘
+//   GGML_ELASTIC_KV_MB=<num>        KV cache 预算扣除（默认 128）
+//   GGML_ELASTIC_MISC_MB=<num>      compute / 激活预算扣除（默认 256）
+//   GGML_ELASTIC_EVICT_INTERVAL=<n> 每 n 个 op 检查一次预算（默认 8）
+//
+// 单例懒初：第一次有 weight tensor 走 set_tensor 时初始化 WBM；
+// 第一次有 BudgetWatcher CSV 时拉起后台线程。
+
+struct ggml_opencl_elastic_state {
+    elastic::weight_buffer_manager wbm;
+    elastic::wbm_opencl_ctx        octx;
+    elastic::budget_watcher        bw;
+    elastic::metrics_logger        metrics;
+
+    bool   wbm_inited     = false;
+    bool   bw_inited      = false;
+    bool   metrics_inited = false;
+
+    size_t kv_bytes       = static_cast<size_t>(128) * 1024 * 1024;
+    size_t misc_overhead  = static_cast<size_t>(256) * 1024 * 1024;
+    int    evict_check_interval = 8;
+
+    uint64_t current_token       = 0;
+    uint64_t n_op_dispatched     = 0;
+    uint64_t n_evicts_total      = 0;
+    uint64_t n_reloads_total     = 0;
+    size_t   bytes_reloaded_total = 0;
+};
+
+static ggml_opencl_elastic_state * ggml_opencl_elastic() {
+    static ggml_opencl_elastic_state s;
+    return &s;
+}
+
+static size_t ggml_opencl_env_mb(const char *name, size_t def_mb) {
+    const char *v = std::getenv(name);
+    if (!v || !*v) return def_mb * 1024 * 1024;
+    long long n = atoll(v);
+    if (n < 0) n = 0;
+    return static_cast<size_t>(n) * 1024 * 1024;
+}
+
+static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue queue) {
+    auto *s = ggml_opencl_elastic();
+    if (s->wbm_inited) return;
+
+    if (elastic::wbm_init(&s->wbm, 0) != 0) {
+        GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
+        return;
+    }
+    if (elastic::wbmcl_init(&s->octx, &s->wbm, cl_ctx, queue, nullptr) != 0) {
+        GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
+        return;
+    }
+    s->wbm_inited = true;
+
+    s->kv_bytes      = ggml_opencl_env_mb("GGML_ELASTIC_KV_MB",   128);
+    s->misc_overhead = ggml_opencl_env_mb("GGML_ELASTIC_MISC_MB", 256);
+    if (const char *iv = std::getenv("GGML_ELASTIC_EVICT_INTERVAL")) {
+        int v = atoi(iv);
+        if (v >= 1) s->evict_check_interval = v;
+    }
+
+    const char *csv = std::getenv("GGML_ELASTIC_BUDGET_CSV");
+    if (csv && *csv) {
+        if (elastic::budget_watcher_init(&s->bw, csv) == 0) {
+            s->bw_inited = true;
+            GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher 启动 trace=%s 初始 B(t)=%zu MB\n",
+                          csv, elastic::budget_watcher_get(&s->bw));
+        } else {
+            GGML_LOG_ERROR("ggml_opencl elastic: BudgetWatcher 加载失败: %s\n", csv);
+        }
+    }
+
+    const char *json = std::getenv("GGML_ELASTIC_METRICS_JSONL");
+    if (json && *json) {
+        if (elastic::metrics_logger_init(&s->metrics, json) == 0) {
+            s->metrics_inited = true;
+            GGML_LOG_INFO("ggml_opencl elastic: metrics → %s\n", json);
+        }
+    }
+
+    GGML_LOG_INFO("ggml_opencl elastic: 单例就绪 (kv=%zu MB misc=%zu MB interval=%d)\n",
+                  s->kv_bytes / 1024 / 1024, s->misc_overhead / 1024 / 1024, s->evict_check_interval);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Elastic baseline (F4-minimal)：拿到 elastic 单例（如果已 lazy_init 过）。
+    auto *est = ggml_opencl_elastic();
+    const bool elastic_active = est->wbm_inited;
+    if (elastic_active) {
+        est->current_token += 1;
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        // Elastic baseline (F4-minimal)：op 派发前，对所有 src 中的 WBM 权重
+        // tensor 调 wbm_touch 更新 LRU。本 commit 还不做实际 evict，所以
+        // 所有 tensor 都常驻、ensure_resident 是 no-op。下一 commit 接入。
+        if (elastic_active) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor *src = node->src[j];
+                if (!src) continue;
+                ggml_tensor_extra_cl *src_extra =
+                    (ggml_tensor_extra_cl *) src->extra;
+                if (!src_extra || src_extra->wbm_idx < 0) continue;
+                elastic::wbm_touch(&est->wbm, src_extra->wbm_idx, est->current_token);
+            }
+        }
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
@@ -3143,6 +3268,8 @@ static bool ggml_opencl_is_weight_tensor(const char *name) {
     if (n < suf) return false;
     return strcmp(name + n - suf, ".weight") == 0;
 }
+
+// 见文件顶部的 ggml_opencl_elastic_state 前置定义（必须在 graph_compute 之前）。
 
 struct ggml_backend_opencl_buffer_context {
     // 三态生命周期：alloc_buffer 进 PENDING；首个 init_tensor 决定升 ELASTIC
@@ -3856,6 +3983,34 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     CL_CHECK(clEnqueueWriteBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + offset,
         size, data, 0, NULL, NULL));
+
+    // Elastic baseline (F4-minimal)：把权重 tensor 注册到 WBM。host_ptr 用
+    // set_tensor 的 data 参数——这是 llama_model_loader 调来的 mmap 指针，
+    // 在模型生命周期内稳定。后续 evict 时重新 clEnqueueWriteBuffer 即可恢复。
+    // 只走 elastic 模式 + 完整覆盖写 (offset == 0 && size == ggml_nbytes) 的情况，
+    // 跳过 view 与已经注册过的 tensor。
+    {
+        ggml_backend_opencl_buffer_context * bctx =
+            (ggml_backend_opencl_buffer_context *) buffer->context;
+        if (bctx->mode == ggml_backend_opencl_buffer_context::MODE_ELASTIC
+            && tensor->view_src == nullptr
+            && extra->wbm_idx < 0
+            && offset == 0
+            && size == ggml_nbytes(tensor)
+            && ggml_opencl_is_weight_tensor(tensor->name)) {
+            ggml_opencl_elastic_lazy_init(context, queue);
+            auto *s = ggml_opencl_elastic();
+            if (s->wbm_inited) {
+                int idx = elastic::wbm_add_block(&s->wbm, const_cast<void*>(data), size);
+                if (idx >= 0) {
+                    elastic::wbm_mark_resident(&s->wbm, idx,
+                        static_cast<void*>(extra->data_device));
+                    elastic::wbm_touch(&s->wbm, idx, s->current_token);
+                    extra->wbm_idx = idx;
+                }
+            }
+        }
+    }
 
     GGML_UNUSED(buffer);
 }

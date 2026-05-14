@@ -15,7 +15,9 @@
 
 #pragma once
 
+#ifndef CL_TARGET_OPENCL_VERSION
 #define CL_TARGET_OPENCL_VERSION 200
+#endif
 #include <CL/cl.h>
 
 #include "weight_buffer_manager.h"

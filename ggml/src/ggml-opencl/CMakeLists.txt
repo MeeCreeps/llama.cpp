@@ -3,11 +3,26 @@ find_package(Python3 REQUIRED)
 
 set(TARGET_NAME ggml-opencl)
 
+# Elastic baseline 集成：把 runtime/ 模块编进 ggml-opencl 后端。
+# WBM / BudgetWatcher / MetricsLogger 是纯 C++，零外部依赖（仅 pthread），
+# 行为门控在运行时由 GGML_OPENCL_ELASTIC=1 env 触发；env=0 时零侵入。
+set(_ELASTIC_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime")
+set(_ELASTIC_RUNTIME_SOURCES
+    ${_ELASTIC_RUNTIME_DIR}/budget_watcher.cpp
+    ${_ELASTIC_RUNTIME_DIR}/metrics_logger.cpp
+    ${_ELASTIC_RUNTIME_DIR}/weight_buffer_manager.cpp
+    ${_ELASTIC_RUNTIME_DIR}/weight_buffer_manager_opencl.cpp
+)
+
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
+                         ${_ELASTIC_RUNTIME_SOURCES}
                          ../../include/ggml-opencl.h)
-target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
-target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
+find_package(Threads REQUIRED)
+target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES} Threads::Threads)
+target_include_directories(${TARGET_NAME} PRIVATE
+                           ${OpenCL_INCLUDE_DIRS}
+                           ${_ELASTIC_RUNTIME_DIR})
 
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")

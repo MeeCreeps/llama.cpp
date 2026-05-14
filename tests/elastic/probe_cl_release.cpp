@@ -27,7 +27,9 @@
 //
 // 退出码：0 = 跑完（不代表 "DRAM 真释放"，结论看输出表）；非 0 = OpenCL 失败
 
+#ifndef CL_TARGET_OPENCL_VERSION
 #define CL_TARGET_OPENCL_VERSION 200
+#endif
 #include <CL/cl.h>
 
 #include <cstdio>
