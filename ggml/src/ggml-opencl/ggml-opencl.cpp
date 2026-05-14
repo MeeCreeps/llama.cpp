@@ -2865,7 +2865,24 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
-    if (elastic::wbmcl_init(&s->octx, &s->wbm, cl_ctx, queue, nullptr) != 0) {
+    // 默认走单队列同步路径：在 Adreno + ggml-opencl 上 enqueue 开销 + barrier
+    // 同步反而拖累整体（实测 Test 3 上 async eval 时间 2223 ms/tok vs sync
+    // 1782 ms/tok，慢 25%）。GGML_ELASTIC_ASYNC_XFER=1 可显式开异步路径，
+    // 留作未来调优时复用——其它芯片或更激进的 prefetch 策略下可能有收益。
+    cl_command_queue xfer_q = nullptr;
+    if (const char *async_x = std::getenv("GGML_ELASTIC_ASYNC_XFER"); async_x && *async_x && *async_x != '0') {
+        cl_int q_err = CL_SUCCESS;
+        cl_device_id dev = nullptr;
+        clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(dev), &dev, nullptr);
+        xfer_q = clCreateCommandQueueWithProperties(cl_ctx, dev, nullptr, &q_err);
+        if (q_err != CL_SUCCESS) {
+            GGML_LOG_ERROR("ggml_opencl elastic: 创建 xfer queue 失败 %d，退回单队列\n", q_err);
+            xfer_q = nullptr;
+        } else {
+            GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_ASYNC_XFER=1 启用异步上传\n");
+        }
+    }
+    if (elastic::wbmcl_init(&s->octx, &s->wbm, cl_ctx, queue, xfer_q) != 0) {
         GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
         return;
     }
@@ -2937,10 +2954,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     const size_t needed  = est->wbm.resident_bytes + bm->byte_size;
                     if (needed > target) {
                         // 给即将 reload 的 bm 腾出位置：把现有 resident 压到
-                        // target - bm->byte_size 以下（saturated）
+                        // target - bm->byte_size 以下（saturated）。F4-event：
+                        // 不再 clFinish，wbmcl_evict_batch 依赖 last_use_event。
                         const size_t pre_target = target > bm->byte_size ?
                                                   target - bm->byte_size : 0;
-                        CL_CHECK(clFinish(backend_ctx->queue));
                         std::vector<int> victims;
                         int n = elastic::wbm_evict_to_byte_budget(&est->wbm, pre_target,
                                                                   /*exclude=*/src_extra->wbm_idx, &victims);
@@ -3010,10 +3027,43 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         GGML_ASSERT(ok);
 
-        // Elastic baseline (F4-evict)：每个 op 派发后累计计数；到 evict_check_interval
-        // 个时评估预算，如果当前 resident_bytes > 目标，clFinish + 批量 LRU 驱逐。
-        // clFinish 保证 in-flight kernel 不会读到 just-released 的 cl_mem；F4-event 之后
-        // 会改成 cl_event 跟踪精细同步。
+        // Elastic baseline (F4-event)：op 派发后插一个 marker event 到 compute
+        // queue 当前位置，写到所有被本 op 用过的 WBM 权重的 last_use_event。
+        // 后续 evict 只需 clWaitForEvents 这些 marker（不再 clFinish 整个 queue），
+        // 旧 marker 已结束的 buffer wait 立即返回。
+        if (elastic_active) {
+            cl_event marker = nullptr;
+            cl_int merr = clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &marker);
+            if (merr == CL_SUCCESS && marker) {
+                auto stamp_event = [&](ggml_tensor *n) {
+                    if (!n) return;
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        ggml_tensor *src = n->src[j];
+                        if (!src) continue;
+                        ggml_tensor_extra_cl *src_extra =
+                            (ggml_tensor_extra_cl *) src->extra;
+                        if (!src_extra || src_extra->wbm_idx < 0) continue;
+                        const elastic::block_meta *bm =
+                            elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
+                        if (!bm) continue;
+                        // 释放旧 event（如果有），retain 新 marker
+                        if (bm->last_use_event) {
+                            clReleaseEvent(static_cast<cl_event>(bm->last_use_event));
+                        }
+                        clRetainEvent(marker);
+                        elastic::wbm_set_last_use_event(&est->wbm, src_extra->wbm_idx,
+                                                       static_cast<void *>(marker));
+                    }
+                };
+                stamp_event(node);
+                // 注：fused op 的 i+1 / i+2 src 在前面 ensure_node_srcs_resident
+                // 已 ensure 过；marker 是基于 compute_queue 的当前点，对它们也
+                // 适用——但严格上要单独标记一次。目前 marker 只发一次，假设
+                // fused op 的 kernel 在同一 marker 之前完成。
+                clReleaseEvent(marker);
+            }
+        }
+
         if (elastic_active && est->bw_inited) {
             est->n_op_dispatched += 1;
             if ((int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
@@ -3022,7 +3072,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const size_t kv_misc    = est->kv_bytes + est->misc_overhead;
                 const size_t target     = budget > kv_misc ? budget - kv_misc : 0;
                 if (est->wbm.resident_bytes > target) {
-                    CL_CHECK(clFinish(backend_ctx->queue));
+                    // F4-event：不再 clFinish 整个 queue，依赖 wbmcl_evict_batch
+                    // 里 clWaitForEvents 在 victim 的 last_use_event 上选择性等待。
                     std::vector<int> victims;
                     int n = elastic::wbm_evict_to_byte_budget(&est->wbm, target,
                                                               /*exclude=*/-1, &victims);

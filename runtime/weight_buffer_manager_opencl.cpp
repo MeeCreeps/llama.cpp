@@ -65,16 +65,45 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     }
     octx->n_creates += 1;
 
-    err = clEnqueueWriteBuffer(octx->xfer_queue ? octx->xfer_queue : octx->compute_queue,
-                               buf, CL_TRUE /* 阻塞 */,
-                               0, meta->byte_size, meta->host_ptr,
-                               0, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-        std::fprintf(stderr, "[wbmcl] clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
-                     idx, cl_err(err), err);
-        clReleaseMemObject(buf);
-        octx->n_releases += 1;
-        return -5;
+    if (octx->xfer_queue) {
+        // 异步路径：上传走 xfer queue，compute queue 插 barrier 等上传 event
+        // 完成。host 端不再阻塞。配合 compute queue 自身的 in-order 语义，
+        // 后续派发的 kernel 会自动等到 buffer 写完才执行。
+        cl_event write_ev = nullptr;
+        err = clEnqueueWriteBuffer(octx->xfer_queue, buf, CL_FALSE,
+                                   0, meta->byte_size, meta->host_ptr,
+                                   0, nullptr, &write_ev);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] async clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
+                         idx, cl_err(err), err);
+            clReleaseMemObject(buf);
+            octx->n_releases += 1;
+            return -5;
+        }
+        // flush xfer queue 让 enqueue 真的发出去（不调 flush 时驱动可能
+        // 攒到下一次 clFinish/clWaitForEvents 才提交）
+        clFlush(octx->xfer_queue);
+        // compute queue 插 barrier，依赖 write_ev
+        cl_int berr = clEnqueueBarrierWithWaitList(octx->compute_queue, 1, &write_ev, nullptr);
+        if (berr != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] clEnqueueBarrierWithWaitList 失败: %s (%d)，退回 wait\n",
+                         cl_err(berr), berr);
+            clWaitForEvents(1, &write_ev);
+        }
+        clReleaseEvent(write_ev);
+    } else {
+        // 同步路径：单队列阻塞写
+        err = clEnqueueWriteBuffer(octx->compute_queue,
+                                   buf, CL_TRUE /* 阻塞 */,
+                                   0, meta->byte_size, meta->host_ptr,
+                                   0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
+                         idx, cl_err(err), err);
+            clReleaseMemObject(buf);
+            octx->n_releases += 1;
+            return -5;
+        }
     }
 
     octx->bytes_uploaded_total += meta->byte_size;
