@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 
 add_library(elastic_runtime STATIC
     budget_watcher.cpp
+    metrics_logger.cpp
 )
 target_include_directories(elastic_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(elastic_runtime PUBLIC Threads::Threads)
