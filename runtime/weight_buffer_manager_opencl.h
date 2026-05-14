@@ -59,6 +59,14 @@ int  wbmcl_evict(wbm_opencl_ctx *octx, int idx);
 // 异步 prefetch 占位：首版直接同步 ensure。后续做异步化时改这一个函数即可。
 int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
 
+// 批量驱逐：一次 clWaitForEvents 在所有 victim 的 last_use_event 上（过滤空
+// 的），随后逐个 clReleaseEvent + clReleaseMemObject + wbm_mark_evicted。
+// 比 N 次单独 wbmcl_evict 省 N-1 次同步往返。
+// victims 通常由 wbm_evict_to_byte_budget 产出。返回成功释放的 victim 数。
+int  wbmcl_evict_batch(wbm_opencl_ctx *octx,
+                       const int *victims,
+                       int n_victims);
+
 // 取 idx 的 cl_mem（已驻留返回非空；未驻留返回 nullptr）
 cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx);
 

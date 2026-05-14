@@ -125,6 +125,59 @@ int wbmcl_prefetch(wbm_opencl_ctx *octx, int idx) {
     return wbmcl_ensure_resident(octx, idx);
 }
 
+int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
+    if (!octx || !octx->wbm || !victims || n_victims <= 0) return 0;
+
+    // 1) 收集所有 in-flight event 一次性等
+    std::vector<cl_event> events;
+    events.reserve(static_cast<size_t>(n_victims));
+    for (int i = 0; i < n_victims; ++i) {
+        const int v = victims[i];
+        const block_meta *m = wbm_get(octx->wbm, v);
+        if (!m || !m->resident) continue;
+        if (m->last_use_event) {
+            events.push_back(static_cast<cl_event>(m->last_use_event));
+        }
+    }
+    if (!events.empty()) {
+        cl_int err = clWaitForEvents(static_cast<cl_uint>(events.size()), events.data());
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] 批量 clWaitForEvents 失败: %s (%d) —— 继续释放\n",
+                         cl_err(err), err);
+        }
+    }
+
+    // 2) 逐个 release event + release cl_mem + mark_evicted
+    int released = 0;
+    for (int i = 0; i < n_victims; ++i) {
+        const int v = victims[i];
+        const block_meta *m = wbm_get(octx->wbm, v);
+        if (!m || !m->resident) continue;
+
+        if (m->last_use_event) {
+            cl_int rerr = clReleaseEvent(static_cast<cl_event>(m->last_use_event));
+            if (rerr != CL_SUCCESS) {
+                std::fprintf(stderr, "[wbmcl] clReleaseEvent 失败 block %d: %s (%d)\n",
+                             v, cl_err(rerr), rerr);
+            }
+        }
+        cl_mem buf = static_cast<cl_mem>(m->backend_handle);
+        if (buf) {
+            cl_int err = clReleaseMemObject(buf);
+            if (err != CL_SUCCESS) {
+                std::fprintf(stderr, "[wbmcl] 批量 clReleaseMemObject 失败 block %d: %s (%d)\n",
+                             v, cl_err(err), err);
+                continue;
+            }
+            octx->n_releases += 1;
+            octx->bytes_evicted_total += m->byte_size;
+        }
+        wbm_mark_evicted(octx->wbm, v);
+        ++released;
+    }
+    return released;
+}
+
 cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx) {
     if (!octx || !octx->wbm) return nullptr;
     const block_meta *meta = wbm_get(octx->wbm, idx);

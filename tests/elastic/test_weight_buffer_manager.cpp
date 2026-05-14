@@ -28,6 +28,8 @@ using elastic::wbm_shutdown;
 using elastic::wbm_total_bytes;
 using elastic::wbm_touch;
 using elastic::wbm_set_last_use_event;
+using elastic::wbm_set_pinned;
+using elastic::wbm_evict_to_byte_budget;
 
 namespace {
 
@@ -49,15 +51,20 @@ void check_eq_sz(size_t got, size_t want, const char *msg) {
 
 void register_uniform(weight_buffer_manager *wbm, int n, size_t each_bytes) {
     for (int i = 0; i < n; ++i) {
-        [[maybe_unused]] int rc = wbm_register_block(wbm, i, &fake_host_pool[i], each_bytes);
-        assert(rc == 0);
+        int rc = wbm_register_block(wbm, i, &fake_host_pool[i], each_bytes);
+        if (rc != 0) {
+            std::fprintf(stderr, "register_uniform: wbm_register_block(i=%d, host=%p, bytes=%zu) → rc=%d\n",
+                         i, (void*)&fake_host_pool[i], each_bytes, rc);
+            std::abort();
+        }
     }
 }
 
 // —— 用例 1：init + register 元数据正确 ——
 void test_init_and_register() {
     weight_buffer_manager wbm{};
-    assert(wbm_init(&wbm, 4) == 0);
+    int rc_init = wbm_init(&wbm, 4);
+    if (rc_init != 0) { std::fprintf(stderr, "wbm_init failed: %d\n", rc_init); std::abort(); }
     register_uniform(&wbm, 4, 50 * 1024 * 1024);
 
     check_eq_int(wbm_resident_count(&wbm), 0, "初始 n_resident");
@@ -281,6 +288,118 @@ void test_streaming_simulation() {
     std::printf("[OK] test_streaming_simulation\n");
 }
 
+// —— 用例 9：is_pinned 让 LRU 跳过该 block ——
+void test_pinned_skipped_by_lru() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 4);
+    register_uniform(&wbm, 4, 10);
+    for (int i = 0; i < 4; ++i) {
+        wbm_mark_resident(&wbm, i, reinterpret_cast<void *>(0x100 + i));
+        wbm_touch(&wbm, i, static_cast<uint64_t>(i + 1));
+    }
+    // pin block 0（最旧）。LRU 应跳过它，选 block 1。
+    wbm_set_pinned(&wbm, 0, true);
+    check_eq_int(wbm_pick_lru_victim(&wbm, -1), 1, "pinned 跳过最旧");
+
+    // 全 pin → 返 -1
+    wbm_set_pinned(&wbm, 1, true);
+    wbm_set_pinned(&wbm, 2, true);
+    wbm_set_pinned(&wbm, 3, true);
+    check_eq_int(wbm_pick_lru_victim(&wbm, -1), -1, "全 pin 时 -1");
+
+    // unpin block 2 → 应选 2
+    wbm_set_pinned(&wbm, 2, false);
+    check_eq_int(wbm_pick_lru_victim(&wbm, -1), 2, "unpin 后选 2");
+
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_pinned_skipped_by_lru\n");
+}
+
+// —— 用例 10：wbm_evict_to_byte_budget 批量挑 victim ——
+void test_evict_to_byte_budget_picks() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 5);
+    // 异构 size：10, 20, 30, 40, 50（共 150）
+    wbm_register_block(&wbm, 0, &fake_host_pool[0], 10);
+    wbm_register_block(&wbm, 1, &fake_host_pool[1], 20);
+    wbm_register_block(&wbm, 2, &fake_host_pool[2], 30);
+    wbm_register_block(&wbm, 3, &fake_host_pool[3], 40);
+    wbm_register_block(&wbm, 4, &fake_host_pool[4], 50);
+    for (int i = 0; i < 5; ++i) {
+        wbm_mark_resident(&wbm, i, reinterpret_cast<void *>(0x200 + i));
+        wbm_touch(&wbm, i, static_cast<uint64_t>(i + 1));  // 0 最旧
+    }
+    check_eq_sz(wbm_resident_bytes(&wbm), 150, "init bytes");
+
+    // 目标 80 bytes：从最旧的 0 开始挑：10 (剩 140) → 20 (剩 120) → 30 (剩 90)
+    // → 40 (剩 50) → 满足 ≤ 80。共选 4 个，剩 block 4 (50 bytes)
+    std::vector<int> victims;
+    int n = wbm_evict_to_byte_budget(&wbm, 80, -1, &victims);
+    check_eq_int(n, 4, "选中 4 个");
+    check_eq_int(static_cast<int>(victims.size()), 4, "victims 大小 4");
+    check_eq_int(victims[0], 0, "首选最旧 0");
+    check_eq_int(victims[1], 1, "次选 1");
+    check_eq_int(victims[2], 2, "再选 2");
+    check_eq_int(victims[3], 3, "再选 3");
+
+    // 注意：evict_to_byte_budget 不修改 resident 状态（OpenCL 包装层负责）
+    check_eq_sz(wbm_resident_bytes(&wbm), 150, "pick 不动 resident");
+    check_eq_int(wbm_resident_count(&wbm), 5, "pick 不动 count");
+
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_evict_to_byte_budget_picks\n");
+}
+
+// —— 用例 11：byte budget 配合 pin 和 exclude ——
+void test_evict_to_byte_budget_pin_exclude() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 4);
+    // 全 30 bytes
+    register_uniform(&wbm, 4, 30);
+    for (int i = 0; i < 4; ++i) {
+        wbm_mark_resident(&wbm, i, reinterpret_cast<void *>(0x300 + i));
+        wbm_touch(&wbm, i, static_cast<uint64_t>(i + 1));
+    }
+    check_eq_sz(wbm_resident_bytes(&wbm), 120, "init bytes");
+
+    // pin block 0（最旧）、exclude block 1。目标 60 bytes → 只能选 2、3。
+    wbm_set_pinned(&wbm, 0, true);
+    std::vector<int> victims;
+    int n = wbm_evict_to_byte_budget(&wbm, 60, /*exclude=*/1, &victims);
+    check_eq_int(n, 2, "只选到 2 个");
+    check_eq_int(victims[0], 2, "首选 2");
+    check_eq_int(victims[1], 3, "次选 3");
+
+    // 把目标压更小：30。可选剩 60 bytes，pin/exclude 阻断进一步驱逐。
+    victims.clear();
+    n = wbm_evict_to_byte_budget(&wbm, 30, /*exclude=*/1, &victims);
+    check_eq_int(n, 2, "目标 30：能挑的还是只有 2 个");
+    // resident_bytes 仍 120（pick 不动状态）。函数返回但目标未达。
+
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_evict_to_byte_budget_pin_exclude\n");
+}
+
+// —— 用例 12：byte budget 已满足时返回 0、不动 victims ——
+void test_evict_to_byte_budget_already_satisfied() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 3);
+    register_uniform(&wbm, 3, 10);
+    wbm_mark_resident(&wbm, 0, reinterpret_cast<void *>(0x400));
+    wbm_mark_resident(&wbm, 1, reinterpret_cast<void *>(0x401));
+    // resident_bytes = 20
+
+    std::vector<int> victims;
+    victims.push_back(99);  // 预填的"脏"内容
+    int n = wbm_evict_to_byte_budget(&wbm, 100, -1, &victims);
+    check_eq_int(n, 0, "预算已满足");
+    check_eq_int(static_cast<int>(victims.size()), 1, "out_victims 不清空（保留 99）");
+    check_eq_int(victims[0], 99, "预填内容保留");
+
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_evict_to_byte_budget_already_satisfied\n");
+}
+
 }  // namespace
 
 int main() {
@@ -292,6 +411,10 @@ int main() {
     test_max_resident_blocks_heterogeneous();
     test_last_use_event();
     test_streaming_simulation();
+    test_pinned_skipped_by_lru();
+    test_evict_to_byte_budget_picks();
+    test_evict_to_byte_budget_pin_exclude();
+    test_evict_to_byte_budget_already_satisfied();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

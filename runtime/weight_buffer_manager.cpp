@@ -18,6 +18,7 @@ int wbm_init(weight_buffer_manager *wbm, int n_blocks) {
         wbm->blocks[i].host_ptr        = nullptr;
         wbm->blocks[i].byte_size       = 0;
         wbm->blocks[i].resident        = false;
+        wbm->blocks[i].is_pinned       = false;
         wbm->blocks[i].last_used_token = 0;
         wbm->blocks[i].backend_handle  = nullptr;
         wbm->blocks[i].last_use_event  = nullptr;
@@ -80,12 +81,19 @@ void wbm_set_last_use_event(weight_buffer_manager *wbm, int idx, void *event) {
     wbm->blocks[idx].last_use_event = event;
 }
 
+void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned) {
+    if (!wbm) return;
+    if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) return;
+    wbm->blocks[idx].is_pinned = pinned;
+}
+
 int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
     if (!wbm) return -1;
     int victim = -1;
     uint64_t oldest = static_cast<uint64_t>(-1);  // UINT64_MAX
     for (const auto &b : wbm->blocks) {
-        if (!b.resident) continue;
+        if (!b.resident)            continue;
+        if (b.is_pinned)            continue;
         if (b.block_idx == exclude_idx) continue;
         if (b.last_used_token < oldest) {
             oldest = b.last_used_token;
@@ -93,6 +101,44 @@ int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
         }
     }
     return victim;
+}
+
+int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
+                             size_t target_bytes,
+                             int exclude_idx,
+                             std::vector<int> *out_victims) {
+    if (!wbm || !out_victims) return 0;
+    // 纯挑选：不修改 resident 状态、不释放 backend handle，
+    // 只把 victim 序号追加到 out_victims。这样 OpenCL 包装层能拿到完整
+    // (cl_mem, cl_event) 表做批量 clWaitForEvents + clReleaseMemObject，
+    // 然后才回头逐个 mark_evicted。
+    //
+    // 模拟"如果驱逐已选 victim 后字节数会是多少"：用本地 simulated_bytes
+    // 跟踪，pick 算法继续基于真实 last_used_token / pinned / exclude。
+    size_t simulated_bytes = wbm->resident_bytes;
+    // 用一张本地 set 标记已选过的，避免重复选同一个
+    std::vector<bool> picked(wbm->blocks.size(), false);
+    int n_picked = 0;
+    while (simulated_bytes > target_bytes) {
+        int victim = -1;
+        uint64_t oldest = static_cast<uint64_t>(-1);
+        for (const auto &b : wbm->blocks) {
+            if (!b.resident)               continue;
+            if (b.is_pinned)               continue;
+            if (b.block_idx == exclude_idx) continue;
+            if (picked[b.block_idx])        continue;
+            if (b.last_used_token < oldest) {
+                oldest = b.last_used_token;
+                victim = b.block_idx;
+            }
+        }
+        if (victim < 0) break;
+        picked[victim] = true;
+        simulated_bytes -= wbm->blocks[victim].byte_size;
+        out_victims->push_back(victim);
+        ++n_picked;
+    }
+    return n_picked;
 }
 
 size_t wbm_max_block_bytes(const weight_buffer_manager *wbm) {

@@ -292,13 +292,22 @@ OpenCL 异步同步：用 `cl_event` 跟踪每个 op，evict 前 `clWaitForEvent
 等用到被驱逐 buffer 的最后一个 event；不在 layer 边界 `clFinish` 整个
 queue，保留 dispatch/compute 流水。
 
-**Q3：mmap unmap_fragment 要不要用？**
+**Q3：mmap unmap_fragment 要不要用？** ✅ 部分决议
 
 `src/llama-mmap.h:45` 有 `unmap_fragment(first, last)`。规范 §10 提到：CPU
 侧 mmap 镜像即使权重在 GPU 上也算 DRAM。Evict 一个 block 时，除了
 `clReleaseMemObject` 还要 `madvise(MADV_DONTNEED)` 它的 mmap 范围，否则
-内核 page cache 仍会占着。**待定**：首版先只动 cl_mem，看 VmRSS 是否
-"够低"；不够再加 madvise。
+内核 page cache 仍会占着。**首版先只动 cl_mem**。
+
+OnePlus 12 (Adreno 750) probe_cl_release 实测 2026-05-14：**clReleaseMemObject
+释放的 cl_mem 真的把 DRAM 还给系统**——
+- 4×64MB interleaved alloc/free：alloc 后 +64MB RSS，release 后回到 +0.11MB
+- 8×64MB batched 同时分配 (~512MB)：release 后回到 +0.18MB
+
+§6 的 madvise / `CL_MEM_ALLOC_HOST_PTR` fallback **不需要走**。其它芯片
+（Mali / 旧 Adreno）需复测；当前按 Snapdragon 8 Gen 3 这个事实推进。
+
+§10 同名 open issue 关闭。
 
 **Q4：KV cache 在哪个 buffer_type 上？**
 

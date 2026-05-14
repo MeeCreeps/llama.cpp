@@ -23,12 +23,14 @@
 
 namespace elastic {
 
-// 每个 transformer block 的元数据
+// 每个被 WBM 管理的权重单元（ε 方案下 = 单个 weight tensor；γ 方案下 = 单个
+// transformer layer 聚合）。"block" 名字保留为不破坏 API 兼容，语义按粒度而变。
 struct block_meta {
     int      block_idx;          // 0 .. n_blocks-1
     void    *host_ptr;           // mmap_base + tensor_offset，host 端起点
     size_t   byte_size;          // 这个 block 全部权重字节数（在 GGUF 里）
     bool     resident;           // true = backend_handle 有效，权重已在 GPU 上
+    bool     is_pinned;          // true 时 LRU 不选它做 victim（小权重永驻）
     uint64_t last_used_token;    // LRU 用的"最近使用 token 序号"
     void    *backend_handle;     // 不透明 cl_mem 句柄；nullptr = 未分配
     void    *last_use_event;     // 不透明 cl_event；evict 前需 wait 此 event
@@ -71,9 +73,24 @@ void wbm_touch(weight_buffer_manager *wbm, int idx, uint64_t token);
 // 拿这个 event 去 clWaitForEvents 等它结束才释放 cl_mem。
 void wbm_set_last_use_event(weight_buffer_manager *wbm, int idx, void *event);
 
-// LRU 选受害者：从已驻留 block 里挑 last_used_token 最小、且不是
-// exclude_idx 的。返回 block_idx；没合适候选时返回 -1。
+// 标记一个 block 是否 pinned（永驻）。pinned 的 block 不会被 LRU 选作 victim。
+// 适合给 RMSNorm 等小权重用，避免频繁换入换出。
+void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned);
+
+// LRU 选受害者：从已驻留 + 非 pinned 的 block 里挑 last_used_token 最小、且
+// 不是 exclude_idx 的。返回 block_idx；没合适候选时返回 -1。
 int  wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx);
+
+// 字节预算批量驱逐：贪心 LRU 挑 victim 直到 resident_bytes <= target_bytes。
+// out_victims 按选中顺序追加 block_idx；不会清空已有内容。
+// pinned + exclude_idx 跳过。返回选中的 victim 数（== out_victims 增加的长度）。
+// 注意本函数**不实际释放 backend handle**，只调 wbm_mark_evicted；GPU 端的
+// clReleaseMemObject 由 OpenCL 包装层的 wbmcl_evict_batch 拿这个 victim 列表
+// 做批量同步 + 释放。
+int  wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
+                              size_t target_bytes,
+                              int exclude_idx,
+                              std::vector<int> *out_victims);
 
 // 按预算算出最大允许驻留 block 数：
 //     floor((B - kv - misc) / max_block_bytes)

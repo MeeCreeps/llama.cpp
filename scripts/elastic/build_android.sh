@@ -63,14 +63,22 @@ cmake -S "$ROOT/runtime" -B "$BUILD_DIR" -G "$GEN" \
 cmake --build "$BUILD_DIR" -j
 
 echo
-echo "构建完成。adb push 到真机示例（按需调整）："
+echo "构建完成。adb 部署示例（按需调整）："
 echo
 echo "  DEV=/data/local/tmp/elastic"
 echo "  adb shell mkdir -p \$DEV"
-echo "  adb push $OCL/lib/libOpenCL.so \$DEV/"
+echo "  # 一次性：push libc++_shared.so（NDK c++_shared 链接产物需要）"
+echo "  LIBCXX=\$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+echo "  adb push \$LIBCXX \$DEV/"
+echo "  # 二进制"
 echo "  adb push $BUILD_DIR/tests_elastic/probe_cl_release \$DEV/"
-echo "  adb shell 'cd '\$DEV' && LD_LIBRARY_PATH=. ./probe_cl_release --size-mb 64 --iters 4 --mode interleaved'"
+echo "  adb push $BUILD_DIR/tests_elastic/test_budget_watcher \$DEV/"
+echo "  adb push $BUILD_DIR/tests_elastic/test_weight_buffer_manager \$DEV/"
+echo "  # 运行：用系统 vendor 路径的 libOpenCL.so，本地路径取 libc++_shared.so"
+echo "  adb shell 'cd '\$DEV' && LD_LIBRARY_PATH=.:/system/vendor/lib64:/vendor/lib64 ./probe_cl_release --size-mb 64 --iters 4 --mode interleaved'"
 echo
-echo "注意：真机上 Adreno 自己的 libOpenCL.so 通常在 /system/vendor/lib64/，"
-echo "      LD_LIBRARY_PATH=. 让我们的 ICD loader 优先；ICD loader 仍会通过"
-echo "      /system/vendor/etc/OpenCL/vendors/*.icd 找到 Qualcomm 实现。"
+echo "注意：**不要把我们 third_party/opencl-android/lib/libOpenCL.so push 到 \$DEV/**。"
+echo "      Adreno 设备上没有 /etc/OpenCL/vendors/*.icd，系统直接用"
+echo "      /system/vendor/lib64/libOpenCL.so 作 OpenCL 实现。push 我们那份 ICD loader"
+echo "      并以 LD_LIBRARY_PATH=. 优先加载，会得到 CL_PLATFORM_NOT_FOUND_KHR(-1001)。"
+echo "      我们那份 libOpenCL.so 只在编译时给链接器用。"
