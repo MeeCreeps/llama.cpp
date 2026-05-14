@@ -1,0 +1,19 @@
+# OnePlus 12 设备 profile（占位值，待真机实测后填入真值）
+#
+# 用法：scripts/elastic/convert_npz_to_budget_csv.py --device configs/devices/oneplus12.yaml
+#
+# 字段含义：
+#   dram_total_mb        ：手机总 DRAM
+#   kernel_overhead_mb   ：Linux 内核 + 驱动常驻（建议读 /proc/meminfo
+#                          MemTotal - MemAvailable 在 idle 时的稳态值）
+#   system_baseline_mb   ：Android system_server / zygote / surfaceflinger 等
+#                          系统服务的常驻（建议 adb shell dumpsys meminfo 在
+#                          空桌面状态下统计）
+#
+# OnePlus 12 16GB 配置；24GB 版把 dram_total_mb 改成 24576。
+# kernel_overhead_mb / system_baseline_mb 这两项当前为粗估占位，**真机跑前必须实测覆盖**。
+
+device: oneplus12
+dram_total_mb: 16384
+kernel_overhead_mb: 800
+system_baseline_mb: 2200
