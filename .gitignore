@@ -158,3 +158,4 @@ runtime/build/
 third_party/
 runtime/build-android/
 build-android-llama/
+results/

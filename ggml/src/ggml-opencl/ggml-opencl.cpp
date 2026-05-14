@@ -2835,6 +2835,8 @@ struct ggml_opencl_elastic_state {
     uint64_t n_evicts_total      = 0;
     uint64_t n_reloads_total     = 0;
     size_t   bytes_reloaded_total = 0;
+
+    std::chrono::steady_clock::time_point t0;  // wbm 初始化时刻；用于 metrics.t_sec
 };
 
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
@@ -2868,6 +2870,7 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         return;
     }
     s->wbm_inited = true;
+    s->t0 = std::chrono::steady_clock::now();
 
     s->kv_bytes      = ggml_opencl_env_mb("GGML_ELASTIC_KV_MB",   128);
     s->misc_overhead = ggml_opencl_env_mb("GGML_ELASTIC_MISC_MB", 256);
@@ -2923,6 +2926,30 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             const elastic::block_meta *bm =
                 elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
             if (bm && !bm->resident) {
+                // 预先 evict：保证 reload 之后 resident_bytes <= target，避免
+                // "reload 一个 → resident 涨 → 下次周期 evict 之前违反预算" 的
+                // 短暂超额。spec §5 第 7 条要求每个 step 都满足合规。
+                if (est->bw_inited) {
+                    const size_t B_t_mb  = elastic::budget_watcher_get(&est->bw);
+                    const size_t budget  = B_t_mb * 1024 * 1024;
+                    const size_t kv_misc = est->kv_bytes + est->misc_overhead;
+                    const size_t target  = budget > kv_misc ? budget - kv_misc : 0;
+                    const size_t needed  = est->wbm.resident_bytes + bm->byte_size;
+                    if (needed > target) {
+                        // 给即将 reload 的 bm 腾出位置：把现有 resident 压到
+                        // target - bm->byte_size 以下（saturated）
+                        const size_t pre_target = target > bm->byte_size ?
+                                                  target - bm->byte_size : 0;
+                        CL_CHECK(clFinish(backend_ctx->queue));
+                        std::vector<int> victims;
+                        int n = elastic::wbm_evict_to_byte_budget(&est->wbm, pre_target,
+                                                                  /*exclude=*/src_extra->wbm_idx, &victims);
+                        if (n > 0) {
+                            int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
+                            est->n_evicts_total += released;
+                        }
+                    }
+                }
                 int rc = elastic::wbmcl_ensure_resident(&est->octx, src_extra->wbm_idx);
                 if (rc != 0) {
                     GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
@@ -3011,7 +3038,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     // 一次 graph_compute 收尾：把单步 metrics 落盘
     if (elastic_active && est->metrics_inited) {
         elastic::metrics_record r{};
-        r.t_sec                = 0.0;  // TODO: budget watcher 启动时刻起算
+        r.t_sec = std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - est->t0).count();
         r.B_t_mb               = est->bw_inited ? elastic::budget_watcher_get(&est->bw) : 0;
         r.resident_bytes       = est->wbm.resident_bytes;
         r.n_blocks_resident    = est->wbm.n_resident;
