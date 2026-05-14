@@ -16,7 +16,7 @@
 | H1 | `src/llama-model.cpp` | `llama_model::load_tensors` (≈L2203) | 不在这里搬权重；记录每个 layer 的 tensor name → (host_ptr, byte_size) 表给 WBM。**不调** ggml-opencl 的 alloc。 | TODO |
 | H2 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_buffer_type_alloc_buffer` (≈L3939) | 对**权重 buffer 类型**改成 lazy：不立刻 `clCreateBuffer`，返回一个空壳 `cl_mem` slot，等 WBM 真要用时再建。激活 buffer / KV / 中间 tensor 走原路径。 | TODO |
 | H3 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_buffer_set_tensor` (≈L3342) | 上传时调 `wbm_ensure_resident(block_idx_from_tensor)`。 | TODO |
-| H4 | `src/models/<arch>.cpp` 各 `llm_build_*` | 逐 layer 的 graph 构造（如 `llm_build_glm4::llm_build_glm4`） | 在引用 `model.layers[il].*` 之前调 `wbm_ensure_resident(il)`；完事 LRU + `wbm_evict` 释放过期 layer。 | TODO |
+| H4 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_graph_compute` | 遍历 cgraph 节点时按 src tensor 名解 `blk.<N>.*` 得 layer 序号；layer 边界处 ensure → event-sync wait → LRU evict → 异步 prefetch。**改一处覆盖所有架构**，不需要 patch 每个 `llm_build_*`。 | TODO |
 | H5 | `examples/elastic-cli/elastic-cli.cpp` | 主 decode 循环 | 拉 BudgetWatcher、按 step 写 MetricsLogger、每 step 校验 `resident_bytes ≤ B(t)`、违反 abort。 | TODO |
 
 H1 仅做"建索引"。真正的物质性补丁是 H2 + H4（前者把权重 cl_mem 改成
@@ -125,32 +125,81 @@ buffer_type 处分流（weight 用 lazy，其它用原）。**这里需要查上
 **风险**：set_tensor 也会被 KV / 激活路径调到，需要白名单只对"权重 tensor"
 插钩，否则会破坏 KV 上传。判定方式：检查 buffer_type 是不是 weight_lazy。
 
-### H4：架构 graph build 加 ensure/evict
+### H4：ggml-opencl 后端的 graph_compute 入口按 tensor 名分组（B1' 方案）
 
-**位置**：`src/models/<arch>.cpp` 的 `llm_build_*` 类构造里逐层循环开头。
-每个支持的 arch（llama、glm4、qwen 等）都要改一遍 —— **首版只覆盖
-Llama-3.2 系列**，其它架构作为后续 follow-up。
+**位置**：`ggml/src/ggml-opencl/ggml-opencl.cpp` 里注册到
+`ggml_backend_i::graph_compute` 的回调（具体函数名待 patch 时锁定 —— 这层
+入口接收 `ggml_cgraph *`，遍历 nodes 并 enqueue OpenCL kernel）。
 
-**逻辑**：
+**关键洞察**：llama.cpp 给每个权重 tensor 起的名字是稳定约定 `blk.<N>.*`
+（`blk.7.attn_q.weight`、`blk.7.ffn_up.weight` ...）。op 节点的 `src[]` 里
+任一权重 tensor 的名字前缀就能反查 layer 序号。**不需要给 ggml 节点新加
+"layer 属性"字段，也不需要 fork ggml 核心调度器。**
+
+**改造逻辑**（伪代码）：
 ```cpp
-for (int il = 0; il < n_layer; ++il) {
-    wbm_ensure_resident(wbm, il);
-    // ... 原有 attention + ffn graph 节点 ...
+int last_layer = -1;
+for (int i = 0; i < graph->n_nodes; ++i) {
+    ggml_tensor *node = graph->nodes[i];
+    int layer = layer_id_from_node_srcs(node);   // "blk.7.*" → 7；非 layer 节点 → -1
 
-    size_t B_t = budget_watcher_get(bw);
-    int max_resident = wbm_max_resident_blocks(wbm, B_t, kv_bytes, misc);
-    while (wbm_resident_count(wbm) > max_resident) {
-        int v = wbm_pick_lru_victim(wbm, /*exclude=*/il);
-        if (v < 0) break;
-        wbm_evict(wbm, v);
+    if (layer >= 0 && layer != last_layer) {
+        wbm_ensure_resident(wbm, layer);
+
+        // LRU 释放
+        size_t B_t = budget_watcher_get(bw);
+        int max_resident = wbm_max_resident_blocks(wbm, B_t, kv_bytes, misc);
+        while (wbm_resident_count(wbm) > max_resident) {
+            int v = wbm_pick_lru_victim(wbm, /*exclude=*/layer);
+            if (v < 0) break;
+            // Event-sync：wait 受害者上最近一次 kernel event，再 release
+            wbm_evict(wbm, v);
+        }
+
+        // headroom 够就 prefetch 下一段
+        if (max_resident > wbm_resident_count(wbm) && layer + 1 < n_layer) {
+            wbm_prefetch(wbm, layer + 1);
+        }
+        last_layer = layer;
+    }
+
+    cl_event ev = dispatch_op(node);   // 原有 enqueue 路径，但要拿 event
+    // 给 node->src[i] 里的每个权重 cl_mem 记一笔 last_use_event = ev
+    for (auto *s : node->src) {
+        int l = layer_id_from_tensor(s);
+        if (l >= 0) wbm_mark_in_use(wbm, l, ev, current_token);
     }
 }
 ```
 
-**问题**：llama.cpp 的 graph 是先**构建**整个 ggml_cgraph，再一次性
-**执行**，不是逐 layer 同步执行。`wbm_ensure_resident` 放在 graph 构建期意
-义不大 —— 真正的 clEnqueueNDRangeKernel 在 `ggml_backend_graph_compute` 里
-触发。**这是 Phase 2 设计的核心难点**，详见 §4 open Q3。
+**前提与坑**：
+
+1. **节点拓扑序天然按 layer 顺序**：llama.cpp 的 `llm_build_llama` 是
+   `for (il = 0..n_layer-1)` 一层一层往 cgraph 塞节点，topo 排序后同 layer
+   节点保持连续且 layer 0 在前、layer N-1 在后。这是稳定的实现事实但不是
+   ggml 抽象保证。**首次 patch 时要 assert 验证**：扫一遍节点序列，确认
+   "layer 序号单调不减"，不满足直接 abort 给清晰错误。
+
+2. **OpenCL 异步性 & event 同步**：`clEnqueueNDRangeKernel` 返回时 kernel
+   还在 queue 里没真跑。如果 layer 7 的 kernel 还没 run 完就
+   `clReleaseMemObject` 它的 Wq，行为 UB。**用 event 跟踪**：每个 op
+   dispatch 拿一个 `cl_event`，记到它 src 里所有 layer 权重的
+   `last_use_event` 字段；evict 前 `clWaitForEvents(1, &last_use_event)` 只
+   等"用到这个被驱逐 buffer 的"最后一个 event。比每个 layer 边界
+   `clFinish` 精确，不丢 dispatch/compute 流水。
+
+3. **非 layer tensor**：`token_embd.weight`、`output_norm.weight`、
+   `output.weight` 不在 `blk.<N>.*` 命名下。这些**永远常驻**，alloc 走原
+   路径，不归 WBM 管。layer_id_from_tensor 对它们返回 -1。
+
+4. **KV / 激活也走 src[]**：判定权重 tensor 用前缀 `blk.<N>.` + 后缀 `.weight`
+   双重过滤，避免误把 KV 或临时 tensor 当 layer 权重。
+
+**改动量**：~250 行；位置集中在 ggml-opencl 后端一个文件里，**一处覆盖所
+有架构**（llama / qwen / glm 都共享后端）。
+
+**能不能干净退出**：能。整个 layer-aware 逻辑用 `#ifdef GGML_OPENCL_ELASTIC`
+或 runtime env `LLAMA_ELASTIC=1` 守护，关掉就回原 enqueue 路径。
 
 ### H5：elastic-cli 主入口
 
@@ -174,19 +223,24 @@ ggml 的 buffer_type 概念是按"内存域"分的（CPU / OpenCL / CUDA），�
 type、激活仍走原 type。**待定**：要不要 patch llama.cpp 的 buft 选择，还
 是用环境变量绕开？倾向前者，但要先读懂上游 buft list 构造路径。
 
-**Q2：lazy buffer 怎么和 ggml_backend_graph_compute 协作？**
+**Q2：lazy buffer 怎么和 ggml_backend_graph_compute 协作？** ✅ 已决议
 
-执行时 ggml runtime 不知道 cl_mem 是 NULL 还是已分配。可能的方案：
-1. 在 H4 的 graph build 之后、compute 之前，扫一遍要用的 tensor，调
-   wbm_ensure_resident 把这一轮所有需要的 layer 都先驻留好（无法做到逐 layer
-   流式，但保证不崩）
-2. 自定义 ggml backend 的 compute 路径，在每个 op 执行前注入 ensure
-   （工作量大，侵入性强）
+**结论：B1' —— 在 ggml-opencl 后端的 `graph_compute` 回调里按 tensor 名分组。**
 
-**首版选 (1)**：在 decode 入口处一次性 ensure 当前 max_resident 个 layer，
-随着 token 推进调整。流式行为以"一个 forward 内不变"为粒度 —— 比规范 §2
-描述的"每个 block 内 ensure → compute → evict"粗，但能跑通，性能验证后
-再升级。**先和你确认这个降级是否可接受**（详见本文档结尾的 ⚠️）。
+核心洞察：llama.cpp 给权重 tensor 起的名字是稳定约定 `blk.<N>.*`，op 节点
+的 `src[]` 里任一权重 tensor 名前缀就能反查 layer 序号，不需要给 ggml 核
+心新加 `elastic_layer_id` 字段。详见 §3 H4 改写后的伪代码。
+
+排除的备选：
+- 节点级 fork ggml 核心：要改 `struct ggml_tensor` + 通用调度器 + 每个
+  arch 的 `llm_build_*`。工程量大、跟上游 rebase 难，且会污染 CUDA/Metal
+  等不需要 elastic 的 backend。
+- forward 粒度（"装不下整个 forward 就拆 sub-graph"）：流式表达力弱，
+  装不下时的 sub-graph 切分本身比 B1' 还麻烦。
+
+OpenCL 异步同步：用 `cl_event` 跟踪每个 op，evict 前 `clWaitForEvents` 只
+等用到被驱逐 buffer 的最后一个 event；不在 layer 边界 `clFinish` 整个
+queue，保留 dispatch/compute 流水。
 
 **Q3：mmap unmap_fragment 要不要用？**
 
@@ -228,4 +282,5 @@ llama.cpp 行为。**回退基线 = 跑通 examples/main，没有 WBM 任何介�
 
 ---
 
-> ⚠️ **降级提示**：首版 H4 不做"逐 block ensure/evict"而是"每个 forward 入口处一次性 ensure，forward 内不换"。流式粒度从 block 退到 forward，比规范 §2 描述粗。正式跑 Test 1 前需要你点头。
+> Phase 2 设计基线：B1' + event 跟踪。逐 layer 粒度，贴合规范 §2；
+> patch 集中在 ggml-opencl 后端一处。
