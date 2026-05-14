@@ -3108,20 +3108,68 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
 //
 // buffer
 //
+//
+// elastic 模式 (env GGML_OPENCL_ELASTIC=1)：
+//   只对**权重 buffer** 启用 per-tensor cl_mem；KV / 计算 / 临时 buffer 仍走
+//   原 monolithic 一块大 cl_mem 的路径，行为零变化。
+//
+//   alloc_buffer 时拿不到 tensor 信息，无法判断这个 buffer 是给权重还是 KV。
+//   所以 ε 模式下 alloc_buffer 把 buffer 标记为 PENDING（不立刻 alloc 任何
+//   cl_mem），延迟到第一次 init_tensor 看 tensor name 才定：
+//     - 名字以 ".weight" 结尾 → ELASTIC（per-tensor cl_mem）
+//     - 否则                  → MONOLITHIC（lazy 把整块 cl_mem alloc 起来）
+//
+//   详见 docs/elastic/baseline_external_execution.md 与 runtime/RUNTIME_PATCHES.md §3 H2。
+//
+static bool ggml_opencl_elastic_enabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *e = std::getenv("GGML_OPENCL_ELASTIC");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (cached) {
+            GGML_LOG_INFO("ggml_opencl: GGML_OPENCL_ELASTIC=1，权重 buffer 启用 per-tensor cl_mem 模式\n");
+        }
+    }
+    return cached == 1;
+}
+
+// 判断 tensor 是不是权重。简单规则：名字以 ".weight" 结尾。
+// LLM 权重 (blk.<N>.*.weight, token_embd.weight, output_norm.weight, output.weight)
+// 都满足；KV cache 与激活的 tensor 都不以 .weight 结尾。
+static bool ggml_opencl_is_weight_tensor(const char *name) {
+    if (!name) return false;
+    const size_t n = strlen(name);
+    const size_t suf = 7;  // strlen(".weight")
+    if (n < suf) return false;
+    return strcmp(name + n - suf, ".weight") == 0;
+}
+
 struct ggml_backend_opencl_buffer_context {
+    // 三态生命周期：alloc_buffer 进 PENDING；首个 init_tensor 决定升 ELASTIC
+    // 或 MONOLITHIC。MONOLITHIC 才会真正 push 一个 cl_mem 到 buffer；ELASTIC
+    // 在每次 init_tensor 时 push 一个 per-tensor cl_mem。
+    enum mode_t { MODE_MONOLITHIC, MODE_PENDING, MODE_ELASTIC };
+
     // A buffer context can hold multiple cl_mem objects. This is for flattening
     // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
     // each tensor is allocated a separate buffer. When flattening is enabled
     // with small allocation, each tensor is backed by two cl_mem objects (for
     // quants and scales) packed into a backend_opencl_buffer.
     ggml_backend_opencl_buffer_context(cl_mem buf)
-        : name("OpenCL") {
+        : mode(MODE_MONOLITHIC), pending_size_hint(0), name("OpenCL") {
         buffer.push_back(buf);
     }
 
+    // PENDING 构造：alloc_buffer 把 size 记下来，等 init_tensor 决定升级路径。
+    struct pending_tag_t {};
+    ggml_backend_opencl_buffer_context(pending_tag_t, size_t size_hint)
+        : mode(MODE_PENDING), pending_size_hint(size_hint), name("OpenCL-Pending") {}
+
     ~ggml_backend_opencl_buffer_context() {
         for (cl_mem buf : buffer) {
-            CL_CHECK(clReleaseMemObject(buf));
+            if (buf) {                          // ELASTIC 下 WBM 可能已 release，skip nullptr
+                CL_CHECK(clReleaseMemObject(buf));
+            }
         }
         for (cl_mem im : img) {
             CL_CHECK(clReleaseMemObject(im));
@@ -3263,6 +3311,8 @@ struct ggml_backend_opencl_buffer_context {
     // one for scales. They should be populated only when flattening and small
     // allocation are enabled.
     std::vector<cl_mem> img;
+    mode_t mode;              // MODE_MONOLITHIC / MODE_PENDING / MODE_ELASTIC
+    size_t pending_size_hint; // alloc_buffer 时记录，PENDING → MONOLITHIC 升级时用来真正 alloc
     std::string name;
 };
 
@@ -3279,7 +3329,33 @@ static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) 
 static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
 
-    ggml_cl2_init(buffer->buft->device);
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+
+    // PENDING 升级：第一次见到 tensor 时按 name 决定走 ELASTIC 还是 MONOLITHIC。
+    // 后续 init_tensor 沿用本 buffer 已决定的模式。
+    if (ctx->mode == ggml_backend_opencl_buffer_context::MODE_PENDING) {
+        if (ggml_opencl_is_weight_tensor(tensor->name)) {
+            ctx->mode = ggml_backend_opencl_buffer_context::MODE_ELASTIC;
+            ctx->name = "OpenCL-Elastic";
+            GGML_LOG_INFO("ggml_opencl elastic: buffer 升 ELASTIC（size=%.2f MiB，首 tensor='%s'）\n",
+                          ctx->pending_size_hint / 1024.0 / 1024.0, tensor->name);
+        } else {
+            // 非权重 buffer 退回 monolithic：现在才把整块 cl_mem 真正分配出来。
+            cl_int err = CL_SUCCESS;
+            cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                        ctx->pending_size_hint, NULL, &err);
+            if (err != CL_SUCCESS) {
+                GGML_LOG_ERROR("ggml_opencl elastic: 升 MONOLITHIC 时 clCreateBuffer %.2f MiB 失败: %d\n",
+                               ctx->pending_size_hint / 1024.0 / 1024.0, err);
+                return GGML_STATUS_ALLOC_FAILED;
+            }
+            ctx->buffer.push_back(mem);
+            ctx->mode = ggml_backend_opencl_buffer_context::MODE_MONOLITHIC;
+            ctx->name = "OpenCL";
+            GGML_LOG_INFO("ggml_opencl elastic: buffer 升 MONOLITHIC（size=%.2f MiB，首 tensor='%s'）\n",
+                          ctx->pending_size_hint / 1024.0 / 1024.0, tensor->name);
+        }
+    }
 
     if (tensor->view_src != nullptr) {
         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
@@ -3304,6 +3380,26 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         // FIXME: if any unexpected results are seen, double check the offset -
         // there could be other places that need fix.
         tensor->extra = view_extra;
+    } else if (ctx->mode == ggml_backend_opencl_buffer_context::MODE_ELASTIC) {
+        // elastic 模式：每个 tensor 一块独立 cl_mem。完全无视 ggml-alloc 算出来
+        // 的 tensor->data offset。extra->offset = 0 因为 tensor 独占整块 buffer。
+        size_t nbytes = ggml_nbytes(tensor);
+        if (nbytes == 0) nbytes = 1;            // clCreateBuffer 不接受 size=0
+        cl_int err = CL_SUCCESS;
+        cl_mem own_buf = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                        nbytes, NULL, &err);
+        if (err != CL_SUCCESS) {
+            GGML_LOG_ERROR("ggml_opencl elastic: clCreateBuffer 失败 tensor '%s' size %zu: %d\n",
+                           tensor->name, nbytes, err);
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        ctx->buffer.push_back(own_buf);
+
+        ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
+        extra->offset      = 0;
+        extra->data_device = own_buf;
+        extra->actual_size = ggml_nbytes(tensor);
+        tensor->extra      = extra;
     } else {
         {
             size_t offset = (char *) tensor->data - (char *) ggml_backend_opencl_buffer_get_base(buffer);
@@ -3903,6 +3999,11 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
     cl_command_queue queue = backend_ctx->queue;
 
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    // ELASTIC 是权重 buffer，set_tensor 会覆盖写完整内容，不需要 zero-init。
+    // PENDING 还没决定升路径，更不需要 clear。
+    if (ctx->mode != ggml_backend_opencl_buffer_context::MODE_MONOLITHIC) {
+        return;
+    }
     for (cl_mem buf : ctx->buffer) {
         CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
     }
@@ -3941,6 +4042,15 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
 
     // clCreateBuffer returns -61 for size 0
     size = std::max(size, (size_t)1);
+
+    // elastic 模式：alloc_buffer 拿不到 tensor 名，无法判断是权重还是 KV。
+    // 进 PENDING 态，记录 size 但**不**调 clCreateBuffer，等首个 init_tensor
+    // 看 tensor name 再决定升 ELASTIC（权重）还是 MONOLITHIC（KV / 激活）。
+    if (ggml_opencl_elastic_enabled()) {
+        ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(
+            ggml_backend_opencl_buffer_context::pending_tag_t{}, size);
+        return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
+    }
 
     cl_int err;
     cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
