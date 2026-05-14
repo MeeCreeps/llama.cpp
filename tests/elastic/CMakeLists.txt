@@ -7,6 +7,11 @@ target_link_libraries(test_budget_watcher PRIVATE elastic_runtime)
 target_compile_options(test_budget_watcher PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME test_budget_watcher COMMAND test_budget_watcher)
 
+add_executable(test_weight_buffer_manager test_weight_buffer_manager.cpp)
+target_link_libraries(test_weight_buffer_manager PRIVATE elastic_runtime)
+target_compile_options(test_weight_buffer_manager PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME test_weight_buffer_manager COMMAND test_weight_buffer_manager)
+
 # OpenCL 探针：验证 clReleaseMemObject 是否真的还 DRAM。
 # 没装 OpenCL 时静默跳过，不影响其他 target 与 ctest。
 find_package(OpenCL QUIET)
