@@ -16,9 +16,10 @@
 | H1 | `src/llama-model.cpp` | `llama_model::load_tensors` (≈L2203) | 不在这里搬权重；记录每个 layer 的 tensor name → (host_ptr, byte_size) 表给 WBM。**不调** ggml-opencl 的 alloc。 | TODO |
 | H2 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_buffer_type_alloc_buffer` (≈L3939) | 对**权重 buffer 类型**改成 lazy：不立刻 `clCreateBuffer`，返回一个空壳 `cl_mem` slot，等 WBM 真要用时再建。激活 buffer / KV / 中间 tensor 走原路径。 | TODO |
 | H3 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_buffer_set_tensor` (≈L3342) | 上传时调 `wbm_ensure_resident(block_idx_from_tensor)`。 | TODO |
-| H2 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `buffer_context` + `init_tensor` (≈L3279-3320) | 把 monolithic cl_mem 拆成 per-layer cl_mem (γ 方案)。`buffer_context` 改成 `map<int layer_id, cl_mem>`；init_tensor 按 tensor name `blk.<N>.*` 取 layer，非 layer 权重归到 shared 桶。`extra->data_device` 指向所属 layer 的 cl_mem，`extra->offset` 改成 layer 内偏移。alloc_buffer 接口不变，对外透明。 | TODO |
-| H2.5 | `src/llama-model.cpp` + `ggml/src/ggml-rpc/ggml-rpc.cpp` | 调 `get_base` 的位置 | γ 后没有单一 base，给 `get_base` 加 fallback（返 layer 0 / shared 桶的 base），并新增 `ggml_backend_opencl_buffer_get_layer_base(buffer, layer_id)` 给 WBM 用。mlock 改成对每个 layer cl_mem 独立 init。 | TODO |
-| H4 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_graph_compute` | 遍历 cgraph 节点时按 src tensor 名解 `blk.<N>.*` 得 layer 序号；layer 边界处 ensure → event-sync wait → LRU evict → 异步 prefetch。**改一处覆盖所有架构**，不需要 patch 每个 `llm_build_*`。**依赖 H2 完成**（拿到 per-layer cl_mem 才能 release 单层）。 | TODO |
+| H2 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `buffer_context` + `init_tensor` (≈L3279-3320) | **ε 方案 per-tensor**：每个 weight tensor 独立 cl_mem。`buffer_context` 改成 `vector<cl_mem>`（按 init 顺序，一一对应 tensor）。alloc_buffer 推迟实际分配；init_tensor 调用 `clCreateBuffer(ggml_nbytes(tensor))` 给 tensor 自己的 cl_mem，`extra->data_device = own_cl_mem`，`extra->offset = 0`。GGML_OPENCL_ELASTIC env var 守护，关闭走老 monolithic 路径。 | TODO |
+| H2.5 | `src/llama-model.cpp` + `ggml/src/ggml-rpc/ggml-rpc.cpp` | 调 `get_base` 的位置 | ε 后没有单一 base 概念。get_base 在 elastic 模式下返回第一个 cl_mem (vector[0]) + 注释说明语义变了；mlock 改成对每个 tensor cl_mem 独立 init（或在 elastic 模式下跳过 mlock，因为我们正要换出去）；ggml-rpc 不支持 elastic 模式（assert）。 | TODO |
+| H4 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_graph_compute` | **ε 方案 per-tensor**：遍历 cgraph 节点，每个 src tensor 是 WBM 注册过的 weight → `wbmcl_ensure_resident(tensor_id)` + `wbm_touch`；dispatch op 拿到 event 写回 `last_use_event`。节流：每 EVICT_CHECK_INTERVAL 个 op 调一次 `wbm_evict_to_byte_budget` + `wbmcl_evict_batch`，**字节预算 + 批量 flush** —— B(t) 跌时一次性挑 N 个 LRU victim flush 出去，比 N 次单独 evict 省 N-1 次同步。 | TODO |
+| H4.5 | `runtime/weight_buffer_manager.{h,cpp}` + `_opencl.{h,cpp}` | WBM API 扩展 | 新增 `wbm_evict_to_byte_budget(budget_bytes, exclude_idx)` 按字节贪心 LRU；新增 `wbmcl_evict_batch(victims[])` 一次 `clWaitForEvents` + 批量 release；新增 `block_meta::is_pinned` 标志让小 tensor (RMSNorm 等) 永驻、跳过 LRU。 | TODO |
 | H5 | `examples/elastic-cli/elastic-cli.cpp` | 主 decode 循环 | 拉 BudgetWatcher、按 step 写 MetricsLogger、每 step 校验 `resident_bytes ≤ B(t)`、违反 abort。 | TODO |
 
 H1 仅做"建索引"。真正的物质性补丁是 H2 + H4（前者把权重 cl_mem 改成
@@ -98,64 +99,66 @@ for (int il = 0; il < n_layer; ++il) {
 
 **能不能干净退出**：能。WBM 没 init 时这段代码全是 no-op。
 
-### H2：buffer_context 改 per-layer cl_mem (γ 方案，已选定)
+### H2：buffer_context 改 per-tensor cl_mem (ε 方案，已选定)
 
 **位置**：`struct ggml_backend_opencl_buffer_context` (L3111) + 
 `ggml_backend_opencl_buffer_type_alloc_buffer` (L3939) + 
 `ggml_backend_opencl_buffer_init_tensor` (L3279)。
 
 **核心改动**：保留 buffer_type 对外接口不变（kernel dispatch 全部不动），
-只重构 `buffer_context` 的内部存储：
+重构 `buffer_context` 的内部存储成 per-tensor cl_mem：
 
 ```cpp
-// 改造后
+// 改造后（elastic 模式下）
 struct ggml_backend_opencl_buffer_context {
     // 旧：std::vector<cl_mem> buffer;   // 一个大 cl_mem
     // 新：
-    std::unordered_map<int, cl_mem> layer_buffers;  // -1 = shared (非 layer 权重)
-    std::unordered_map<int, size_t> layer_sizes;
+    bool elastic;                                  // env GGML_OPENCL_ELASTIC=1 触发
+    std::vector<cl_mem> per_tensor_buffer;         // 每个 tensor 一个 cl_mem (elastic 时)
+    std::vector<cl_mem> buffer;                    // 兼容老路径 (非 elastic 时)
     cl_context cl_ctx;
     size_t alignment;
-    // 推迟分配：alloc_buffer 时只记 size_total，第一次 init_tensor 才扫
+    // 推迟分配：alloc_buffer 时只记 size_total，init_tensor 时按 tensor 拆
     bool deferred_alloc_done;
     size_t pending_total_size;
 };
 ```
 
-**关键流程**：
+**关键流程**（elastic 模式）：
 
 1. **alloc_buffer(size)**：不立刻 `clCreateBuffer`，只把 size 记到
-   `pending_total_size`。
-2. **init_tensor(buffer, tensor)** 首次调用时（`!deferred_alloc_done`）：
-   - 走一遍 ggml_context 的 tensor 链（如果能拿到），按 `tensor->name` 解
-     layer：`blk.<N>.*` → layer N，其它 → -1 (shared)
-   - 但 §4 调研显示 init_tensor **拿不到完整 tensor 列表**。fallback：
-     遇到一个 init 一个；首次见到 layer N 时 `clCreateBuffer(sum_of_layer_N_bytes_so_far)` 
-     按需扩。**这条路太险**。
-   - **真正可行方案**：alloc_buffer 时虽然没拿到 tensor list，但 buffer 在
-     init_tensor 之前已经分配 `pending_total_size`。
-     **第一次 init_tensor 来的时候，buffer 这个 ggml_backend_buffer_t 已经
-     绑定了 tensor 链**（在 `ggml_backend_alloc_ctx_tensors_from_buft` 里 
-     `ggml_tallocr_alloc(&talloc, t)` 之前，所有 t 已经在 ctx 的 tensor list
-     上）。**可以从 buffer 反查 tensor list 做一次性切层**。需要在 init_tensor
-     里调 `ggml_get_first_tensor(buffer->some_ctx_handle)` 类的 API，再
-     按 name 切。具体怎么从 buffer 拿 ggml_context 待 patch 时确认。
-3. **正常 init_tensor**：根据 tensor name 提取 layer_id，`extra->data_device 
-   = layer_buffers[layer_id]`，`extra->offset = offset_within_layer`。
+   `pending_total_size` 当 sanity check。
+2. **init_tensor(buffer, tensor)**：直接 `clCreateBuffer(ggml_nbytes(tensor))`
+   给 tensor 自己的 cl_mem；`extra->data_device = own_cl_mem`，
+   `extra->offset = 0`（tensor 独占整个 buffer）。
+   - 完全 stateless，每个 tensor 独立处理，**不需要扫 tensor list、不需要
+     name parsing、不需要 layer 划分**。
+   - WBM 注册：如果 tensor name 匹配 `blk.<N>.*` 或 `*.weight` 模式 →
+     调 `wbm_register_block(tensor_id, host_ptr_from_mmap, byte_size)`。
+   - 小权重 (RMSNorm 等 < pin_threshold) 标记 `is_pinned = true`，永驻 GPU。
+3. **buffer_context 析构**：释放 `per_tensor_buffer` 里所有 cl_mem（已经被
+   WBM 释放掉的会是 nullptr，跳过）。
 
 **view tensor 处理**：[L3284-3306](ggml/src/ggml-opencl/ggml-opencl.cpp#L3284) 
-现状是复用 parent extra。改造后加 assert：parent 的 layer_id 跟 view 推断
-出的 layer_id 一致，不一致 abort（实测 Llama 上不会触发；KV view 不走权重
-buffer_type，所以不受影响）。
+现状是 view 复用 parent extra。ε 下：view 直接挂到 parent 的 cl_mem 上
+（parent 的 own_cl_mem），跨"层"概念无意义，**γ 方案下要做的 layer 守护
+不再需要**。
 
 **改动量**：
-- buffer_context 改造：~80 行
-- init_tensor 按 name 切层 + 延迟 alloc：~70 行
-- view 守护 + edge case：~30 行
-- shared 桶（tok_embd / output / output_norm）：~30 行
+- buffer_context 改造：~50 行
+- init_tensor per-tensor 分配：~40 行
+- env var GGML_OPENCL_ELASTIC 守护 + 兼容老路径：~30 行
+- 总：~120 行（比 γ 省 ~90 行）
 
-**能不能干净退出**：能。新增 env var `GGML_OPENCL_ELASTIC=1` 守护，关闭
-时走老 buffer_context 路径。
+**能不能干净退出**：能。`GGML_OPENCL_ELASTIC=0`（默认）走老 monolithic
+路径，elastic 关闭时 buffer_context 行为零变化。
+
+**注意 clCreateBuffer 调用次数**：Llama-3B 32 layer × ~8 tensor/layer = ~256
+tensors。每个 forward 最坏情况 ~256 次 create + 256 次 release。Adreno
+上每次估计 0.1-1ms = 50-500ms overhead。缓解：
+1. `is_pinned` 让 RMSNorm 等小 tensor 永驻
+2. LRU 自然倾向保留最近用过的小 tensor
+3. probe_cl_release `--count-mode` 真机量 clCreate/Release 实际延迟
 
 ### H3：set_tensor 时触发 ensure_resident
 
