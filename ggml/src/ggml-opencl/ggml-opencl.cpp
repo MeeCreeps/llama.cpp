@@ -2513,12 +2513,17 @@ struct ggml_tensor_extra_cl {
     // elastic baseline 用：被 WBM 管理的 block_idx；-1 = 不归 WBM 管。
     // 见 runtime/weight_buffer_manager.h 与 RUNTIME_PATCHES.md §3 H4。
     int wbm_idx;
+    // elastic baseline 用：buffer_context::buffer 里对应 cl_mem 的 slot index；
+    // -1 = 不在 elastic buffer 槽位中（如 view tensor / MONOLITHIC 路径）。
+    // ensure_resident 重新分配 cl_mem 后用来把新 cl_mem 同步回 ctx->buffer。
+    int ctx_slot;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
         wbm_idx = -1;
+        ctx_slot = -1;
     }
 };
 
@@ -2845,6 +2850,11 @@ static size_t ggml_opencl_env_mb(const char *name, size_t def_mb) {
     return static_cast<size_t>(n) * 1024 * 1024;
 }
 
+// 把新分配的 cl_mem 回填到对应 buffer_context 的 slot；buffer_context 完整类型
+// 在文件靠后定义，所以这里仅做前向声明，实现放在 buffer_context 之后。
+static void ggml_opencl_elastic_update_ctx_slot(ggml_backend_buffer_t buf,
+                                                int slot, cl_mem new_buf);
+
 static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue queue) {
     auto *s = ggml_opencl_elastic();
     if (s->wbm_inited) return;
@@ -2899,22 +2909,43 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         est->current_token += 1;
     }
 
+    // Elastic baseline (F4-evict)：ensure_resident 当前 node 的所有 WBM src
+    // tensor。封成 lambda 以便 fused 分支也能给被融合进来的下一节点跑一遍。
+    auto ensure_node_srcs_resident = [&](ggml_tensor *n) -> bool {
+        if (!elastic_active || !n) return true;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor *src = n->src[j];
+            if (!src) continue;
+            ggml_tensor_extra_cl *src_extra =
+                (ggml_tensor_extra_cl *) src->extra;
+            if (!src_extra || src_extra->wbm_idx < 0) continue;
+
+            const elastic::block_meta *bm =
+                elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
+            if (bm && !bm->resident) {
+                int rc = elastic::wbmcl_ensure_resident(&est->octx, src_extra->wbm_idx);
+                if (rc != 0) {
+                    GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
+                                   src_extra->wbm_idx, rc);
+                    return false;
+                }
+                bm = elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
+                cl_mem new_buf = static_cast<cl_mem>(bm->backend_handle);
+                src_extra->data_device = new_buf;
+                ggml_opencl_elastic_update_ctx_slot(src->buffer, src_extra->ctx_slot, new_buf);
+                est->n_reloads_total += 1;
+                est->bytes_reloaded_total += bm->byte_size;
+            }
+            elastic::wbm_touch(&est->wbm, src_extra->wbm_idx, est->current_token);
+        }
+        return true;
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
-        // Elastic baseline (F4-minimal)：op 派发前，对所有 src 中的 WBM 权重
-        // tensor 调 wbm_touch 更新 LRU。本 commit 还不做实际 evict，所以
-        // 所有 tensor 都常驻、ensure_resident 是 no-op。下一 commit 接入。
-        if (elastic_active) {
-            for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                ggml_tensor *src = node->src[j];
-                if (!src) continue;
-                ggml_tensor_extra_cl *src_extra =
-                    (ggml_tensor_extra_cl *) src->extra;
-                if (!src_extra || src_extra->wbm_idx < 0) continue;
-                elastic::wbm_touch(&est->wbm, src_extra->wbm_idx, est->current_token);
-            }
-        }
+        // 当前 node 的 src 先 ensure；fused 分支命中时再补本 i+1/i+2 节点的 src。
+        if (!ensure_node_srcs_resident(node)) return GGML_STATUS_FAILED;
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
@@ -2926,16 +2957,21 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) return GGML_STATUS_FAILED;
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) return GGML_STATUS_FAILED;
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
             continue;
@@ -2946,6 +2982,44 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+
+        // Elastic baseline (F4-evict)：每个 op 派发后累计计数；到 evict_check_interval
+        // 个时评估预算，如果当前 resident_bytes > 目标，clFinish + 批量 LRU 驱逐。
+        // clFinish 保证 in-flight kernel 不会读到 just-released 的 cl_mem；F4-event 之后
+        // 会改成 cl_event 跟踪精细同步。
+        if (elastic_active && est->bw_inited) {
+            est->n_op_dispatched += 1;
+            if ((int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
+                const size_t B_t_mb     = elastic::budget_watcher_get(&est->bw);
+                const size_t budget     = B_t_mb * 1024 * 1024;
+                const size_t kv_misc    = est->kv_bytes + est->misc_overhead;
+                const size_t target     = budget > kv_misc ? budget - kv_misc : 0;
+                if (est->wbm.resident_bytes > target) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    std::vector<int> victims;
+                    int n = elastic::wbm_evict_to_byte_budget(&est->wbm, target,
+                                                              /*exclude=*/-1, &victims);
+                    if (n > 0) {
+                        int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
+                        est->n_evicts_total += released;
+                    }
+                }
+            }
+        }
+    }
+
+    // 一次 graph_compute 收尾：把单步 metrics 落盘
+    if (elastic_active && est->metrics_inited) {
+        elastic::metrics_record r{};
+        r.t_sec                = 0.0;  // TODO: budget watcher 启动时刻起算
+        r.B_t_mb               = est->bw_inited ? elastic::budget_watcher_get(&est->bw) : 0;
+        r.resident_bytes       = est->wbm.resident_bytes;
+        r.n_blocks_resident    = est->wbm.n_resident;
+        r.token_id             = static_cast<int>(est->current_token);
+        r.layer_load_latency_ms = 0.0;
+        r.decode_latency_ms    = 0.0;
+        r.flash_bytes_read     = est->bytes_reloaded_total;
+        elastic::metrics_logger_write(&est->metrics, r);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -3293,10 +3367,26 @@ struct ggml_backend_opencl_buffer_context {
         : mode(MODE_PENDING), pending_size_hint(size_hint), name("OpenCL-Pending") {}
 
     ~ggml_backend_opencl_buffer_context() {
-        for (cl_mem buf : buffer) {
-            if (buf) {                          // ELASTIC 下 WBM 可能已 release，skip nullptr
-                CL_CHECK(clReleaseMemObject(buf));
+        for (size_t i = 0; i < buffer.size(); ++i) {
+            cl_mem buf = buffer[i];
+            if (!buf) continue;  // 显式 nullptr，跳过
+            // ELASTIC 模式下 WBM 可能已经 release 了某些 slot 的 cl_mem。
+            // 判定：如果 slot 有 WBM 关联 (wbm_idx_per_slot[i] >= 0)，且 WBM
+            // 该 block 当前 backend_handle 与 buf 不一致（已 evict 或 reload 成
+            // 新 cl_mem），则 buf 是死指针，跳过释放。
+            if (mode == MODE_ELASTIC && i < wbm_idx_per_slot.size()) {
+                int wbm_idx = wbm_idx_per_slot[i];
+                if (wbm_idx >= 0) {
+                    auto *st = ggml_opencl_elastic();
+                    if (st->wbm_inited) {
+                        const elastic::block_meta *bm = elastic::wbm_get(&st->wbm, wbm_idx);
+                        if (bm && (cl_mem)bm->backend_handle != buf) {
+                            continue;  // 死指针
+                        }
+                    }
+                }
             }
+            CL_CHECK(clReleaseMemObject(buf));
         }
         for (cl_mem im : img) {
             CL_CHECK(clReleaseMemObject(im));
@@ -3440,8 +3530,20 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<cl_mem> img;
     mode_t mode;              // MODE_MONOLITHIC / MODE_PENDING / MODE_ELASTIC
     size_t pending_size_hint; // alloc_buffer 时记录，PENDING → MONOLITHIC 升级时用来真正 alloc
+    // elastic 模式下与 buffer 平行的 slot → WBM block_idx 映射；-1 表示该 slot 未注册到 WBM
+    std::vector<int> wbm_idx_per_slot;
     std::string name;
 };
+
+// 前向声明在 elastic helpers 处。
+static void ggml_opencl_elastic_update_ctx_slot(ggml_backend_buffer_t buf,
+                                                int slot, cl_mem new_buf) {
+    if (!buf || slot < 0) return;
+    auto *bctx = (ggml_backend_opencl_buffer_context *) buf->context;
+    if (bctx->mode != ggml_backend_opencl_buffer_context::MODE_ELASTIC) return;
+    if (static_cast<size_t>(slot) >= bctx->buffer.size()) return;
+    bctx->buffer[slot] = new_buf;
+}
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -3520,12 +3622,15 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
                            tensor->name, nbytes, err);
             return GGML_STATUS_ALLOC_FAILED;
         }
+        const int slot = static_cast<int>(ctx->buffer.size());
         ctx->buffer.push_back(own_buf);
+        ctx->wbm_idx_per_slot.push_back(-1);   // 在 set_tensor 注册时填 WBM block idx
 
         ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
         extra->offset      = 0;
         extra->data_device = own_buf;
         extra->actual_size = ggml_nbytes(tensor);
+        extra->ctx_slot    = slot;
         tensor->extra      = extra;
     } else {
         {
@@ -4007,6 +4112,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         static_cast<void*>(extra->data_device));
                     elastic::wbm_touch(&s->wbm, idx, s->current_token);
                     extra->wbm_idx = idx;
+                    // 同步 slot → wbm_idx，析构时能识别 WBM 已 evict 的 dead slot
+                    if (extra->ctx_slot >= 0 &&
+                        static_cast<size_t>(extra->ctx_slot) < bctx->wbm_idx_per_slot.size()) {
+                        bctx->wbm_idx_per_slot[extra->ctx_slot] = idx;
+                    }
                 }
             }
         }

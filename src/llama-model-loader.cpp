@@ -1061,6 +1061,14 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // elastic baseline (H2.5)：上面的 mmap_used 更新只走 host buf_mmap
+                // 路径，导致非-host backend (OpenCL/CUDA 等) 走 ggml_backend_tensor_set
+                // 时 mmap_used 始终是 (size, 0)，load 结束 unmap_fragment 会把整个 mmap
+                // 拆掉。WBM 之后 evict + reload 时存的 host_ptr 失效 → segfault。
+                // 在这里同步更新 mmap_used，让 unmap 只拆未用区域，weight 区域保留。
+                auto & mmap_used = mmaps_used[weight->idx];
+                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             }
         } else {
             const auto & file = files.at(weight->idx);
