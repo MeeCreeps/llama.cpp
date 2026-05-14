@@ -48,6 +48,7 @@ build*
 release
 debug
 !build-info.cmake
+!scripts/elastic/build_android.sh
 !build-info.cpp.in
 !build-info.sh
 !build.zig
@@ -153,3 +154,5 @@ poetry.toml
 *.code-workspace
 .windsurf/
 runtime/build/
+third_party/
+runtime/build-android/
