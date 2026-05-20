@@ -2816,6 +2816,15 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 // 单例懒初：第一次有 weight tensor 走 set_tensor 时初始化 WBM；
 // 第一次有 BudgetWatcher CSV 时拉起后台线程。
 
+// F4-profile：按 tensor 名后缀 / op 类型聚合 reload IO 和 compute 时间。
+// GGML_ELASTIC_PROFILE=1 触发。compute 时间会在每个 op 后 clFinish 拿真实
+// GPU 时间，因此会显著拖慢，只在调研性能时使用。
+struct elastic_profile_bucket {
+    uint64_t n           = 0;
+    double   total_ms    = 0.0;
+    size_t   total_bytes = 0;
+};
+
 struct ggml_opencl_elastic_state {
     elastic::weight_buffer_manager wbm;
     elastic::wbm_opencl_ctx        octx;
@@ -2836,12 +2845,31 @@ struct ggml_opencl_elastic_state {
     uint64_t n_reloads_total     = 0;
     size_t   bytes_reloaded_total = 0;
 
+    bool profile = false;
+    std::map<std::string, elastic_profile_bucket> reload_buckets;   // tensor name suffix → 累计
+    std::map<int,         elastic_profile_bucket> compute_buckets;  // ggml_op → 累计
+
     std::chrono::steady_clock::time_point t0;  // wbm 初始化时刻；用于 metrics.t_sec
 };
 
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
     static ggml_opencl_elastic_state s;
     return &s;
+}
+
+// 提取 tensor 名后缀用于 profile 聚合：blk.<N>.<X>.weight → X
+// 非 blk. 前缀的（token_embd/output/output_norm 等）直接去掉 .weight 后缀返回
+static std::string ggml_opencl_tensor_suffix(const char *name) {
+    if (!name) return std::string();
+    std::string s(name);
+    if (s.size() >= 4 && s.compare(0, 4, "blk.") == 0) {
+        size_t dot2 = s.find('.', 4);
+        if (dot2 != std::string::npos) s = s.substr(dot2 + 1);
+    }
+    if (s.size() > 7 && s.compare(s.size() - 7, 7, ".weight") == 0) {
+        s = s.substr(0, s.size() - 7);
+    }
+    return s;
 }
 
 static size_t ggml_opencl_env_mb(const char *name, size_t def_mb) {
@@ -2907,6 +2935,38 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         }
     }
 
+    if (const char *prof = std::getenv("GGML_ELASTIC_PROFILE"); prof && *prof && *prof != '0') {
+        s->profile = true;
+        GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_PROFILE=1 启用按 tensor / op 聚合的 IO+compute 计时（每个 op 后 clFinish，性能下降，仅调研用）\n");
+        std::atexit([]() {
+            auto *st = ggml_opencl_elastic();
+            if (!st->profile) return;
+            std::fprintf(stderr, "\n=== ggml_opencl elastic profile dump ===\n");
+            std::fprintf(stderr, "reload IO （按 tensor 名后缀聚合）：\n");
+            std::fprintf(stderr, "  %-22s %8s %12s %12s %10s %10s\n",
+                         "suffix", "n", "total ms", "MB total", "avg ms", "MB/s");
+            for (const auto &kv : st->reload_buckets) {
+                const auto &b = kv.second;
+                double mb = b.total_bytes / 1024.0 / 1024.0;
+                double avg = b.n ? b.total_ms / b.n : 0;
+                double mbps = b.total_ms > 0 ? mb / (b.total_ms / 1000.0) : 0;
+                std::fprintf(stderr, "  %-22s %8llu %12.1f %12.1f %10.2f %10.1f\n",
+                             kv.first.c_str(), (unsigned long long)b.n,
+                             b.total_ms, mb, avg, mbps);
+            }
+            std::fprintf(stderr, "compute （按 ggml_op 聚合，含 clFinish 同步）：\n");
+            std::fprintf(stderr, "  %-22s %8s %12s %10s\n", "op", "n", "total ms", "avg ms");
+            for (const auto &kv : st->compute_buckets) {
+                const auto &b = kv.second;
+                double avg = b.n ? b.total_ms / b.n : 0;
+                std::fprintf(stderr, "  %-22s %8llu %12.1f %10.3f\n",
+                             ggml_op_name((ggml_op)kv.first),
+                             (unsigned long long)b.n, b.total_ms, avg);
+            }
+            std::fprintf(stderr, "=========================================\n");
+        });
+    }
+
     const char *json = std::getenv("GGML_ELASTIC_METRICS_JSONL");
     if (json && *json) {
         if (elastic::metrics_logger_init(&s->metrics, json) == 0) {
@@ -2967,11 +3027,21 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                         }
                     }
                 }
+                auto rl_t0 = est->profile ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
                 int rc = elastic::wbmcl_ensure_resident(&est->octx, src_extra->wbm_idx);
                 if (rc != 0) {
                     GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
                                    src_extra->wbm_idx, rc);
                     return false;
+                }
+                if (est->profile) {
+                    auto rl_t1 = std::chrono::steady_clock::now();
+                    double ms = std::chrono::duration<double, std::milli>(rl_t1 - rl_t0).count();
+                    auto &b = est->reload_buckets[ggml_opencl_tensor_suffix(src->name)];
+                    b.n           += 1;
+                    b.total_ms    += ms;
+                    b.total_bytes += bm->byte_size;
                 }
                 bm = elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
                 cl_mem new_buf = static_cast<cl_mem>(bm->backend_handle);
@@ -3021,11 +3091,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        auto op_t0 = (elastic_active && est->profile)
+                     ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
         bool ok = ggml_cl_compute_forward(backend, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+        if (elastic_active && est->profile) {
+            // 拿真实 GPU 时间：每个 op 后 clFinish。会显著拖速度，仅 profile 模式。
+            clFinish(backend_ctx->queue);
+            auto op_t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(op_t1 - op_t0).count();
+            auto &b = est->compute_buckets[(int) node->op];
+            b.n        += 1;
+            b.total_ms += ms;
+        }
 
         // Elastic baseline (F4-event)：op 派发后插一个 marker event 到 compute
         // queue 当前位置，写到所有被本 op 用过的 WBM 权重的 last_use_event。
