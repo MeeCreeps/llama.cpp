@@ -22,6 +22,7 @@ int wbm_init(weight_buffer_manager *wbm, int n_blocks) {
         wbm->blocks[i].last_used_token = 0;
         wbm->blocks[i].backend_handle  = nullptr;
         wbm->blocks[i].last_use_event  = nullptr;
+        wbm->blocks[i].prefetch_event  = nullptr;
     }
     wbm->current_token  = 0;
     wbm->n_resident     = 0;
@@ -42,6 +43,7 @@ int wbm_add_block(weight_buffer_manager *wbm, void *host_ptr, size_t byte_size) 
     b.last_used_token = 0;
     b.backend_handle  = nullptr;
     b.last_use_event  = nullptr;
+    b.prefetch_event  = nullptr;
     return idx;
 }
 
@@ -56,6 +58,7 @@ int wbm_register_block(weight_buffer_manager *wbm,
     b.resident  = false;
     b.backend_handle = nullptr;
     b.last_use_event = nullptr;
+    b.prefetch_event = nullptr;
     b.last_used_token = 0;
     return 0;
 }
@@ -79,6 +82,7 @@ void wbm_mark_evicted(weight_buffer_manager *wbm, int idx) {
     b.resident       = false;
     b.backend_handle = nullptr;
     b.last_use_event = nullptr;
+    b.prefetch_event = nullptr;
     wbm->n_resident -= 1;
     assert(wbm->resident_bytes >= b.byte_size);
     wbm->resident_bytes -= b.byte_size;
@@ -95,6 +99,12 @@ void wbm_set_last_use_event(weight_buffer_manager *wbm, int idx, void *event) {
     if (!wbm) return;
     if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) return;
     wbm->blocks[idx].last_use_event = event;
+}
+
+void wbm_set_prefetch_event(weight_buffer_manager *wbm, int idx, void *event) {
+    if (!wbm) return;
+    if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) return;
+    wbm->blocks[idx].prefetch_event = event;
 }
 
 void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned) {

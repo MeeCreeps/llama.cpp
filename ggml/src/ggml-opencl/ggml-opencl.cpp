@@ -29,6 +29,9 @@
 #include <charconv>
 #include <mutex>
 
+#include <sys/mman.h>   // posix_madvise
+#include <unistd.h>     // sysconf(_SC_PAGESIZE)
+
 // Elastic baseline 集成：runtime/ 模块的头文件由 ggml-opencl CMakeLists.txt 的
 // target_include_directories 把 runtime/ 加入搜索路径。
 #include "budget_watcher.h"
@@ -2839,6 +2842,12 @@ struct ggml_opencl_elastic_state {
     size_t misc_overhead  = static_cast<size_t>(256) * 1024 * 1024;
     int    evict_check_interval = 8;
 
+    // 流水线 prefetch：GGML_ELASTIC_PREFETCH=N 用 posix_madvise(WILLNEED) 提前
+    // 预热后 N 个 node src 的 mmap 页到 CPU page cache。N=0 关闭。
+    int      prefetch_lookahead   = 0;
+    uint64_t n_prefetch_issued    = 0;
+    uint64_t n_prefetch_skipped   = 0;
+
     uint64_t current_token       = 0;
     uint64_t n_op_dispatched     = 0;
     uint64_t n_evicts_total      = 0;
@@ -2897,8 +2906,18 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     // 同步反而拖累整体（实测 Test 3 上 async eval 时间 2223 ms/tok vs sync
     // 1782 ms/tok，慢 25%）。GGML_ELASTIC_ASYNC_XFER=1 可显式开异步路径，
     // 留作未来调优时复用——其它芯片或更激进的 prefetch 策略下可能有收益。
+    // prefetch 也需要 xfer_queue；先把 lookahead 读出来，下面建 queue 的判断要用
+    int prefetch_la_env = 0;
+    if (const char *pf = std::getenv("GGML_ELASTIC_PREFETCH")) {
+        int v = atoi(pf);
+        if (v > 0) prefetch_la_env = v;
+    }
+    s->prefetch_lookahead = prefetch_la_env;
+
     cl_command_queue xfer_q = nullptr;
-    if (const char *async_x = std::getenv("GGML_ELASTIC_ASYNC_XFER"); async_x && *async_x && *async_x != '0') {
+    const bool need_xfer = prefetch_la_env > 0
+        || ([]{ const char *a = std::getenv("GGML_ELASTIC_ASYNC_XFER"); return a && *a && *a != '0'; })();
+    if (need_xfer) {
         cl_int q_err = CL_SUCCESS;
         cl_device_id dev = nullptr;
         clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(dev), &dev, nullptr);
@@ -2906,8 +2925,11 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         if (q_err != CL_SUCCESS) {
             GGML_LOG_ERROR("ggml_opencl elastic: 创建 xfer queue 失败 %d，退回单队列\n", q_err);
             xfer_q = nullptr;
+            s->prefetch_lookahead = 0;
         } else {
-            GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_ASYNC_XFER=1 启用异步上传\n");
+            GGML_LOG_INFO("ggml_opencl elastic: 启用 xfer queue (prefetch=%d async_xfer=%s)\n",
+                          prefetch_la_env,
+                          std::getenv("GGML_ELASTIC_ASYNC_XFER") ? std::getenv("GGML_ELASTIC_ASYNC_XFER") : "0");
         }
     }
     if (elastic::wbmcl_init(&s->octx, &s->wbm, cl_ctx, queue, xfer_q) != 0) {
@@ -2964,6 +2986,19 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                              (unsigned long long)b.n, b.total_ms, avg);
             }
             std::fprintf(stderr, "=========================================\n");
+        });
+    }
+
+    // Prefetch 计数 dump（无条件）：开了 GGML_ELASTIC_PREFETCH 才有意义
+    if (s->prefetch_lookahead > 0) {
+        std::atexit([]() {
+            auto *st = ggml_opencl_elastic();
+            std::fprintf(stderr, "[elastic prefetch] lookahead=%d issued=%llu skipped=%llu reloads_total=%llu evicts_total=%llu\n",
+                         st->prefetch_lookahead,
+                         (unsigned long long)st->n_prefetch_issued,
+                         (unsigned long long)st->n_prefetch_skipped,
+                         (unsigned long long)st->n_reloads_total,
+                         (unsigned long long)st->n_evicts_total);
         });
     }
 
@@ -3163,6 +3198,41 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                         int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
                         est->n_evicts_total += released;
                     }
+                }
+            }
+        }
+
+        // Pipeline prefetch (F5)：CPU 侧 page-cache 预热。Adreno unified memory
+        // 下 GPU async upload 没法跟 compute overlap（同一条 DRAM bus），改成对
+        // 后 N 个 node 的 src host_ptr 发 POSIX_MADV_WILLNEED——kernel 后台
+        // readahead，等到 ensure_resident 同步上传时 mmap 页已 warm，driver 端
+        // memcpy(host→GPU buf) 拿满 ~2.87 GB/s，不再触发 page fault / disk read。
+        if (elastic_active && est->prefetch_lookahead > 0) {
+            static const size_t pgsz = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            const int max_j = std::min(i + 1 + est->prefetch_lookahead, cgraph->n_nodes);
+            for (int j = i + 1; j < max_j; ++j) {
+                ggml_tensor *nj = cgraph->nodes[j];
+                if (!nj) continue;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor *src = nj->src[k];
+                    if (!src) continue;
+                    ggml_tensor_extra_cl *se = (ggml_tensor_extra_cl *) src->extra;
+                    if (!se || se->wbm_idx < 0) continue;
+                    const elastic::block_meta *bm =
+                        elastic::wbm_get(&est->wbm, se->wbm_idx);
+                    if (!bm || !bm->host_ptr || bm->byte_size == 0) continue;
+                    if (bm->resident) continue;
+                    // host_ptr 是 mmap_base + tensor_offset，tensor offset 通常 32B 对齐
+                    // 但不一定 4K page 对齐，向下/向上 round 到 page 边界再 madvise。
+                    uintptr_t addr     = reinterpret_cast<uintptr_t>(bm->host_ptr);
+                    uintptr_t aligned  = addr & ~(pgsz - 1);
+                    size_t    over     = addr - aligned;
+                    size_t    raw_len  = bm->byte_size + over;
+                    size_t    a_len    = ((raw_len + pgsz - 1) / pgsz) * pgsz;
+                    int rc = posix_madvise(reinterpret_cast<void *>(aligned), a_len,
+                                           POSIX_MADV_WILLNEED);
+                    if (rc == 0) est->n_prefetch_issued += 1;
+                    else         est->n_prefetch_skipped += 1;
                 }
             }
         }

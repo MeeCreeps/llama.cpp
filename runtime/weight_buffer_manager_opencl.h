@@ -61,6 +61,18 @@ int  wbmcl_evict(wbm_opencl_ctx *octx, int idx);
 // 异步 prefetch 占位：首版直接同步 ensure。后续做异步化时改这一个函数即可。
 int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
 
+// 真正的异步 prefetch：在 xfer_queue 上发非阻塞 clEnqueueWriteBuffer，把 write
+// 的 cl_event 存到 block_meta::prefetch_event。block 此时 backend_handle 已分配
+// 但 resident=false，留给后续 ensure_resident 看到 prefetch_event 时 wait 它。
+//
+// 返回值：
+//   0  发出 prefetch 成功（或 block 已 resident / 已 in-flight，no-op 返回 0）
+//   <0 失败（xfer_queue 没设、clCreateBuffer / clEnqueueWriteBuffer 报错等）
+//
+// 注意：必须有独立 xfer_queue 才有意义；compute_queue 上发 async 会跟 compute
+// kernel 抢同一个 in-order queue 位置，没有 overlap 收益。
+int  wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx);
+
 // 批量驱逐：一次 clWaitForEvents 在所有 victim 的 last_use_event 上（过滤空
 // 的），随后逐个 clReleaseEvent + clReleaseMemObject + wbm_mark_evicted。
 // 比 N 次单独 wbmcl_evict 省 N-1 次同步往返。

@@ -34,6 +34,7 @@ struct block_meta {
     uint64_t last_used_token;    // LRU 用的"最近使用 token 序号"
     void    *backend_handle;     // 不透明 cl_mem 句柄；nullptr = 未分配
     void    *last_use_event;     // 不透明 cl_event；evict 前需 wait 此 event
+    void    *prefetch_event;     // 不透明 cl_event；in-flight 上传写完才能用，nullptr = 没在 in-flight
 };
 
 struct weight_buffer_manager {
@@ -76,6 +77,11 @@ void wbm_touch(weight_buffer_manager *wbm, int idx, uint64_t token);
 // 记下某 block 上最近一次 GPU kernel 的 event。OpenCL 包装层在 evict 前会
 // 拿这个 event 去 clWaitForEvents 等它结束才释放 cl_mem。
 void wbm_set_last_use_event(weight_buffer_manager *wbm, int idx, void *event);
+
+// 标记 block 的 in-flight 上传 event。prefetch 路径把 enqueueWriteBuffer 的
+// write event 存进来；ensure_resident 命中 in-flight 时拿它 clWaitForEvents
+// 再 mark_resident，避免重复 alloc。
+void wbm_set_prefetch_event(weight_buffer_manager *wbm, int idx, void *event);
 
 // 标记一个 block 是否 pinned（永驻）。pinned 的 block 不会被 LRU 选作 victim。
 // 适合给 RMSNorm 等小权重用，避免频繁换入换出。

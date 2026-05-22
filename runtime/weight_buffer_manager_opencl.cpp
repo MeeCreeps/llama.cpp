@@ -49,6 +49,23 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     const block_meta *meta = wbm_get(octx->wbm, idx);
     if (!meta) return -2;
     if (meta->resident) return 0;
+
+    // In-flight prefetch 命中：buffer 已 alloc + 已发 enqueueWriteBuffer，
+    // 等 write event 完成后直接 mark_resident，避免重复 alloc。
+    if (meta->prefetch_event && meta->backend_handle) {
+        cl_event ev = static_cast<cl_event>(meta->prefetch_event);
+        cl_int werr = clWaitForEvents(1, &ev);
+        if (werr != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] prefetch_event clWaitForEvents 失败 block %d: %s (%d)\n",
+                         idx, cl_err(werr), werr);
+        }
+        clReleaseEvent(ev);
+        wbm_set_prefetch_event(octx->wbm, idx, nullptr);
+        octx->bytes_uploaded_total += meta->byte_size;
+        wbm_mark_resident(octx->wbm, idx, meta->backend_handle);
+        return 0;
+    }
+
     if (!meta->host_ptr || meta->byte_size == 0) {
         std::fprintf(stderr, "[wbmcl] block %d 未注册或 byte_size=0\n", idx);
         return -3;
@@ -149,9 +166,48 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
 
 int wbmcl_prefetch(wbm_opencl_ctx *octx, int idx) {
     // 首版同步：等价于 ensure_resident。
-    // TODO：xfer_queue + cl_event 异步化（block_meta 增加 write_event 字段，
-    //       后续 ensure_resident 看到该字段则 clWaitForEvents 而不是再 alloc）。
     return wbmcl_ensure_resident(octx, idx);
+}
+
+int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    if (!octx->xfer_queue) return -7;  // 没独立 queue，不发 async prefetch
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+    if (meta->resident) return 0;
+    if (meta->prefetch_event) return 0;  // 已 in-flight
+    if (!meta->host_ptr || meta->byte_size == 0) return -3;
+
+    cl_int err = CL_SUCCESS;
+    cl_mem buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
+                                meta->byte_size, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[wbmcl] async clCreateBuffer 失败 block %d size %zu: %s (%d)\n",
+                     idx, meta->byte_size, cl_err(err), err);
+        return -4;
+    }
+    octx->n_creates += 1;
+
+    cl_event write_ev = nullptr;
+    err = clEnqueueWriteBuffer(octx->xfer_queue, buf, CL_FALSE,
+                               0, meta->byte_size, meta->host_ptr,
+                               0, nullptr, &write_ev);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[wbmcl] async clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
+                     idx, cl_err(err), err);
+        clReleaseMemObject(buf);
+        octx->n_releases += 1;
+        return -5;
+    }
+    // flush 让 enqueue 真发出去，否则要等下一次 clFinish/clWaitForEvents 才提交
+    clFlush(octx->xfer_queue);
+
+    // 暂存 backend_handle + prefetch_event；不调 mark_resident，等 ensure_resident
+    // 看到 prefetch_event 时 wait 完才正式标 resident（更新 n_resident /
+    // resident_bytes）。这样在 prefetch 完成前 LRU 不会把它当 resident。
+    octx->wbm->blocks[static_cast<size_t>(idx)].backend_handle = static_cast<void *>(buf);
+    wbm_set_prefetch_event(octx->wbm, idx, static_cast<void *>(write_ev));
+    return 0;
 }
 
 int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
@@ -217,6 +273,18 @@ cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx) {
 void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     if (!octx || !octx->wbm) return;
     for (auto &b : octx->wbm->blocks) {
+        // 清掉未消费的 in-flight prefetch（block 还没 resident 但已发 write）
+        if (!b.resident && b.prefetch_event) {
+            cl_event ev = static_cast<cl_event>(b.prefetch_event);
+            clWaitForEvents(1, &ev);
+            clReleaseEvent(ev);
+            b.prefetch_event = nullptr;
+            if (b.backend_handle) {
+                clReleaseMemObject(static_cast<cl_mem>(b.backend_handle));
+                octx->n_releases += 1;
+                b.backend_handle = nullptr;
+            }
+        }
         if (b.resident) {
             // 不走 wbmcl_evict 以免被 last_use_event 阻塞太久；强行回收
             if (b.last_use_event) {
