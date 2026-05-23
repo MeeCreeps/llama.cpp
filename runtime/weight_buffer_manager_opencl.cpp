@@ -158,21 +158,19 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
     if (!meta->resident) return 0;
 
     cl_mem buf = static_cast<cl_mem>(meta->backend_handle);
-    cl_event ev = static_cast<cl_event>(meta->last_use_event);
 
-    // 等待最近一次使用此 buffer 的 kernel 结束，避免释放正在用的 cl_mem
-    if (ev) {
-        cl_int werr = clWaitForEvents(1, &ev);
-        if (werr != CL_SUCCESS) {
-            std::fprintf(stderr, "[wbmcl] clWaitForEvents 失败 block %d: %s (%d) —— 继续释放\n",
-                         idx, cl_err(werr), werr);
-        }
-        // event 是 H4 钩点 retain 的；这里释放掉
-        cl_int rerr = clReleaseEvent(ev);
-        if (rerr != CL_SUCCESS) {
-            std::fprintf(stderr, "[wbmcl] clReleaseEvent 失败 block %d: %s (%d)\n",
-                         idx, cl_err(rerr), rerr);
-        }
+    // in-order queue：插 1 个 marker 等 queue 跑完 prior kernel
+    cl_event marker = nullptr;
+    cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
+    if (merr == CL_SUCCESS && marker) {
+        clWaitForEvents(1, &marker);
+        clReleaseEvent(marker);
+    } else {
+        clFinish(octx->compute_queue);
+    }
+    // 兼容残留 last_use_event 引用
+    if (meta->last_use_event) {
+        clReleaseEvent(static_cast<cl_event>(meta->last_use_event));
     }
 
     cl_int err = clReleaseMemObject(buf);
@@ -236,38 +234,36 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
 int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
     if (!octx || !octx->wbm || !victims || n_victims <= 0) return 0;
 
-    // 1) 收集所有 in-flight event 一次性等
-    std::vector<cl_event> events;
-    events.reserve(static_cast<size_t>(n_victims));
-    for (int i = 0; i < n_victims; ++i) {
-        const int v = victims[i];
-        const block_meta *m = wbm_get(octx->wbm, v);
-        if (!m || !m->resident) continue;
-        if (m->last_use_event) {
-            events.push_back(static_cast<cl_event>(m->last_use_event));
+    // in-order queue 顺序保证：在 queue 末尾插一个 marker，等它完成就等于等
+    // queue 上所有 prior kernel 完成（含最后一次用 victim 的 kernel）。
+    // 不需要 per-block 精细追踪——graph_compute 那边因此不再 stamp per-op
+    // marker，省 ~18k OpenCL API call / token。
+    cl_event marker = nullptr;
+    cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
+    if (merr == CL_SUCCESS && marker) {
+        cl_int werr = clWaitForEvents(1, &marker);
+        if (werr != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] evict-marker clWaitForEvents 失败: %s (%d)\n",
+                         cl_err(werr), werr);
         }
-    }
-    if (!events.empty()) {
-        cl_int err = clWaitForEvents(static_cast<cl_uint>(events.size()), events.data());
-        if (err != CL_SUCCESS) {
-            std::fprintf(stderr, "[wbmcl] 批量 clWaitForEvents 失败: %s (%d) —— 继续释放\n",
-                         cl_err(err), err);
-        }
+        clReleaseEvent(marker);
+    } else {
+        // fallback：marker 插入失败就 clFinish 全队列（保守正确）
+        std::fprintf(stderr, "[wbmcl] enqueueMarker 失败: %s (%d) —— 退回 clFinish\n",
+                     cl_err(merr), merr);
+        clFinish(octx->compute_queue);
     }
 
-    // 2) 逐个 release event + release cl_mem + mark_evicted
+    // 释放 cl_mem + mark_evicted
     int released = 0;
     for (int i = 0; i < n_victims; ++i) {
         const int v = victims[i];
         const block_meta *m = wbm_get(octx->wbm, v);
         if (!m || !m->resident) continue;
 
+        // 兼容性：若早期残留 last_use_event 引用还在则 release 掉
         if (m->last_use_event) {
-            cl_int rerr = clReleaseEvent(static_cast<cl_event>(m->last_use_event));
-            if (rerr != CL_SUCCESS) {
-                std::fprintf(stderr, "[wbmcl] clReleaseEvent 失败 block %d: %s (%d)\n",
-                             v, cl_err(rerr), rerr);
-            }
+            clReleaseEvent(static_cast<cl_event>(m->last_use_event));
         }
         cl_mem buf = static_cast<cl_mem>(m->backend_handle);
         if (buf) {

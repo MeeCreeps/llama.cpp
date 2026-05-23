@@ -3163,45 +3163,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // queue 当前位置，写到所有被本 op 用过的 WBM 权重的 last_use_event。
         // 后续 evict 只需 clWaitForEvents 这些 marker（不再 clFinish 整个 queue），
         // 旧 marker 已结束的 buffer wait 立即返回。
-        // 只在"本次 graph_compute 真发生过 reload"才走 marker stamping 路径。
-        // budget 充裕情况下完全不 reload，3600 ops × ~5 个 OpenCL API call 是
-        // 纯浪费，实测可拖速 5×。无 reload 时 wbmcl_evict 也不会被调，markers
-        // 用不上。GGML_ELASTIC_FORCE_MARKER=1 留个开关强制开（debug 用）。
-        static const bool s_force_marker = []() {
-            const char *e = std::getenv("GGML_ELASTIC_FORCE_MARKER");
-            return e && *e && *e != '0';
-        }();
-        if (elastic_active && (s_force_marker || est->n_reloads_total > 0)) {
-            cl_event marker = nullptr;
-            cl_int merr = clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &marker);
-            if (merr == CL_SUCCESS && marker) {
-                auto stamp_event = [&](ggml_tensor *n) {
-                    if (!n) return;
-                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                        ggml_tensor *src = n->src[j];
-                        if (!src) continue;
-                        ggml_tensor_extra_cl *src_extra =
-                            (ggml_tensor_extra_cl *) src->extra;
-                        if (!src_extra || src_extra->wbm_idx < 0) continue;
-                        const elastic::block_meta *bm =
-                            elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
-                        if (!bm) continue;
-                        // pinned 块永不 evict → wbmcl_evict_batch 不会去
-                        // clWaitForEvents 它的 last_use_event → 不需要 stamp
-                        if (bm->is_pinned) continue;
-                        // 释放旧 event（如果有），retain 新 marker
-                        if (bm->last_use_event) {
-                            clReleaseEvent(static_cast<cl_event>(bm->last_use_event));
-                        }
-                        clRetainEvent(marker);
-                        elastic::wbm_set_last_use_event(&est->wbm, src_extra->wbm_idx,
-                                                       static_cast<void *>(marker));
-                    }
-                };
-                stamp_event(node);
-                clReleaseEvent(marker);
-            }
-        }
+        // Per-op marker stamping 已废弃：wbmcl_evict_batch 改成在 evict 当下
+        // 插 1 个 marker 等 queue 跑完所有 prior kernel——in-order queue 顺序
+        // 保证那时被 evict 的 block 上次用它的 kernel 必然已完成。省下每个
+        // op 的 ~5 个 OpenCL API call（约 18k call / token 在 1B 模型上）。
 
         if (elastic_active && est->bw_inited) {
             est->n_op_dispatched += 1;
