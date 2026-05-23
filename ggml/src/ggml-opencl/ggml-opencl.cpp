@@ -2907,6 +2907,15 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
+    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 lru）。LLM decode 是 round-robin
+    // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
+    // MRU 反而能让命中率随 cache/model 比例线性提升。
+    if (const char *p = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
+        if (std::string(p) == "mru") {
+            s->wbm.evict_mru = true;
+            GGML_LOG_INFO("ggml_opencl elastic: 启用 MRU 驱逐策略\n");
+        }
+    }
     // 默认走单队列同步路径：在 Adreno + ggml-opencl 上 enqueue 开销 + barrier
     // 同步反而拖累整体（实测 Test 3 上 async eval 时间 2223 ms/tok vs sync
     // 1782 ms/tok，慢 25%）。GGML_ELASTIC_ASYNC_XFER=1 可显式开异步路径，

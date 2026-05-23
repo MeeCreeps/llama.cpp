@@ -88,11 +88,14 @@ void wbm_mark_evicted(weight_buffer_manager *wbm, int idx) {
     wbm->resident_bytes -= b.byte_size;
 }
 
-void wbm_touch(weight_buffer_manager *wbm, int idx, uint64_t token) {
+void wbm_touch(weight_buffer_manager *wbm, int idx, uint64_t /*token_unused*/) {
     if (!wbm) return;
     if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) return;
-    wbm->blocks[idx].last_used_token = token;
-    if (token > wbm->current_token) wbm->current_token = token;
+    // 用一个全局递增计数器记 access 顺序，比 per-graph_compute 的 token 计数器
+    // 精细：能区分同一 forward pass 内不同 weight 的访问先后，让 MRU 真的能
+    // 选到"刚用过"的 victim（而不是被同 token 的 ties 卡到 lowest block_idx）。
+    wbm->current_token += 1;
+    wbm->blocks[idx].last_used_token = wbm->current_token;
 }
 
 void wbm_set_last_use_event(weight_buffer_manager *wbm, int idx, void *event) {
@@ -116,14 +119,31 @@ void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned) {
 int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
     if (!wbm) return -1;
     int victim = -1;
-    uint64_t oldest = static_cast<uint64_t>(-1);  // UINT64_MAX
-    for (const auto &b : wbm->blocks) {
-        if (!b.resident)            continue;
-        if (b.is_pinned)            continue;
-        if (b.block_idx == exclude_idx) continue;
-        if (b.last_used_token < oldest) {
-            oldest = b.last_used_token;
-            victim = b.block_idx;
+    if (wbm->evict_mru) {
+        // MRU：选 last_used_token 最大（刚被访问过的）
+        uint64_t newest = 0;
+        bool found = false;
+        for (const auto &b : wbm->blocks) {
+            if (!b.resident)            continue;
+            if (b.is_pinned)            continue;
+            if (b.block_idx == exclude_idx) continue;
+            if (!found || b.last_used_token > newest) {
+                newest = b.last_used_token;
+                victim = b.block_idx;
+                found = true;
+            }
+        }
+    } else {
+        // LRU：选 last_used_token 最小
+        uint64_t oldest = static_cast<uint64_t>(-1);  // UINT64_MAX
+        for (const auto &b : wbm->blocks) {
+            if (!b.resident)            continue;
+            if (b.is_pinned)            continue;
+            if (b.block_idx == exclude_idx) continue;
+            if (b.last_used_token < oldest) {
+                oldest = b.last_used_token;
+                victim = b.block_idx;
+            }
         }
     }
     return victim;
@@ -142,20 +162,35 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
     // 模拟"如果驱逐已选 victim 后字节数会是多少"：用本地 simulated_bytes
     // 跟踪，pick 算法继续基于真实 last_used_token / pinned / exclude。
     size_t simulated_bytes = wbm->resident_bytes;
-    // 用一张本地 set 标记已选过的，避免重复选同一个
     std::vector<bool> picked(wbm->blocks.size(), false);
     int n_picked = 0;
     while (simulated_bytes > target_bytes) {
         int victim = -1;
-        uint64_t oldest = static_cast<uint64_t>(-1);
-        for (const auto &b : wbm->blocks) {
-            if (!b.resident)               continue;
-            if (b.is_pinned)               continue;
-            if (b.block_idx == exclude_idx) continue;
-            if (picked[b.block_idx])        continue;
-            if (b.last_used_token < oldest) {
-                oldest = b.last_used_token;
-                victim = b.block_idx;
+        if (wbm->evict_mru) {
+            uint64_t newest = 0;
+            bool found = false;
+            for (const auto &b : wbm->blocks) {
+                if (!b.resident)               continue;
+                if (b.is_pinned)               continue;
+                if (b.block_idx == exclude_idx) continue;
+                if (picked[b.block_idx])        continue;
+                if (!found || b.last_used_token > newest) {
+                    newest = b.last_used_token;
+                    victim = b.block_idx;
+                    found = true;
+                }
+            }
+        } else {
+            uint64_t oldest = static_cast<uint64_t>(-1);
+            for (const auto &b : wbm->blocks) {
+                if (!b.resident)               continue;
+                if (b.is_pinned)               continue;
+                if (b.block_idx == exclude_idx) continue;
+                if (picked[b.block_idx])        continue;
+                if (b.last_used_token < oldest) {
+                    oldest = b.last_used_token;
+                    victim = b.block_idx;
+                }
             }
         }
         if (victim < 0) break;
