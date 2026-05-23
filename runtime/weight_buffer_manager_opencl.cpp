@@ -72,15 +72,38 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     }
 
     cl_int err = CL_SUCCESS;
-    // 走两步法（先 alloc，再 enqueueWriteBuffer），方便后续插 prefetch + event：
-    cl_mem buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
-                                meta->byte_size, nullptr, &err);
+    // GGML_ELASTIC_USE_HOST_PTR=1 实验：让 OpenCL 用 mmap 指针直接做 cl_mem
+    // 后备存储，省掉显式的 host→GPU memcpy。Adreno unified memory 下可能
+    // 实现零拷贝；非 unified 架构（如桌面独显）driver 会自己做一次 copy，
+    // 等价但多一次驱动开销。默认关。
+    static const bool s_use_host_ptr = []() {
+        const char *e = std::getenv("GGML_ELASTIC_USE_HOST_PTR");
+        return e && *e && *e != '0';
+    }();
+
+    cl_mem buf = nullptr;
+    if (s_use_host_ptr) {
+        // host_ptr 由 llama_model_loader 的 mmap 而来，生命周期 = 进程 →
+        // cl_mem 持续引用安全。Adreno 上 USE_HOST_PTR 触发零拷贝。
+        buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+                             meta->byte_size, meta->host_ptr, &err);
+    } else {
+        buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
+                             meta->byte_size, nullptr, &err);
+    }
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[wbmcl] clCreateBuffer 失败 block %d size %zu: %s (%d)\n",
                      idx, meta->byte_size, cl_err(err), err);
         return -4;
     }
     octx->n_creates += 1;
+
+    if (s_use_host_ptr) {
+        // USE_HOST_PTR 路径：driver 已绑 host_ptr，不再需要 enqueueWriteBuffer
+        octx->bytes_uploaded_total += meta->byte_size;
+        wbm_mark_resident(octx->wbm, idx, static_cast<void *>(buf));
+        return 0;
+    }
 
     if (octx->xfer_queue) {
         // 异步路径：上传走 xfer queue，compute queue 插 barrier 等上传 event

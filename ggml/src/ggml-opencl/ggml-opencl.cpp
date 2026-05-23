@@ -2848,6 +2848,11 @@ struct ggml_opencl_elastic_state {
     uint64_t n_prefetch_issued    = 0;
     uint64_t n_prefetch_skipped   = 0;
 
+    // EMBED_OUTSIDE_BUDGET 把 token_embd 的字节数累计在这里，运行时 target
+    // 加上它（dynamic = B(t) - kv - misc + extra_target_bytes），效果上等于
+    // 该 tensor 的开销不计入 M_floor 预算。
+    size_t   extra_target_bytes   = 0;
+
     uint64_t current_token       = 0;
     uint64_t n_op_dispatched     = 0;
     uint64_t n_evicts_total      = 0;
@@ -3045,7 +3050,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     const size_t B_t_mb  = elastic::budget_watcher_get(&est->bw);
                     const size_t budget  = B_t_mb * 1024 * 1024;
                     const size_t kv_misc = est->kv_bytes + est->misc_overhead;
-                    const size_t target  = budget > kv_misc ? budget - kv_misc : 0;
+                    const size_t base    = budget > kv_misc ? budget - kv_misc : 0;
+                    const size_t target  = base + est->extra_target_bytes;
                     const size_t needed  = est->wbm.resident_bytes + bm->byte_size;
                     if (needed > target) {
                         // 给即将 reload 的 bm 腾出位置：把现有 resident 压到
@@ -3187,7 +3193,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const size_t B_t_mb     = elastic::budget_watcher_get(&est->bw);
                 const size_t budget     = B_t_mb * 1024 * 1024;
                 const size_t kv_misc    = est->kv_bytes + est->misc_overhead;
-                const size_t target     = budget > kv_misc ? budget - kv_misc : 0;
+                const size_t base       = budget > kv_misc ? budget - kv_misc : 0;
+                const size_t target     = base + est->extra_target_bytes;
                 if (est->wbm.resident_bytes > target) {
                     // F4-event：不再 clFinish 整个 queue，依赖 wbmcl_evict_batch
                     // 里 clWaitForEvents 在 victim 的 last_use_event 上选择性等待。
@@ -4372,6 +4379,24 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (contains("o") && suffix == "attn_output") should_pin = true;
                     if (should_pin) {
                         elastic::wbm_set_pinned(&s->wbm, idx, true);
+                    }
+
+                    // GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1：把 token_embd（501 MB
+                    // 但只用 1 行 / token，每次 reload 要 ~240 ms）pin 起来，并
+                    // 把它的字节数加到 extra_target_bytes 上：动态模式下
+                    // target = B(t) - kv - misc + extra，等于"该 tensor 的开销
+                    // 不计入预算"。技术上违反 spec §5 的 M_floor 契约（实际 GPU
+                    // 占用 = B(t) + embed_bytes），但因为是 read-only 的固定量，
+                    // 可以理解成对 B(t) 的常数偏置。
+                    static const bool s_embed_out = []() {
+                        const char *e = std::getenv("GGML_ELASTIC_EMBED_OUTSIDE_BUDGET");
+                        return e && *e && *e != '0';
+                    }();
+                    if (s_embed_out && suffix == "token_embd") {
+                        elastic::wbm_set_pinned(&s->wbm, idx, true);
+                        s->extra_target_bytes += size;
+                        GGML_LOG_INFO("ggml_opencl elastic: pin token_embd (%zu MB) outside budget → extra=%zu MB\n",
+                                      size / 1024 / 1024, s->extra_target_bytes / 1024 / 1024);
                     }
                 }
             }
