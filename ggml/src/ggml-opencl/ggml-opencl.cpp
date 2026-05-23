@@ -3163,7 +3163,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // queue 当前位置，写到所有被本 op 用过的 WBM 权重的 last_use_event。
         // 后续 evict 只需 clWaitForEvents 这些 marker（不再 clFinish 整个 queue），
         // 旧 marker 已结束的 buffer wait 立即返回。
-        if (elastic_active) {
+        // 只在"本次 graph_compute 真发生过 reload"才走 marker stamping 路径。
+        // budget 充裕情况下完全不 reload，3600 ops × ~5 个 OpenCL API call 是
+        // 纯浪费，实测可拖速 5×。无 reload 时 wbmcl_evict 也不会被调，markers
+        // 用不上。GGML_ELASTIC_FORCE_MARKER=1 留个开关强制开（debug 用）。
+        static const bool s_force_marker = []() {
+            const char *e = std::getenv("GGML_ELASTIC_FORCE_MARKER");
+            return e && *e && *e != '0';
+        }();
+        if (elastic_active && (s_force_marker || est->n_reloads_total > 0)) {
             cl_event marker = nullptr;
             cl_int merr = clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &marker);
             if (merr == CL_SUCCESS && marker) {
@@ -3188,10 +3196,6 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     }
                 };
                 stamp_event(node);
-                // 注：fused op 的 i+1 / i+2 src 在前面 ensure_node_srcs_resident
-                // 已 ensure 过；marker 是基于 compute_queue 的当前点，对它们也
-                // 适用——但严格上要单独标记一次。目前 marker 只发一次，假设
-                // fused op 的 kernel 在同一 marker 之前完成。
                 clReleaseEvent(marker);
             }
         }
