@@ -12,7 +12,33 @@
 2. **CPU prefetch**：`GGML_ELASTIC_PREFETCH=N`（madvise WILLNEED on lookahead N nodes 的 src）
 3. **Pin 永驻**：`GGML_ELASTIC_PIN=norm,k,v,q`（按 tensor 后缀 set is_pinned）
 4. **token_embd outside-budget**：`GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1`（pin 但不计入 target，违反 M_floor）
-5. **测试 trace**：test3_tight (窄带 1000-1200) / decreasing (2500→1000)
+5. **Marker 优化**：删 per-op marker stamping，evict 时插单 marker（in-order queue 顺序保证）
+6. **MRU 驱逐策略**：`GGML_ELASTIC_EVICT_POLICY=mru`——适配 LLM round-robin 访问，cache < model 时命中率随 cache 大小线性提升（vs LRU 100% miss 平台）
+7. **测试 trace**：test3_tight (窄带 1000-1200) / decreasing (2500→1000) / constant huge / constant B sweep
+
+## Budget 扫描：LRU vs MRU（vanilla, PF=0 PIN=空 EMBED_OUT=0）
+
+恒定 B(t) trace，模型 2.3 GB：
+
+| B(t) MB | target | ratio | LRU tpot ms | MRU tpot ms | speedup |
+|---|---|---|---|---|---|
+| 4000 | 3616 | 157% | 49 | 49 | 1× (装下) |
+| 2700 | 2316 | 101% | 1521 | **114** | **13.3×** |
+| 2500 | 2116 | 92% | 1477 | 269 | 5.5× |
+| 2300 | 1916 | 83% | 1498 | 399 | 3.7× |
+| 2100 | 1716 | 75% | 1502 | 562 | 2.7× |
+| 1900 | 1516 | 66% | 1528 | 721 | 2.1× |
+| 1700 | 1316 | 57% | 1530 | 876 | 1.7× |
+| 1500 | 1116 | 49% | 1517 | 1025 | 1.5× |
+| 1300 | 916 | 40% | 1510 | 1181 | 1.3× |
+| 1100 | 716 | 31% | 1567 | 1627 | 0.96× |
+| 900 | 516 | 22% | 1528 | 1595 | 0.96× |
+| 700 | 316 | 14% | 1532 | 1616 | 0.95× |
+
+**关键观察**：
+- LRU 在所有 cache 大小下都是 ~1500 ms 平台（100% miss——round-robin 访问的经典 LRU 病态）
+- MRU 速度跟 cache/model 比例呈**线性**（命中率 ∝ cache 大小）
+- B≥1300（target≥40% model）时 MRU 显著优于 LRU；以下两者都进入"全 miss"plateau（DMA 带宽决定），MRU 略输 5% 是 evict 顺序对 driver allocator 的细节影响
 
 ## tpot/ms 完整矩阵 (n=31 decode tokens)
 
@@ -77,6 +103,7 @@ GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1：pin token_embd 并把它 501 MB 加到 sta
 ```bash
 GGML_OPENCL_ELASTIC=1 \
 GGML_ELASTIC_BUDGET_CSV=<trace> \
+GGML_ELASTIC_EVICT_POLICY=mru \
 GGML_ELASTIC_PREFETCH=32 \
 GGML_ELASTIC_PIN=norm,k,v,q \
 GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1 \
