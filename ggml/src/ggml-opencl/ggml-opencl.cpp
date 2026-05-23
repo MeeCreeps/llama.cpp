@@ -3186,6 +3186,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                         const elastic::block_meta *bm =
                             elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
                         if (!bm) continue;
+                        // pinned 块永不 evict → wbmcl_evict_batch 不会去
+                        // clWaitForEvents 它的 last_use_event → 不需要 stamp
+                        if (bm->is_pinned) continue;
                         // 释放旧 event（如果有），retain 新 marker
                         if (bm->last_use_event) {
                             clReleaseEvent(static_cast<cl_event>(bm->last_use_event));
