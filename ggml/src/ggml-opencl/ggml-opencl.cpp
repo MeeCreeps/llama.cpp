@@ -4348,6 +4348,31 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         static_cast<size_t>(extra->ctx_slot) < bctx->wbm_idx_per_slot.size()) {
                         bctx->wbm_idx_per_slot[extra->ctx_slot] = idx;
                     }
+
+                    // Pin 小但常访问的 tensor：norm（4 KB 量级、每 op 必用）+ GQA
+                    // 的 attn_k/v（每层 2 MB）。按 tensor 名后缀决定。
+                    // GGML_ELASTIC_PIN=norm,k,v,q（默认 norm,k,v；写空串关闭；
+                    // 写 all 把所有 attn 权重和 norm 都 pin 上做 A/B 对比）
+                    static std::string pin_policy = []() -> std::string {
+                        const char *e = std::getenv("GGML_ELASTIC_PIN");
+                        return e ? std::string(e) : std::string("norm,k,v");
+                    }();
+                    auto contains = [&](const char *tok) {
+                        return pin_policy == "all" ||
+                               pin_policy.find(tok) != std::string::npos;
+                    };
+                    const std::string suffix = ggml_opencl_tensor_suffix(tensor->name);
+                    bool should_pin = false;
+                    if (contains("norm") &&
+                        (suffix == "attn_norm" || suffix == "ffn_norm" ||
+                         suffix == "output_norm")) should_pin = true;
+                    if (contains("k") && suffix == "attn_k") should_pin = true;
+                    if (contains("v") && suffix == "attn_v") should_pin = true;
+                    if (contains("q") && suffix == "attn_q") should_pin = true;
+                    if (contains("o") && suffix == "attn_output") should_pin = true;
+                    if (should_pin) {
+                        elastic::wbm_set_pinned(&s->wbm, idx, true);
+                    }
                 }
             }
         }
