@@ -112,9 +112,25 @@ GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1 \
 | 分支 | HEAD | 内容 |
 |---|---|---|
 | `feature/elastic-baseline-phase1` | `50f762839` | static M_floor + CPU prefetch + Pin + EMBED_OUTSIDE_BUDGET |
-| `feature/elastic-dynamic-phase1` | `7660a3b0a` | dynamic B(t) + CPU prefetch (cherry-pick；尚未合 Pin / EMBED_OUT) |
+| `feature/elastic-dynamic-phase1` | `86778b760` | dynamic B(t) + CPU prefetch + Pin + EMBED_OUTSIDE_BUDGET（已 cherry-pick + 适配 extra_target_bytes）|
 
-dynamic 分支可以再 cherry-pick Pin + EMBED_OUTSIDE_BUDGET 的 commit 拿到同样的 ~43% 优化。
+dynamic 的 EMBED_OUTSIDE_BUDGET 实现：加 `extra_target_bytes` 字段，运行时
+`target = B(t) - kv - misc + extra_target_bytes`。
+
+### Dynamic + 全部优化的发现
+
+decreasing trace（B(t) 2500→1000 MB）+ dynamic + EMBED_OUT=1 表现极佳：早期
+B(t)=2500 MB + extra=501 MB → target ≈ 2616 MB，**整个 2.3 GB 模型装下**，
+前期几乎零 reload。
+
+| 配置 | tpot ms | 备注 |
+|---|---|---|
+| static + 全部优化 + EMBED_OUT=1 | 1096 | target 锁 609 MB |
+| dynamic + 全部优化 + EMBED_OUT=1 on decreasing | **280** | **3.57 tok/s** |
+
+dynamic 在 trace 有 budget headroom 时能拿到接近"全装"的 tpot（compute-only
+时间约 280 ms），相比 static **4× 加速**。窄带 trace (test3_tight) 上 dynamic
+跟 static 打平（~1100 ms）。
 
 ## 验收（spec §6 对齐）
 
