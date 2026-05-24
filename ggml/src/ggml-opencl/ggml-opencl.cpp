@@ -2853,6 +2853,8 @@ struct ggml_opencl_elastic_state {
     // 该 tensor 的开销不计入 M_floor 预算。
     size_t   extra_target_bytes   = 0;
 
+    bool     retain_cap_auto      = false;  // GGML_ELASTIC_CL_RETAIN_MB=auto
+
     uint64_t current_token       = 0;
     uint64_t n_op_dispatched     = 0;
     uint64_t n_evicts_total      = 0;
@@ -2950,6 +2952,22 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
         return;
     }
+    if (const char *r = std::getenv("GGML_ELASTIC_CL_RETAIN"); r && *r && *r != '0') {
+        s->octx.retain_cl_mem = true;
+        if (const char *m = std::getenv("GGML_ELASTIC_CL_RETAIN_MB")) {
+            if (std::string(m) == "auto") {
+                s->octx.cache_byte_limit = 0;
+                s->retain_cap_auto = true;
+                GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool cap = AUTO\n");
+            } else {
+                size_t mb = (size_t)atoll(m);
+                s->octx.cache_byte_limit = mb * 1024 * 1024;
+                GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool cap = %zu MB\n", mb);
+            }
+        } else {
+            GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool 不限\n");
+        }
+    }
     s->wbm_inited = true;
     s->t0 = std::chrono::steady_clock::now();
 
@@ -3036,6 +3054,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     const bool elastic_active = est->wbm_inited;
     if (elastic_active) {
         est->current_token += 1;
+        // Auto cap on first graph_compute（wbm 已全注册）
+        if (est->retain_cap_auto && est->octx.cache_byte_limit == 0) {
+            size_t max_unpinned = 0;
+            for (const auto &b : est->wbm.blocks) {
+                if (b.is_pinned) continue;
+                if (b.byte_size > max_unpinned) max_unpinned = b.byte_size;
+            }
+            if (max_unpinned > 0) {
+                est->octx.cache_byte_limit = max_unpinned;
+                GGML_LOG_INFO("ggml_opencl elastic: auto cap = %zu MB\n",
+                              est->octx.cache_byte_limit / 1024 / 1024);
+            }
+        }
     }
 
     // Elastic baseline (F4-evict)：ensure_resident 当前 node 的所有 WBM src
@@ -3060,7 +3091,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     const size_t budget  = B_t_mb * 1024 * 1024;
                     const size_t kv_misc = est->kv_bytes + est->misc_overhead;
                     const size_t base    = budget > kv_misc ? budget - kv_misc : 0;
-                    const size_t target  = base + est->extra_target_bytes;
+                    size_t target = base + est->extra_target_bytes;
+                    // CL_RETAIN_COUNTS_BUDGET：把 pool cap 从 target 扣，严格合规
+                    static const bool s_pool_counts = []() {
+                        const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
+                        return e && *e && *e != '0';
+                    }();
+                    if (s_pool_counts && est->octx.cache_byte_limit > 0 && target > est->octx.cache_byte_limit) {
+                        target -= est->octx.cache_byte_limit;
+                    }
                     const size_t needed  = est->wbm.resident_bytes + bm->byte_size;
                     if (needed > target) {
                         // 给即将 reload 的 bm 腾出位置：把现有 resident 压到
@@ -3175,7 +3214,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const size_t budget     = B_t_mb * 1024 * 1024;
                 const size_t kv_misc    = est->kv_bytes + est->misc_overhead;
                 const size_t base       = budget > kv_misc ? budget - kv_misc : 0;
-                const size_t target     = base + est->extra_target_bytes;
+                size_t target = base + est->extra_target_bytes;
+                static const bool s_pool_counts_p = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
+                    return e && *e && *e != '0';
+                }();
+                if (s_pool_counts_p && est->octx.cache_byte_limit > 0 && target > est->octx.cache_byte_limit) {
+                    target -= est->octx.cache_byte_limit;
+                }
                 if (est->wbm.resident_bytes > target) {
                     // F4-event：不再 clFinish 整个 queue，依赖 wbmcl_evict_batch
                     // 里 clWaitForEvents 在 victim 的 last_use_event 上选择性等待。

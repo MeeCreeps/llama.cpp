@@ -20,6 +20,10 @@
 #endif
 #include <CL/cl.h>
 
+#include <list>
+#include <unordered_map>
+#include <vector>
+
 #include "weight_buffer_manager.h"
 
 namespace elastic {
@@ -29,6 +33,28 @@ struct wbm_opencl_ctx {
     cl_context        cl_ctx;
     cl_command_queue  compute_queue;      // 主算用
     cl_command_queue  xfer_queue;         // 异步 prefetch；空 → 用 compute_queue
+
+    // GGML_ELASTIC_CL_RETAIN=1 触发：evict 时不调 clReleaseMemObject，把 cl_mem
+    // 暂存到 retained_buffers[idx]；ensure_resident 直接 clEnqueueWriteBuffer 到
+    // 已存在的 cl_mem，省 driver per-call alloc/free overhead。
+    //
+    // GGML_ELASTIC_CL_RETAIN_MB=N 设 pool 字节上限（默认 0 = 不限）。pool 满时
+    // FIFO 释放最早入池的 cl_mem，保证 cached_bytes ≤ cache_byte_limit。
+    // 这样 elastic 的 "evict 真释放" 语义部分保留，driver overhead 摊到 cache miss。
+    bool                                                       retain_cl_mem;
+    size_t                                                     cache_byte_limit;  // 0 = 不限
+    size_t                                                     cached_bytes;      // 当前 pool 字节
+    // Pool indexed by **byte size** (不是 tensor idx)：不同 idx 的 tensor 可以
+    // 共享同 size 的 cl_mem。这样 total GPU = working_set + 小 pool overhead，
+    // 真的合规 budget——而不是 indexed by idx 那种"每个 tensor 一份" ≈ 全 model。
+    std::unordered_map<size_t, std::vector<void *>>            retained_buffers_by_size;
+    std::list<size_t>                                          retain_order_sizes;  // FIFO 顺序，每个 entry = 一个 cl_mem 的 size
+    // 额外的 xfer queue 池：round-robin 派发，让多个 DMA 真并行
+    // micro-bench (probe_overlap.cpp) 实测 2 queue 能 2× 吞吐，3+ 边际递减
+    static constexpr int N_XFER_EXTRA = 4;
+    cl_command_queue  xfer_extra[N_XFER_EXTRA];  // 0..n_xfer_extra-1 有效
+    int               n_xfer_extra;       // 实际启用条数（0..4）
+    unsigned          xfer_round_robin;   // 选 queue 用的计数器
 
     // 内部计数 / 统计，便于 metrics_logger 取
     size_t bytes_uploaded_total;          // 历史累计上传字节

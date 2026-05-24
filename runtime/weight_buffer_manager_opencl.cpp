@@ -37,6 +37,14 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->cl_ctx               = cl_ctx;
     octx->compute_queue        = compute_queue;
     octx->xfer_queue           = xfer_queue;
+    octx->n_xfer_extra         = 0;
+    octx->xfer_round_robin     = 0;
+    for (int i = 0; i < wbm_opencl_ctx::N_XFER_EXTRA; ++i) octx->xfer_extra[i] = nullptr;
+    octx->retain_cl_mem                = false;
+    octx->cache_byte_limit             = 0;
+    octx->cached_bytes                 = 0;
+    octx->retained_buffers_by_size.clear();
+    octx->retain_order_sizes.clear();
     octx->bytes_uploaded_total = 0;
     octx->bytes_evicted_total  = 0;
     octx->n_creates            = 0;
@@ -72,6 +80,36 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     }
 
     cl_int err = CL_SUCCESS;
+    // Retain 模式：从 size 池里拿一个同 size 的 cl_mem 复用，省 clCreateBuffer
+    if (octx->retain_cl_mem) {
+        auto it = octx->retained_buffers_by_size.find(meta->byte_size);
+        if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
+            cl_mem cached = static_cast<cl_mem>(it->second.back());
+            it->second.pop_back();
+            // 从 FIFO 列表里移除一个 == 该 size 的 entry（LIFO 找最近的就行）
+            for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
+                if (*lit == meta->byte_size) {
+                    octx->retain_order_sizes.erase(std::next(lit).base());
+                    break;
+                }
+            }
+            octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
+            err = clEnqueueWriteBuffer(octx->compute_queue,
+                                       cached, CL_TRUE,
+                                       0, meta->byte_size, meta->host_ptr,
+                                       0, nullptr, nullptr);
+            if (err != CL_SUCCESS) {
+                std::fprintf(stderr, "[wbmcl retain] enqueueWriteBuffer 失败 idx=%d: %s (%d)\n",
+                             idx, cl_err(err), err);
+                return -5;
+            }
+            octx->bytes_uploaded_total += meta->byte_size;
+            wbm_mark_resident(octx->wbm, idx, static_cast<void *>(cached));
+            return 0;
+        }
+        // 没缓存的话走下面正常 create
+    }
+
     // GGML_ELASTIC_USE_HOST_PTR=1 实验：让 OpenCL 用 mmap 指针直接做 cl_mem
     // 后备存储，省掉显式的 host→GPU memcpy。Adreno unified memory 下可能
     // 实现零拷贝；非 unified 架构（如桌面独显）driver 会自己做一次 copy，
@@ -106,11 +144,16 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     }
 
     if (octx->xfer_queue) {
-        // 异步路径：上传走 xfer queue，compute queue 插 barrier 等上传 event
-        // 完成。host 端不再阻塞。配合 compute queue 自身的 in-order 语义，
-        // 后续派发的 kernel 会自动等到 buffer 写完才执行。
+        // 多 xfer queue 池：round-robin 派发；micro-bench (probe_overlap.cpp)
+        // 实测 2 queue 并发能让 DMA 吞吐 ~2× (Adreno 单 DMA 没吃满 host→GPU
+        // staging 的 per-call overhead)。
+        cl_command_queue use_q = octx->xfer_queue;
+        if (octx->n_xfer_extra > 0) {
+            unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
+            if (slot > 0) use_q = octx->xfer_extra[slot - 1];
+        }
         cl_event write_ev = nullptr;
-        err = clEnqueueWriteBuffer(octx->xfer_queue, buf, CL_FALSE,
+        err = clEnqueueWriteBuffer(use_q, buf, CL_FALSE,
                                    0, meta->byte_size, meta->host_ptr,
                                    0, nullptr, &write_ev);
         if (err != CL_SUCCESS) {
@@ -120,9 +163,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
             octx->n_releases += 1;
             return -5;
         }
-        // flush xfer queue 让 enqueue 真的发出去（不调 flush 时驱动可能
-        // 攒到下一次 clFinish/clWaitForEvents 才提交）
-        clFlush(octx->xfer_queue);
+        clFlush(use_q);
         // compute queue 插 barrier，依赖 write_ev
         cl_int berr = clEnqueueBarrierWithWaitList(octx->compute_queue, 1, &write_ev, nullptr);
         if (berr != CL_SUCCESS) {
@@ -173,6 +214,30 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
         clReleaseEvent(static_cast<cl_event>(meta->last_use_event));
     }
 
+    // Retain 模式：cl_mem 按 size 入池，cap 检查
+    if (octx->retain_cl_mem) {
+        if (octx->cache_byte_limit > 0) {
+            while (octx->cached_bytes + meta->byte_size > octx->cache_byte_limit &&
+                   !octx->retain_order_sizes.empty()) {
+                size_t old_sz = octx->retain_order_sizes.front();
+                octx->retain_order_sizes.pop_front();
+                auto pit = octx->retained_buffers_by_size.find(old_sz);
+                if (pit == octx->retained_buffers_by_size.end() || pit->second.empty()) continue;
+                cl_mem old_buf = static_cast<cl_mem>(pit->second.back());
+                pit->second.pop_back();
+                clReleaseMemObject(old_buf);
+                octx->n_releases += 1;
+                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+            }
+        }
+        octx->retained_buffers_by_size[meta->byte_size].push_back(static_cast<void *>(buf));
+        octx->retain_order_sizes.push_back(meta->byte_size);
+        octx->cached_bytes += meta->byte_size;
+        octx->bytes_evicted_total += meta->byte_size;
+        wbm_mark_evicted(octx->wbm, idx);
+        return 0;
+    }
+
     cl_int err = clReleaseMemObject(buf);
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[wbmcl] clReleaseMemObject 失败 block %d: %s (%d)\n",
@@ -209,8 +274,14 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
     }
     octx->n_creates += 1;
 
+    // 多 xfer queue 池：round-robin 派发
+    cl_command_queue use_q = octx->xfer_queue;
+    if (octx->n_xfer_extra > 0) {
+        unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
+        if (slot > 0) use_q = octx->xfer_extra[slot - 1];
+    }
     cl_event write_ev = nullptr;
-    err = clEnqueueWriteBuffer(octx->xfer_queue, buf, CL_FALSE,
+    err = clEnqueueWriteBuffer(use_q, buf, CL_FALSE,
                                0, meta->byte_size, meta->host_ptr,
                                0, nullptr, &write_ev);
     if (err != CL_SUCCESS) {
@@ -220,8 +291,7 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
         octx->n_releases += 1;
         return -5;
     }
-    // flush 让 enqueue 真发出去，否则要等下一次 clFinish/clWaitForEvents 才提交
-    clFlush(octx->xfer_queue);
+    clFlush(use_q);
 
     // 暂存 backend_handle + prefetch_event；不调 mark_resident，等 ensure_resident
     // 看到 prefetch_event 时 wait 完才正式标 resident（更新 n_resident /
@@ -267,6 +337,30 @@ int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
         }
         cl_mem buf = static_cast<cl_mem>(m->backend_handle);
         if (buf) {
+            // Retain 模式：cl_mem 按 size 入池。pool 满时 FIFO 释放最早 size。
+            if (octx->retain_cl_mem) {
+                if (octx->cache_byte_limit > 0) {
+                    while (octx->cached_bytes + m->byte_size > octx->cache_byte_limit &&
+                           !octx->retain_order_sizes.empty()) {
+                        size_t old_sz = octx->retain_order_sizes.front();
+                        octx->retain_order_sizes.pop_front();
+                        auto pit = octx->retained_buffers_by_size.find(old_sz);
+                        if (pit == octx->retained_buffers_by_size.end() || pit->second.empty()) continue;
+                        cl_mem old_buf = static_cast<cl_mem>(pit->second.back());
+                        pit->second.pop_back();
+                        clReleaseMemObject(old_buf);
+                        octx->n_releases += 1;
+                        octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+                    }
+                }
+                octx->retained_buffers_by_size[m->byte_size].push_back(static_cast<void *>(buf));
+                octx->retain_order_sizes.push_back(m->byte_size);
+                octx->cached_bytes += m->byte_size;
+                octx->bytes_evicted_total += m->byte_size;
+                wbm_mark_evicted(octx->wbm, v);
+                ++released;
+                continue;
+            }
             cl_int err = clReleaseMemObject(buf);
             if (err != CL_SUCCESS) {
                 std::fprintf(stderr, "[wbmcl] 批量 clReleaseMemObject 失败 block %d: %s (%d)\n",
@@ -291,6 +385,18 @@ cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx) {
 
 void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     if (!octx || !octx->wbm) return;
+    // 释放 retain 模式下暂存的所有 cl_mem
+    for (auto &kv : octx->retained_buffers_by_size) {
+        for (void *p : kv.second) {
+            if (p) {
+                clReleaseMemObject(static_cast<cl_mem>(p));
+                octx->n_releases += 1;
+            }
+        }
+    }
+    octx->retained_buffers_by_size.clear();
+    octx->retain_order_sizes.clear();
+    octx->cached_bytes = 0;
     for (auto &b : octx->wbm->blocks) {
         // 清掉未消费的 in-flight prefetch（block 还没 resident 但已发 write）
         if (!b.resident && b.prefetch_event) {
