@@ -9,6 +9,14 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <string>
+
+#if !defined(_WIN32)
+    #include <sys/types.h>
+    #include <sys/stat.h>
+    #include <sys/ioctl.h>
+    #include <stdlib.h>      // posix_memalign
+#endif
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -230,18 +238,95 @@ struct llama_file::impl {
         write_raw(&val, sizeof(val));
     }
 
+    // O_DIRECT bypass page cache.
+    // Linux/Android only. 处理:
+    //   - lazy 开 fd (一次)
+    //   - 探测 device block size 作 alignment
+    //   - 用对齐 bounce buffer 处理 unaligned offset/size/dst
+    int pread_direct_impl(void * dst, size_t file_offset, size_t len) const {
+#if defined(__linux__) || defined(__ANDROID__)
+        if (direct_fd < 0) {
+            int fd = open(filename.c_str(), O_RDONLY | O_DIRECT);
+            if (fd < 0) {
+                // 某些 fs (e.g. tmpfs, f2fs 配置不允许) 不支持 O_DIRECT
+                fprintf(stderr, "[pread_direct] open O_DIRECT failed for %s: %s, fallback no-direct\n",
+                        filename.c_str(), strerror(errno));
+                fd = open(filename.c_str(), O_RDONLY);
+                if (fd < 0) return -1;
+            }
+            direct_fd = fd;
+            // block size detect: 探测 fs block size, fallback 4096
+            struct stat st;
+            if (fstat(fd, &st) == 0) {
+                align = (size_t) st.st_blksize;
+                if (align == 0 || (align & (align - 1)) != 0) align = 4096;
+            } else {
+                align = 4096;
+            }
+        }
+        size_t a = align;
+        size_t off_aligned   = file_offset & ~(a - 1);
+        size_t head_skip     = file_offset - off_aligned;
+        size_t total_aligned = ((head_skip + len + a - 1) / a) * a;
+        // bounce buffer (aligned) 容量
+        if (bounce_cap < total_aligned) {
+            if (bounce_buf) free(bounce_buf);
+            bounce_buf = nullptr;
+            if (posix_memalign(&bounce_buf, a, total_aligned) != 0) {
+                bounce_cap = 0;
+                return -2;
+            }
+            bounce_cap = total_aligned;
+        }
+        ssize_t rd = pread(direct_fd, bounce_buf, total_aligned, off_aligned);
+        if (rd < 0) {
+            fprintf(stderr, "[pread_direct] pread fail off=%zu len=%zu: %s\n",
+                    file_offset, len, strerror(errno));
+            return -3;
+        }
+        // 拷贝有效区到 dst
+        memcpy(dst, (char *)bounce_buf + head_skip, len);
+        return 0;
+#else
+        (void)dst; (void)file_offset; (void)len;
+        return -1;
+#endif
+    }
+
     ~impl() {
         if (fp) {
             std::fclose(fp);
+        }
+        if (direct_fd >= 0) {
+            close(direct_fd);
+            direct_fd = -1;
+        }
+        if (bounce_buf) {
+            free(bounce_buf);
+            bounce_buf = nullptr;
+            bounce_cap = 0;
         }
     }
 #endif
 
     FILE * fp;
     size_t size;
+
+#if !defined(_WIN32)
+    // O_DIRECT fd (lazy-opened), 跟 fp 同文件但独立, 用于绕 page cache 的 pread.
+    mutable int direct_fd       = -1;
+    mutable std::string         filename;   // 记下来方便 lazy open
+    mutable size_t              align       = 0;   // pread alignment requirement (block size)
+    mutable void *              bounce_buf  = nullptr;
+    mutable size_t              bounce_cap  = 0;
+#endif
 };
 
-llama_file::llama_file(const char * fname, const char * mode) : pimpl(std::make_unique<impl>(fname, mode)) {}
+llama_file::llama_file(const char * fname, const char * mode) : pimpl(std::make_unique<impl>(fname, mode)) {
+#if !defined(_WIN32)
+    pimpl->filename = fname;
+#endif
+}
 llama_file::~llama_file() = default;
 
 size_t llama_file::tell() const { return pimpl->tell(); }
@@ -261,6 +346,15 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) const { pimpl->read_raw(ptr, len); }
+
+int llama_file::pread_direct(void * dst, size_t file_offset, size_t len) const {
+#if defined(_WIN32)
+    (void)dst; (void)file_offset; (void)len;
+    return -1;
+#else
+    return pimpl->pread_direct_impl(dst, file_offset, len);
+#endif
+}
 
 uint32_t llama_file::read_u32() const { return pimpl->read_u32(); }
 

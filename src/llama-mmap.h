@@ -29,6 +29,14 @@ struct llama_file {
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
+    // O_DIRECT read：绕过 page cache，每次真打 disk (UFS controller). 用于 elastic
+    // benchmark "model > RAM" 场景模拟. 内部用 pread + O_DIRECT fd, 处理对齐
+    // (buffer / offset / size 不必 4KB 对齐, 函数内部用对齐 bounce buffer 补齐).
+    // 仅 Linux/Android, 其它平台 fallback 走普通 pread.
+    // 注意: 跟 read_raw/seek 用的是独立 fd, 不影响 mmap path.
+    // 返回 0 = 成功, <0 = 错误.
+    int pread_direct(void * dst, size_t file_offset, size_t len) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
