@@ -17,6 +17,7 @@ set(_ELASTIC_SOURCES
     budget_watcher.cpp
     metrics_logger.cpp
     weight_buffer_manager.cpp
+    weight_buffer_manager_cpu.cpp
 )
 
 # OpenCL 包装层只在 find_package 找到 OpenCL 时进静态库。

@@ -407,6 +407,15 @@ ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
 
+# CPU_Elastic：自定义命名（带连字符），不走 ggml_add_backend 宏
+if (GGML_CPU_ELASTIC)
+    add_subdirectory(ggml-cpu-elastic)
+    message(STATUS "Including CPU_Elastic backend")
+    if (NOT GGML_BACKEND_DL)
+        target_compile_definitions(ggml PUBLIC GGML_USE_CPU_ELASTIC)
+    endif()
+endif()
+
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump

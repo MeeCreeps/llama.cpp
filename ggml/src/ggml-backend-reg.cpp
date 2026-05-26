@@ -57,6 +57,10 @@
 #include "ggml-opencl.h"
 #endif
 
+#ifdef GGML_USE_CPU_ELASTIC
+#include "ggml-cpu-elastic.h"
+#endif
+
 #ifdef GGML_USE_HEXAGON
 #include "ggml-hexagon.h"
 #endif
@@ -202,6 +206,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_OPENCL
         register_backend(ggml_backend_opencl_reg());
+#endif
+#ifdef GGML_USE_CPU_ELASTIC
+        register_backend(ggml_backend_cpu_elastic_reg());
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());
