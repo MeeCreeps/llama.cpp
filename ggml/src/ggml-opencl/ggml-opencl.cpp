@@ -2909,13 +2909,19 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
-    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 lru）。LLM decode 是 round-robin
+    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 MRU）。LLM decode 是 round-robin
     // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
     // MRU 反而能让命中率随 cache/model 比例线性提升。
+    // 实测 3B F16 B=5000: LRU 3827 ms/tok, MRU 447 ms/tok (8.5× 差距).
+    // CPU elastic 早就改成 MRU 默认; GPU 这里之前还是 LRU 默认是 bug.
+    s->wbm.evict_mru = true;
     if (const char *p = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
-        if (std::string(p) == "mru") {
-            s->wbm.evict_mru = true;
-            GGML_LOG_INFO("ggml_opencl elastic: 启用 MRU 驱逐策略\n");
+        std::string ps(p);
+        if (ps == "lru") {
+            s->wbm.evict_mru = false;
+            GGML_LOG_INFO("ggml_opencl elastic: 启用 LRU 驱逐策略 (显式)\n");
+        } else if (ps == "mru") {
+            GGML_LOG_INFO("ggml_opencl elastic: MRU 驱逐策略 (默认)\n");
         }
     }
     // 默认走单队列同步路径：在 Adreno + ggml-opencl 上 enqueue 开销 + barrier
@@ -3025,12 +3031,15 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     if (s->prefetch_lookahead > 0) {
         std::atexit([]() {
             auto *st = ggml_opencl_elastic();
-            std::fprintf(stderr, "[elastic prefetch] lookahead=%d issued=%llu skipped=%llu reloads_total=%llu evicts_total=%llu\n",
+            std::fprintf(stderr, "[elastic prefetch] lookahead=%d issued=%llu skipped=%llu reloads_total=%llu evicts_total=%llu n_creates=%llu n_releases=%llu cached_bytes=%zu\n",
                          st->prefetch_lookahead,
                          (unsigned long long)st->n_prefetch_issued,
                          (unsigned long long)st->n_prefetch_skipped,
                          (unsigned long long)st->n_reloads_total,
-                         (unsigned long long)st->n_evicts_total);
+                         (unsigned long long)st->n_evicts_total,
+                         (unsigned long long)st->octx.n_creates,
+                         (unsigned long long)st->octx.n_releases,
+                         st->octx.cached_bytes);
         });
     }
 

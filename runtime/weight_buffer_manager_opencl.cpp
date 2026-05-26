@@ -265,14 +265,34 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
     if (!meta->host_ptr || meta->byte_size == 0) return -3;
 
     cl_int err = CL_SUCCESS;
-    cl_mem buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
-                                meta->byte_size, nullptr, &err);
-    if (err != CL_SUCCESS) {
-        std::fprintf(stderr, "[wbmcl] async clCreateBuffer 失败 block %d size %zu: %s (%d)\n",
-                     idx, meta->byte_size, cl_err(err), err);
-        return -4;
+    cl_mem buf = nullptr;
+    // Retain pool 优先 (跟 ensure_resident 对齐) — 之前 prefetch 直接 clCreateBuffer
+    // 不查池, 导致 prefetch 是热路径时 10000+ 次 alloc/release, Adreno driver 开销
+    // 主导 (实测 5000 MB budget 3B F16 eval 6500 ms/tok vs ceiling 183).
+    if (octx->retain_cl_mem) {
+        auto it = octx->retained_buffers_by_size.find(meta->byte_size);
+        if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
+            buf = static_cast<cl_mem>(it->second.back());
+            it->second.pop_back();
+            for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
+                if (*lit == meta->byte_size) {
+                    octx->retain_order_sizes.erase(std::next(lit).base());
+                    break;
+                }
+            }
+            octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
+        }
     }
-    octx->n_creates += 1;
+    if (!buf) {
+        buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
+                             meta->byte_size, nullptr, &err);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[wbmcl] async clCreateBuffer 失败 block %d size %zu: %s (%d)\n",
+                         idx, meta->byte_size, cl_err(err), err);
+            return -4;
+        }
+        octx->n_creates += 1;
+    }
 
     // 多 xfer queue 池：round-robin 派发
     cl_command_queue use_q = octx->xfer_queue;
