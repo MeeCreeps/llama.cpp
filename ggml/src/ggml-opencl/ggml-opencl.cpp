@@ -38,6 +38,9 @@
 #include "metrics_logger.h"
 #include "weight_buffer_manager.h"
 #include "weight_buffer_manager_opencl.h"
+// O_DIRECT path: 让 elastic reload 绕过 mmap page cache. 通过
+// llama_mmap_registry 反查 host_ptr → (file, file_offset).
+#include "../../../src/llama-mmap.h"
 
 #undef MIN
 #undef MAX
@@ -2547,6 +2550,15 @@ struct ggml_tensor_extra_cl_q4_0 {
     size_t size_q = 0;
     // Size of scales.
     size_t size_d = 0;
+    // elastic baseline: 同 ggml_tensor_extra_cl::wbm_idx，对 SOA q4_0 tensor
+    // 启用 evict/reload 时填。SOA 路径替换 tensor->extra 后，elastic 集成钩子
+    // 通过这个 idx 反查 WBM block；-1 = 不归 WBM 管。
+    int wbm_idx = -1;
+    int ctx_slot = -1;
+    // Parent buffer：SOA convert kernel 把 mmap 的原始字节 → {scales, quants}
+    // 写入这个 cl_mem 的两段（extra->d、extra->q 是它的 sub-buffer）。evict 时
+    // 释放它 + q/d sub-buffer；reload 时 alloc 新 parent 并重跑 convert。
+    cl_mem parent_buffer = nullptr;
 
     ~ggml_tensor_extra_cl_q4_0() {
         reset();
@@ -2588,6 +2600,12 @@ struct ggml_tensor_extra_cl_mxfp4 {
     size_t size_q = 0;
     // Size of scales.
     size_t size_e = 0;
+    // elastic baseline：与 ggml_tensor_extra_cl::wbm_idx 同义；类型不同 struct
+    // layout 不同，graph_compute 读 wbm_idx 必须通过 ggml_opencl_get_wbm_idx() 帮手
+    // 按 tensor->type 分派，不能直接 cast 通用 extra。
+    int wbm_idx = -1;
+    int ctx_slot = -1;
+    cl_mem parent_buffer = nullptr;
 
     ~ggml_tensor_extra_cl_mxfp4() {
         reset();
@@ -2627,6 +2645,9 @@ struct ggml_tensor_extra_cl_q8_0 {
 
     size_t size_q = 0;
     size_t size_d = 0;
+    int wbm_idx = -1;
+    int ctx_slot = -1;
+    cl_mem parent_buffer = nullptr;
 
     ~ggml_tensor_extra_cl_q8_0() {
         reset();
@@ -2652,6 +2673,36 @@ struct ggml_tensor_extra_cl_q8_0 {
         size_d = 0;
     }
 };
+
+// Type-aware accessors：SOA 量化 tensor 用独立 extra struct，layout 与 generic
+// 不同——直接 (ggml_tensor_extra_cl*) 强转读 wbm_idx / ctx_slot 会读错偏移。
+// graph_compute / elastic 集成路径必须通过这两个 helper 拿值。
+static inline int ggml_opencl_get_wbm_idx(const ggml_tensor *t) {
+    if (!t || !t->extra) return -1;
+    switch (t->type) {
+        case GGML_TYPE_Q4_0:
+            return ((const ggml_tensor_extra_cl_q4_0 *)t->extra)->wbm_idx;
+        case GGML_TYPE_Q8_0:
+            return ((const ggml_tensor_extra_cl_q8_0 *)t->extra)->wbm_idx;
+        case GGML_TYPE_MXFP4:
+            return ((const ggml_tensor_extra_cl_mxfp4 *)t->extra)->wbm_idx;
+        default:
+            return ((const ggml_tensor_extra_cl *)t->extra)->wbm_idx;
+    }
+}
+static inline int ggml_opencl_get_ctx_slot(const ggml_tensor *t) {
+    if (!t || !t->extra) return -1;
+    switch (t->type) {
+        case GGML_TYPE_Q4_0:
+            return ((const ggml_tensor_extra_cl_q4_0 *)t->extra)->ctx_slot;
+        case GGML_TYPE_Q8_0:
+            return ((const ggml_tensor_extra_cl_q8_0 *)t->extra)->ctx_slot;
+        case GGML_TYPE_MXFP4:
+            return ((const ggml_tensor_extra_cl_mxfp4 *)t->extra)->ctx_slot;
+        default:
+            return ((const ggml_tensor_extra_cl *)t->extra)->ctx_slot;
+    }
+}
 
 //------------------------------------------------------------------------------
 // Backend API
@@ -2842,18 +2893,19 @@ struct ggml_opencl_elastic_state {
     size_t misc_overhead  = static_cast<size_t>(256) * 1024 * 1024;
     int    evict_check_interval = 8;
 
-    // 流水线 prefetch：GGML_ELASTIC_PREFETCH=N 用 posix_madvise(WILLNEED) 提前
-    // 预热后 N 个 node src 的 mmap 页到 CPU page cache。N=0 关闭。
+    // Baseline (spec §5)：静态 target = M_floor - kv - misc，整个 run 不变。
+    // bw_inited 后在 lazy_init 里算一次。bw 没启用时为 0，等价于关闭 evict。
+    size_t static_target_bytes = 0;
+
+    // 流水线 prefetch：GGML_ELASTIC_PREFETCH=N 提前对后 N 个 node 的 src 发
+    // async write。N=0 关闭。开启时 xfer_queue 自动建。
     int      prefetch_lookahead   = 0;
     uint64_t n_prefetch_issued    = 0;
     uint64_t n_prefetch_skipped   = 0;
-
-    // EMBED_OUTSIDE_BUDGET 把 token_embd 的字节数累计在这里，运行时 target
-    // 加上它（dynamic = B(t) - kv - misc + extra_target_bytes），效果上等于
-    // 该 tensor 的开销不计入 M_floor 预算。
-    size_t   extra_target_bytes   = 0;
-
-    bool     retain_cap_auto      = false;  // GGML_ELASTIC_CL_RETAIN_MB=auto
+    int      gpu_prefetch_lookahead = 0;
+    uint64_t n_gpu_prefetch_issued  = 0;
+    uint64_t n_gpu_prefetch_skipped = 0;
+    bool     retain_cap_auto         = false;  // GGML_ELASTIC_CL_RETAIN_MB=auto
 
     uint64_t current_token       = 0;
     uint64_t n_op_dispatched     = 0;
@@ -2866,6 +2918,17 @@ struct ggml_opencl_elastic_state {
     std::map<int,         elastic_profile_bucket> compute_buckets;  // ggml_op → 累计
 
     std::chrono::steady_clock::time_point t0;  // wbm 初始化时刻；用于 metrics.t_sec
+
+    // GGML_ELASTIC_TIMING=1：不带 profile clFinish 干扰的真实时间统计。atexit 输出。
+    // reload_host_us = reload_fn 调用的纯 CPU 侧 enqueue 时间（不等 GPU 完成）
+    // reload_gpu_us  = GPU side convert/transpose kernel 真实运行时间（从 cl_event
+    //                  CL_PROFILING_COMMAND_{START,END} 提取，绕过 host clFinish）
+    bool       timing       = false;
+    uint64_t   t_reload_host_us  = 0;   // sum of host-issue time for all reload_fn calls
+    uint64_t   t_reload_gpu_us   = 0;   // sum of GPU profiling time on convert kernel
+    uint64_t   t_compute_gpu_us  = 0;   // sum of GPU profiling time on matmul kernels
+    uint64_t   n_reload_gpu_ev   = 0;   // count of GPU events sampled
+    uint64_t   n_compute_gpu_ev  = 0;
 };
 
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
@@ -2909,19 +2972,13 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
-    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 MRU）。LLM decode 是 round-robin
+    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 lru）。LLM decode 是 round-robin
     // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
     // MRU 反而能让命中率随 cache/model 比例线性提升。
-    // 实测 3B F16 B=5000: LRU 3827 ms/tok, MRU 447 ms/tok (8.5× 差距).
-    // CPU elastic 早就改成 MRU 默认; GPU 这里之前还是 LRU 默认是 bug.
-    s->wbm.evict_mru = true;
     if (const char *p = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
-        std::string ps(p);
-        if (ps == "lru") {
-            s->wbm.evict_mru = false;
-            GGML_LOG_INFO("ggml_opencl elastic: 启用 LRU 驱逐策略 (显式)\n");
-        } else if (ps == "mru") {
-            GGML_LOG_INFO("ggml_opencl elastic: MRU 驱逐策略 (默认)\n");
+        if (std::string(p) == "mru") {
+            s->wbm.evict_mru = true;
+            GGML_LOG_INFO("ggml_opencl elastic: 启用 MRU 驱逐策略\n");
         }
     }
     // 默认走单队列同步路径：在 Adreno + ggml-opencl 上 enqueue 开销 + barrier
@@ -2936,8 +2993,16 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     }
     s->prefetch_lookahead = prefetch_la_env;
 
+    int gpu_pf_env = 0;
+    if (const char *gp = std::getenv("GGML_ELASTIC_GPU_PREFETCH")) {
+        int v = atoi(gp);
+        if (v > 0) gpu_pf_env = v;
+    }
+    s->gpu_prefetch_lookahead = gpu_pf_env;
+
     cl_command_queue xfer_q = nullptr;
     const bool need_xfer = prefetch_la_env > 0
+        || gpu_pf_env > 0
         || ([]{ const char *a = std::getenv("GGML_ELASTIC_ASYNC_XFER"); return a && *a && *a != '0'; })();
     if (need_xfer) {
         cl_int q_err = CL_SUCCESS;
@@ -2960,18 +3025,60 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     }
     if (const char *r = std::getenv("GGML_ELASTIC_CL_RETAIN"); r && *r && *r != '0') {
         s->octx.retain_cl_mem = true;
+        // GGML_ELASTIC_CL_RETAIN_MB=N 设 pool 上限（MB）；"auto" 让 backend
+        // 根据 model 的 max_block_bytes 自算（首次 graph_compute 触发）；
+        // 不设 = 不限（违反 budget 但最快）。
         if (const char *m = std::getenv("GGML_ELASTIC_CL_RETAIN_MB")) {
             if (std::string(m) == "auto") {
                 s->octx.cache_byte_limit = 0;
                 s->retain_cap_auto = true;
-                GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool cap = AUTO\n");
+                GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool cap = AUTO (待 first graph_compute 算)\n");
             } else {
                 size_t mb = (size_t)atoll(m);
                 s->octx.cache_byte_limit = mb * 1024 * 1024;
+                s->retain_cap_auto = false;
                 GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool cap = %zu MB\n", mb);
             }
         } else {
             GGML_LOG_INFO("ggml_opencl elastic: cl_mem retain pool 不限\n");
+        }
+    }
+    if (false) {  // 占位避免重复 wbmcl_init 错误处理
+        GGML_LOG_ERROR("dummy\n");
+        return;
+    }
+    // GGML_ELASTIC_XFER_EXTRA=N：额外创建 N 条 xfer queue（总共 N+1 条 xfer）
+    // wbmcl 在 N+1 条 queue 间 round-robin 发 write。micro-bench 实测 2 总
+    // queue 数 (extra=1) 已经 ~2× 吞吐，超过 2 收益递减。N <= 4。
+    // 兼容旧 env GGML_ELASTIC_DUAL_XFER=1 = N=1。
+    int xfer_extra_n = 0;
+    if (const char *x = std::getenv("GGML_ELASTIC_XFER_EXTRA")) {
+        int v = atoi(x);
+        if (v > 0) xfer_extra_n = v;
+    } else if (const char *d = std::getenv("GGML_ELASTIC_DUAL_XFER"); d && *d && *d != '0') {
+        xfer_extra_n = 1;
+    }
+    if (xfer_q && xfer_extra_n > 0) {
+        if (xfer_extra_n > elastic::wbm_opencl_ctx::N_XFER_EXTRA) {
+            xfer_extra_n = elastic::wbm_opencl_ctx::N_XFER_EXTRA;
+        }
+        cl_int q_err = CL_SUCCESS;
+        cl_device_id dev = nullptr;
+        clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(dev), &dev, nullptr);
+        int n_ok = 0;
+        for (int i = 0; i < xfer_extra_n; ++i) {
+            cl_command_queue q2 = clCreateCommandQueueWithProperties(cl_ctx, dev, nullptr, &q_err);
+            if (q_err != CL_SUCCESS) {
+                GGML_LOG_ERROR("ggml_opencl elastic: 第%d条额外 xfer queue 创建失败 %d\n", i + 1, q_err);
+                break;
+            }
+            s->octx.xfer_extra[i] = q2;
+            n_ok = i + 1;
+        }
+        s->octx.n_xfer_extra = n_ok;
+        if (n_ok > 0) {
+            GGML_LOG_INFO("ggml_opencl elastic: 启用 %d 条额外 xfer queue (总 %d 条)\n",
+                          n_ok, n_ok + 1);
         }
     }
     s->wbm_inited = true;
@@ -2988,11 +3095,47 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     if (csv && *csv) {
         if (elastic::budget_watcher_init(&s->bw, csv) == 0) {
             s->bw_inited = true;
-            GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher 启动 trace=%s 初始 B(t)=%zu MB\n",
-                          csv, elastic::budget_watcher_get(&s->bw));
+            const size_t mfloor_bytes = s->bw.m_floor_mb * 1024 * 1024;
+            const size_t kv_misc      = s->kv_bytes + s->misc_overhead;
+            s->static_target_bytes    = mfloor_bytes > kv_misc ? mfloor_bytes - kv_misc : 0;
+            GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher trace=%s 初始 B(t)=%zu MB "
+                          "M_floor=%zu MB → static_target=%zu MB (kv=%zu MB misc=%zu MB)\n",
+                          csv, elastic::budget_watcher_get(&s->bw), s->bw.m_floor_mb,
+                          s->static_target_bytes / 1024 / 1024,
+                          s->kv_bytes / 1024 / 1024, s->misc_overhead / 1024 / 1024);
         } else {
             GGML_LOG_ERROR("ggml_opencl elastic: BudgetWatcher 加载失败: %s\n", csv);
         }
+    }
+
+    // GGML_ELASTIC_TIMING=1：只记 reload host-issue 时间, 不像 PROFILE 那样
+    // per-op clFinish 拖速度. 用于不带干扰地测 reload IO vs total wall time.
+    if (const char *t = std::getenv("GGML_ELASTIC_TIMING"); t && *t && *t != '0') {
+        s->timing = true;
+        GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_TIMING=1 (host reload 计时, 无 clFinish 干扰)\n");
+        std::atexit([]() {
+            auto *st = ggml_opencl_elastic();
+            if (!st->timing) return;
+            std::fprintf(stderr, "\n=== ggml_opencl elastic timing dump (no clFinish overhead) ===\n");
+            double total_ms = st->t_reload_host_us / 1000.0;
+            std::fprintf(stderr, "reload host-issue total: %.1f ms\n", total_ms);
+            std::fprintf(stderr, "reload calls: %llu (avg %.2f ms/call)\n",
+                         (unsigned long long)st->n_reloads_total,
+                         st->n_reloads_total ? total_ms/st->n_reloads_total : 0);
+            std::fprintf(stderr, "per-suffix breakdown (host issue time):\n");
+            std::fprintf(stderr, "  %-22s %8s %12s %12s %10s %10s\n",
+                         "suffix", "n", "total ms", "MB total", "avg ms", "MB/s");
+            for (const auto &kv : st->reload_buckets) {
+                const auto &b = kv.second;
+                double mb = b.total_bytes / 1024.0 / 1024.0;
+                double avg = b.n ? b.total_ms / b.n : 0;
+                double mbps = b.total_ms > 0 ? mb / (b.total_ms / 1000.0) : 0;
+                std::fprintf(stderr, "  %-22s %8llu %12.1f %12.1f %10.2f %10.1f\n",
+                             kv.first.c_str(), (unsigned long long)b.n,
+                             b.total_ms, mb, avg, mbps);
+            }
+            std::fprintf(stderr, "===========================================================\n");
+        });
     }
 
     if (const char *prof = std::getenv("GGML_ELASTIC_PROFILE"); prof && *prof && *prof != '0') {
@@ -3031,15 +3174,12 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     if (s->prefetch_lookahead > 0) {
         std::atexit([]() {
             auto *st = ggml_opencl_elastic();
-            std::fprintf(stderr, "[elastic prefetch] lookahead=%d issued=%llu skipped=%llu reloads_total=%llu evicts_total=%llu n_creates=%llu n_releases=%llu cached_bytes=%zu\n",
+            std::fprintf(stderr, "[elastic prefetch] lookahead=%d issued=%llu skipped=%llu reloads_total=%llu evicts_total=%llu\n",
                          st->prefetch_lookahead,
                          (unsigned long long)st->n_prefetch_issued,
                          (unsigned long long)st->n_prefetch_skipped,
                          (unsigned long long)st->n_reloads_total,
-                         (unsigned long long)st->n_evicts_total,
-                         (unsigned long long)st->octx.n_creates,
-                         (unsigned long long)st->octx.n_releases,
-                         st->octx.cached_bytes);
+                         (unsigned long long)st->n_evicts_total);
         });
     }
 
@@ -3063,7 +3203,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     const bool elastic_active = est->wbm_inited;
     if (elastic_active) {
         est->current_token += 1;
-        // Auto cap on first graph_compute（wbm 已全注册）
+        // Auto cap：首次 graph_compute 时 wbm 已全部注册，按非 pinned tensor
+        // 的最大 size × 2 算 pool cap（pool by size 设计下足够 1-2 个 in-flight
+        // 同 size cl_mem）。
         if (est->retain_cap_auto && est->octx.cache_byte_limit == 0) {
             size_t max_unpinned = 0;
             for (const auto &b : est->wbm.blocks) {
@@ -3071,8 +3213,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 if (b.byte_size > max_unpinned) max_unpinned = b.byte_size;
             }
             if (max_unpinned > 0) {
+                // pool by size：每 size class 只需 1 个 cl_mem 就能 cycle，
+                // cap = max unpinned tensor size 即可（多了反而 working_set 缩水）
                 est->octx.cache_byte_limit = max_unpinned;
-                GGML_LOG_INFO("ggml_opencl elastic: auto cap = %zu MB\n",
+                GGML_LOG_INFO("ggml_opencl elastic: auto cap = max_unpinned = %zu MB\n",
                               est->octx.cache_byte_limit / 1024 / 1024);
             }
         }
@@ -3084,71 +3228,78 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (!elastic_active || !n) return true;
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             ggml_tensor *src = n->src[j];
-            if (!src) continue;
-            ggml_tensor_extra_cl *src_extra =
-                (ggml_tensor_extra_cl *) src->extra;
-            if (!src_extra || src_extra->wbm_idx < 0) continue;
+            if (!src || !src->extra) continue;
+            const int src_wbm_idx = ggml_opencl_get_wbm_idx(src);
+            if (src_wbm_idx < 0) continue;
+            // SOA 量化 tensor (Q4_0 / Q8_0 / MXFP4) 走自定义 evict/reload 回调，
+            // 不需要也不能写 src_extra->data_device（它的字段不在同一个偏移）。
+            const bool is_soa = (src->type == GGML_TYPE_Q4_0 ||
+                                 src->type == GGML_TYPE_Q8_0 ||
+                                 src->type == GGML_TYPE_MXFP4);
+            ggml_tensor_extra_cl *src_extra_generic =
+                is_soa ? nullptr : (ggml_tensor_extra_cl *) src->extra;
+            const int src_ctx_slot = ggml_opencl_get_ctx_slot(src);
 
             const elastic::block_meta *bm =
-                elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
+                elastic::wbm_get(&est->wbm, src_wbm_idx);
             if (bm && !bm->resident) {
                 // 预先 evict：保证 reload 之后 resident_bytes <= target，避免
                 // "reload 一个 → resident 涨 → 下次周期 evict 之前违反预算" 的
                 // 短暂超额。spec §5 第 7 条要求每个 step 都满足合规。
                 if (est->bw_inited) {
-                    const size_t B_t_mb  = elastic::budget_watcher_get(&est->bw);
-                    const size_t budget  = B_t_mb * 1024 * 1024;
-                    const size_t kv_misc = est->kv_bytes + est->misc_overhead;
-                    const size_t base    = budget > kv_misc ? budget - kv_misc : 0;
-                    size_t target = base + est->extra_target_bytes;
-                    // CL_RETAIN_COUNTS_BUDGET：把 pool cap 从 target 扣，严格合规
-                    static const bool s_pool_counts = []() {
+                    static const bool s_pool_counts_budget_pre = []() {
                         const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
                         return e && *e && *e != '0';
                     }();
-                    if (s_pool_counts && est->octx.cache_byte_limit > 0 && target > est->octx.cache_byte_limit) {
+                    size_t target = est->static_target_bytes;
+                    if (s_pool_counts_budget_pre && est->octx.cache_byte_limit > 0
+                        && target > est->octx.cache_byte_limit) {
                         target -= est->octx.cache_byte_limit;
                     }
                     const size_t needed  = est->wbm.resident_bytes + bm->byte_size;
                     if (needed > target) {
-                        // 给即将 reload 的 bm 腾出位置：把现有 resident 压到
-                        // target - bm->byte_size 以下（saturated）。F4-event：
-                        // 不再 clFinish，wbmcl_evict_batch 依赖 last_use_event。
                         const size_t pre_target = target > bm->byte_size ?
                                                   target - bm->byte_size : 0;
                         std::vector<int> victims;
                         int n = elastic::wbm_evict_to_byte_budget(&est->wbm, pre_target,
-                                                                  /*exclude=*/src_extra->wbm_idx, &victims);
+                                                                  /*exclude=*/src_wbm_idx, &victims);
                         if (n > 0) {
                             int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
                             est->n_evicts_total += released;
                         }
                     }
                 }
-                auto rl_t0 = est->profile ? std::chrono::steady_clock::now()
+                auto rl_t0 = (est->profile || est->timing) ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
-                int rc = elastic::wbmcl_ensure_resident(&est->octx, src_extra->wbm_idx);
+                int rc = elastic::wbmcl_ensure_resident(&est->octx, src_wbm_idx);
                 if (rc != 0) {
                     GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
-                                   src_extra->wbm_idx, rc);
+                                   src_wbm_idx, rc);
                     return false;
                 }
-                if (est->profile) {
+                if (est->profile || est->timing) {
                     auto rl_t1 = std::chrono::steady_clock::now();
                     double ms = std::chrono::duration<double, std::milli>(rl_t1 - rl_t0).count();
                     auto &b = est->reload_buckets[ggml_opencl_tensor_suffix(src->name)];
                     b.n           += 1;
                     b.total_ms    += ms;
                     b.total_bytes += bm->byte_size;
+                    est->t_reload_host_us += (uint64_t)(ms * 1000.0);
                 }
-                bm = elastic::wbm_get(&est->wbm, src_extra->wbm_idx);
+                bm = elastic::wbm_get(&est->wbm, src_wbm_idx);
                 cl_mem new_buf = static_cast<cl_mem>(bm->backend_handle);
-                src_extra->data_device = new_buf;
-                ggml_opencl_elastic_update_ctx_slot(src->buffer, src_extra->ctx_slot, new_buf);
+                if (!is_soa) {
+                    src_extra_generic->data_device = new_buf;
+                }
+                // SOA 回调内部已经更新过 ctx->buffer 槽位（parent 替换），这里只
+                // 对非 SOA 路径补 ctx_slot 同步。
+                if (!is_soa) {
+                    ggml_opencl_elastic_update_ctx_slot(src->buffer, src_ctx_slot, new_buf);
+                }
                 est->n_reloads_total += 1;
                 est->bytes_reloaded_total += bm->byte_size;
             }
-            elastic::wbm_touch(&est->wbm, src_extra->wbm_idx, est->current_token);
+            elastic::wbm_touch(&est->wbm, src_wbm_idx, est->current_token);
         }
         return true;
     };
@@ -3219,16 +3370,16 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (elastic_active && est->bw_inited) {
             est->n_op_dispatched += 1;
             if ((int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
-                const size_t B_t_mb     = elastic::budget_watcher_get(&est->bw);
-                const size_t budget     = B_t_mb * 1024 * 1024;
-                const size_t kv_misc    = est->kv_bytes + est->misc_overhead;
-                const size_t base       = budget > kv_misc ? budget - kv_misc : 0;
-                size_t target = base + est->extra_target_bytes;
-                static const bool s_pool_counts_p = []() {
+                // Baseline 静态：target = M_floor - kv - misc。
+                // 若 GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET=1，把 pool cap 从 target
+                // 里扣掉，让 working_set + cached_bytes ≤ target，严格合规。
+                static const bool s_pool_counts_budget = []() {
                     const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
                     return e && *e && *e != '0';
                 }();
-                if (s_pool_counts_p && est->octx.cache_byte_limit > 0 && target > est->octx.cache_byte_limit) {
+                size_t target = est->static_target_bytes;
+                if (s_pool_counts_budget && est->octx.cache_byte_limit > 0
+                    && target > est->octx.cache_byte_limit) {
                     target -= est->octx.cache_byte_limit;
                 }
                 if (est->wbm.resident_bytes > target) {
@@ -3259,10 +3410,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
                     ggml_tensor *src = nj->src[k];
                     if (!src) continue;
-                    ggml_tensor_extra_cl *se = (ggml_tensor_extra_cl *) src->extra;
-                    if (!se || se->wbm_idx < 0) continue;
+                    const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
+                    if (se_wbm_idx < 0) continue;
                     const elastic::block_meta *bm =
-                        elastic::wbm_get(&est->wbm, se->wbm_idx);
+                        elastic::wbm_get(&est->wbm, se_wbm_idx);
                     if (!bm || !bm->host_ptr || bm->byte_size == 0) continue;
                     if (bm->resident) continue;
                     // host_ptr 是 mmap_base + tensor_offset，tensor offset 通常 32B 对齐
@@ -3276,6 +3427,89 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                                            POSIX_MADV_WILLNEED);
                     if (rc == 0) est->n_prefetch_issued += 1;
                     else         est->n_prefetch_skipped += 1;
+                }
+            }
+        }
+
+        // GPU prefetch：往 xfer_queue (可能多条) 上提前发 clEnqueueWriteBuffer。
+        // 配合 GGML_ELASTIC_XFER_EXTRA 用多 queue round-robin，让 DMA 真并行。
+        // ensure_resident 命中时用 barrier-on-compute_queue 等 prefetch_event。
+        if (elastic_active && est->gpu_prefetch_lookahead > 0 && est->octx.xfer_queue) {
+            static const size_t inflight_cap = []() {
+                const char *e = std::getenv("GGML_ELASTIC_GPU_PREFETCH_INFLIGHT_MB");
+                size_t mb = e ? (size_t)atoi(e) : 256;
+                return mb * 1024 * 1024;
+            }();
+            size_t inflight = 0;
+            for (const auto &b : est->wbm.blocks) {
+                if (!b.resident && b.prefetch_event) inflight += b.byte_size;
+            }
+            const int max_j = std::min(i + 1 + est->gpu_prefetch_lookahead, cgraph->n_nodes);
+            for (int j = i + 1; j < max_j; ++j) {
+                ggml_tensor *nj = cgraph->nodes[j];
+                if (!nj) continue;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor *src = nj->src[k];
+                    if (!src) continue;
+                    const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
+                    if (se_wbm_idx < 0) continue;
+                    const elastic::block_meta *bm =
+                        elastic::wbm_get(&est->wbm, se_wbm_idx);
+                    if (!bm) continue;
+                    if (bm->resident || bm->prefetch_event) continue;
+                    if (inflight + bm->byte_size > inflight_cap) {
+                        est->n_gpu_prefetch_skipped += 1;
+                        continue;
+                    }
+                    const bool is_soa = (src->type == GGML_TYPE_Q4_0 ||
+                                         src->type == GGML_TYPE_Q8_0 ||
+                                         src->type == GGML_TYPE_MXFP4);
+                    if (is_soa) {
+                        // SOA prefetch：直接调注册的 reload_fn 提前 enqueue 整个
+                        // SOA 重建管线 (staging write + convert + transpose, 全在
+                        // xfer/compute queue 上 async). reload_fn 会 mark_resident,
+                        // 后续 ensure_resident 看到 resident=true 跳过. 让 reload
+                        // 真正跟 compute 重叠. env GGML_ELASTIC_SOA_PREFETCH=0 关掉.
+                        static const bool s_soa_pf = []() {
+                            const char *e = std::getenv("GGML_ELASTIC_SOA_PREFETCH");
+                            return !(e && *e == '0');
+                        }();
+                        if (!s_soa_pf) { est->n_gpu_prefetch_skipped += 1; continue; }
+                        auto cit = est->octx.soa_per_idx.find(se_wbm_idx);
+                        if (cit == est->octx.soa_per_idx.end() || !cit->second.reload_fn) {
+                            est->n_gpu_prefetch_skipped += 1; continue;
+                        }
+                        auto pf_t0 = (est->profile || est->timing) ? std::chrono::steady_clock::now()
+                                                                  : std::chrono::steady_clock::time_point{};
+                        int rc = cit->second.reload_fn();
+                        if (est->profile || est->timing) {
+                            auto pf_t1 = std::chrono::steady_clock::now();
+                            double ms = std::chrono::duration<double, std::milli>(pf_t1 - pf_t0).count();
+                            est->t_reload_host_us += (uint64_t)(ms * 1000.0);
+                        }
+                        if (rc == 0) {
+                            inflight += bm->byte_size;
+                            est->n_gpu_prefetch_issued += 1;
+                        } else {
+                            est->n_gpu_prefetch_skipped += 1;
+                        }
+                        continue;
+                    }
+                    int rc = elastic::wbmcl_prefetch_async(&est->octx, se_wbm_idx);
+                    if (rc == 0) {
+                        inflight += bm->byte_size;
+                        est->n_gpu_prefetch_issued += 1;
+                        const elastic::block_meta *bm2 =
+                            elastic::wbm_get(&est->wbm, se_wbm_idx);
+                        if (bm2 && bm2->backend_handle) {
+                            cl_mem nb = static_cast<cl_mem>(bm2->backend_handle);
+                            ggml_tensor_extra_cl *se = (ggml_tensor_extra_cl *) src->extra;
+                            se->data_device = nb;
+                            ggml_opencl_elastic_update_ctx_slot(src->buffer, ggml_opencl_get_ctx_slot(src), nb);
+                        }
+                    } else {
+                        est->n_gpu_prefetch_skipped += 1;
+                    }
                 }
             }
         }
@@ -3923,7 +4157,286 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
 
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
+// 公共注册逻辑：SOA tensor (q4_0/q8_0/mxfp4) 注册到 WBM + 绑定 evict/reload 回调。
+// 三个 SOA extra 类型有同名字段 wbm_idx / ctx_slot / parent_buffer，模板就够；
+// 不同的转换 kernel / sub-buffer 字段在调用方的闭包里处理。
+template <typename ExtraT>
+static void ggml_opencl_elastic_register_soa(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor *tensor,
+        ExtraT *extra,
+        cl_mem parent_buffer,
+        int ctx_slot,
+        const void *host_ptr,
+        size_t nbytes,
+        cl_context cl_ctx,
+        cl_command_queue queue,
+        std::function<int()> evict_fn,
+        std::function<int()> reload_fn) {
+    ggml_backend_opencl_buffer_context *bctx =
+        (ggml_backend_opencl_buffer_context *) buffer->context;
+    if (bctx->mode != ggml_backend_opencl_buffer_context::MODE_ELASTIC) return;
+    if (!ggml_opencl_is_weight_tensor(tensor->name)) return;
+    if (tensor->view_src != nullptr) return;
+
+    ggml_opencl_elastic_lazy_init(cl_ctx, queue);
+    auto *s = ggml_opencl_elastic();
+    if (!s->wbm_inited) return;
+
+    extra->parent_buffer = parent_buffer;
+    extra->ctx_slot      = ctx_slot;
+    int idx = elastic::wbm_add_block(&s->wbm, const_cast<void*>(host_ptr), nbytes);
+    if (idx < 0) return;
+    extra->wbm_idx = idx;
+    elastic::wbm_mark_resident(&s->wbm, idx, static_cast<void*>(parent_buffer));
+    elastic::wbm_touch(&s->wbm, idx, s->current_token);
+    if (ctx_slot >= 0 && (size_t)ctx_slot < bctx->wbm_idx_per_slot.size()) {
+        bctx->wbm_idx_per_slot[ctx_slot] = idx;
+    }
+    elastic::wbmcl_register_soa(&s->octx, idx, std::move(evict_fn), std::move(reload_fn));
+
+    // Pin 策略
+    static const std::string s_pin_policy = []() {
+        const char *p = std::getenv("GGML_ELASTIC_PIN");
+        return std::string(p ? p : "");
+    }();
+    if (!s_pin_policy.empty()) {
+        const std::string suffix = ggml_opencl_tensor_suffix(tensor->name);
+        auto contains = [&](const char *tok) {
+            return s_pin_policy == "all" || s_pin_policy.find(tok) != std::string::npos;
+        };
+        bool should_pin = false;
+        if (contains("norm") && (suffix == "attn_norm" || suffix == "ffn_norm" || suffix == "output_norm")) should_pin = true;
+        if (contains("k") && suffix == "attn_k") should_pin = true;
+        if (contains("v") && suffix == "attn_v") should_pin = true;
+        if (contains("q") && suffix == "attn_q") should_pin = true;
+        if (contains("o") && suffix == "attn_output") should_pin = true;
+        if (should_pin) elastic::wbm_set_pinned(&s->wbm, idx, true);
+    }
+    static const bool s_embed_out = []() {
+        const char *e = std::getenv("GGML_ELASTIC_EMBED_OUTSIDE_BUDGET");
+        return e && *e && *e != '0';
+    }();
+    if (s_embed_out && ggml_opencl_tensor_suffix(tensor->name) == "token_embd") {
+        elastic::wbm_set_pinned(&s->wbm, idx, true);
+        s->static_target_bytes += nbytes;
+    }
+}
+
+// 公共 reload helper：pool 命中复用 parent / 否则 alloc。
+// 调用方负责后续 sub-buffer 创建 + convert kernel + mark_resident。
+static cl_mem ggml_opencl_elastic_alloc_or_pool_parent(
+        elastic::wbm_opencl_ctx *octx, cl_context cl_ctx, size_t nbytes) {
+    if (octx->retain_cl_mem) {
+        auto it = octx->retained_buffers_by_size.find(nbytes);
+        if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
+            cl_mem cached = static_cast<cl_mem>(it->second.back());
+            it->second.pop_back();
+            for (auto lit = octx->retain_order_sizes.rbegin();
+                 lit != octx->retain_order_sizes.rend(); ++lit) {
+                if (*lit == nbytes) {
+                    octx->retain_order_sizes.erase(std::next(lit).base());
+                    break;
+                }
+            }
+            octx->cached_bytes -= std::min(octx->cached_bytes, nbytes);
+            return cached;
+        }
+    }
+    cl_int err = CL_SUCCESS;
+    cl_mem buf = clCreateBuffer(cl_ctx, CL_MEM_READ_WRITE, nbytes, nullptr, &err);
+    if (err != CL_SUCCESS) return nullptr;
+    octx->n_creates += 1;
+    return buf;
+}
+
+// 公共 evict helper：parent 释放或入 pool；同时调 mark_evicted。
+// 调用方负责 sub-buffer 释放 (通常调 extra->reset())。
+static void ggml_opencl_elastic_evict_parent_pool_or_release(
+        elastic::wbm_opencl_ctx *octx, cl_mem parent, size_t nbytes, int idx) {
+    if (octx->retain_cl_mem && parent) {
+        if (octx->cache_byte_limit > 0) {
+            while (octx->cached_bytes + nbytes > octx->cache_byte_limit &&
+                   !octx->retain_order_sizes.empty()) {
+                size_t old_sz = octx->retain_order_sizes.front();
+                octx->retain_order_sizes.pop_front();
+                auto pit = octx->retained_buffers_by_size.find(old_sz);
+                if (pit == octx->retained_buffers_by_size.end() || pit->second.empty()) continue;
+                cl_mem old_buf = static_cast<cl_mem>(pit->second.back());
+                pit->second.pop_back();
+                clReleaseMemObject(old_buf);
+                octx->n_releases += 1;
+                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+            }
+        }
+        octx->retained_buffers_by_size[nbytes].push_back(static_cast<void*>(parent));
+        octx->retain_order_sizes.push_back(nbytes);
+        octx->cached_bytes += nbytes;
+    } else if (parent) {
+        clReleaseMemObject(parent);
+        octx->n_releases += 1;
+    }
+    octx->bytes_evicted_total += nbytes;
+    elastic::wbm_mark_evicted(octx->wbm, idx);
+}
+
+// 公共 staging buffer 复用：跨所有 SOA reload 共享一块，容量不够 2× growth。
+static cl_mem ggml_opencl_elastic_get_staging(
+        elastic::wbm_opencl_ctx *octx, cl_context cl_ctx, size_t nbytes) {
+    if (octx->soa_staging_capacity >= nbytes) return octx->soa_staging;
+    if (octx->soa_staging) {
+        clReleaseMemObject(octx->soa_staging);
+        octx->n_releases += 1;
+    }
+    size_t new_cap = octx->soa_staging_capacity ? octx->soa_staging_capacity * 2 : nbytes;
+    while (new_cap < nbytes) new_cap *= 2;
+    cl_int err = CL_SUCCESS;
+    octx->soa_staging = clCreateBuffer(cl_ctx, CL_MEM_READ_WRITE, new_cap, nullptr, &err);
+    if (err != CL_SUCCESS) { octx->soa_staging = nullptr; octx->soa_staging_capacity = 0; return nullptr; }
+    octx->soa_staging_capacity = new_cap;
+    octx->n_creates += 1;
+    return octx->soa_staging;
+}
+
+// Q4_0 Adreno transpose helper：被 set_tensor 首装路径 & elastic reload 路径共用。
+// `sync_each` = true：每个 kernel 后 clWaitForEvents（set_tensor 首装路径用，
+//   要等内容写完才能 release sub-buffer）。
+// `sync_each` = false：纯 enqueue，依赖 in-order queue 串行——elastic reload 用，
+//   外层 ensure_resident 在 matmul 入队前会做一次 sync（每 op 之前）。
+//   省掉 6 个 clWaitForEvents 是 tight budget 的主要加速。
+// 输入：extra->q + extra->d 已经由 convert kernel 写入（generic SOA layout）。
+// 输出：原位转置（4 image1d + 2 transpose kernel + 2 copy），extra->q/d 仍是同
+// sub-buffer，但内容变成 Adreno mat-mul kernel 期待的 transpose layout。
+// M = tensor->ne[1], K = tensor->ne[0]。需 K%32==0 && M%4==0。
+static int ggml_opencl_run_q4_0_adreno_transpose(
+        ggml_backend_opencl_context *backend_ctx,
+        cl_command_queue queue,
+        ggml_tensor_extra_cl_q4_0 *extra,
+        int M, int K,
+        bool sync_each = true) {
+    cl_int err = CL_SUCCESS;
+    cl_context context = backend_ctx->context;
+
+    size_t q_size_bytes = (size_t)K * M / 8 * sizeof(float);
+    cl_buffer_region region;
+    region.origin = 0;
+    region.size   = q_size_bytes;
+    cl_mem qT_d = clCreateSubBuffer(backend_ctx->A_q_d_max, 0,
+                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+    if (err != CL_SUCCESS) return -1;
+    bool K_tile_trans = ((K / 32) % 4 == 0);
+    size_t d_size_bytes = (size_t)M * (K / 32) * 2;
+    region.origin = 0;
+    region.size   = d_size_bytes;
+    cl_mem dT_d = clCreateSubBuffer(backend_ctx->A_s_d_max, 0,
+                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d); return -2; }
+
+    cl_image_format img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
+    cl_image_desc img_desc_1d;
+    cl_mem q_d_image1D, d_d_image1D, qT_d_image1D, dT_d_image1D;
+
+    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc_1d.image_width = (size_t)M * K / 4 / 4;
+    img_desc_1d.buffer      = extra->q;
+    q_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
+    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -3; }
+
+    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc_1d.image_width = (size_t)M * K / 4 / 4;
+    img_desc_1d.buffer      = qT_d;
+    qT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
+    if (err != CL_SUCCESS) { clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -4; }
+
+    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+    if (K_tile_trans) {
+        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
+        img_desc_1d.image_width = (size_t)M * K / 32 / 4;
+    } else {
+        img_fmt_1d = { CL_R, CL_HALF_FLOAT };
+        img_desc_1d.image_width = (size_t)M * K / 32;
+    }
+    img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc_1d.buffer     = extra->d;
+    d_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
+    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d_image1D); clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -5; }
+
+    img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
+    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc_1d.image_width = (size_t)M * K / 32 / 4;
+    img_desc_1d.buffer      = dT_d;
+    dT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
+    if (err != CL_SUCCESS) { clReleaseMemObject(d_d_image1D); clReleaseMemObject(qT_d_image1D); clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -6; }
+
+    cl_event evt;
+    // weights transpose
+    int height_q = M / 4;
+    int width_q  = K / 4 / 4;
+    cl_kernel kernel = backend_ctx->kernel_transpose_16;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &q_d_image1D));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &qT_d_image1D));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_q));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &width_q));
+    size_t local_size_q[3]  = {4, 16, 1};
+    size_t global_size_q[3] = {(size_t)width_q, (size_t)height_q, 1};
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
+    if (sync_each) { CL_CHECK(clWaitForEvents(1, &evt)); }
+    clReleaseEvent(evt);
+
+    // scales transpose
+    int height_s = M / 4;
+    int width_s  = K / 32 / 4;
+    kernel = backend_ctx->kernel_transpose_16;
+    if (!K_tile_trans) {
+        kernel  = backend_ctx->kernel_transpose_16_4x1;
+        width_s = K / 32;
+    }
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_d_image1D));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &dT_d_image1D));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int), &height_s));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &width_s));
+    size_t local_size_s[3]  = {4, 16, 1};
+    size_t global_size_s[3] = {(size_t)width_s, (size_t)height_s, 1};
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
+    if (sync_each) { CL_CHECK(clWaitForEvents(1, &evt)); }
+    clReleaseEvent(evt);
+
+    // copy transposed contents back into extra->q / extra->d
+    CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
+    if (sync_each) { CL_CHECK(clWaitForEvents(1, &evt)); }
+    clReleaseEvent(evt);
+    CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
+    if (sync_each) { CL_CHECK(clWaitForEvents(1, &evt)); }
+    clReleaseEvent(evt);
+
+    // 异步路径下：release 只减引用，driver 等 queue 用完才真销毁，安全。
+    clReleaseMemObject(qT_d);
+    clReleaseMemObject(dT_d);
+    clReleaseMemObject(q_d_image1D);
+    clReleaseMemObject(d_d_image1D);
+    clReleaseMemObject(qT_d_image1D);
+    clReleaseMemObject(dT_d_image1D);
+    return 0;
+}
+
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    // GGML_ELASTIC_NO_TRANSPOSE=1：elastic 模式下跳过 Adreno transpose 路径。
+    // 对 1B 这种小模型 decode 是 mat-vec, transpose 不是优势 (实测 1B-Q4 generic
+    // 比 Adreno transpose 还快 ~30%), 但 evict/reload 时 transpose dance 多 6
+    // 个 kernel/copy enqueue × ~0.5 ms = 大头. 关掉后 reload 路径只剩 write+
+    // convert (3 enqueue), 8B 也能省 ~50% reload 开销 (代价是 loose 慢 ~30%).
+    static const bool s_no_transpose = []() {
+        const char *e = std::getenv("GGML_ELASTIC_NO_TRANSPOSE");
+        return e && *e && *e != '0';
+    }();
+    static const bool s_elastic_on = []() {
+        const char *e = std::getenv("GGML_OPENCL_ELASTIC");
+        return e && *e && *e != '0';
+    }();
+    if (s_elastic_on && s_no_transpose) return false;
     int64_t threshold_ne0 = 512;
     int64_t threshold_ne1 = 512;
     if (!backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
@@ -4039,165 +4552,232 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         // transpose the weights and scales
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Only do transpose for large, non batched matrix
-        // TODO: use preallocated images instead of sub-buffer then image
         if (use_adreno_kernels(backend_ctx, tensor)) {
-        // <----------------------------------------------------------------------------------> //
-        // start transpose
-        // <----------------------------------------------------------------------------------> //
-        int M = tensor->ne[1];   // ne01
-        int K = tensor->ne[0];   // ne00
-
-        //For matrix-vector multiplication kernel, we assume K is a multiple of 32
-        GGML_ASSERT(K % 32 == 0);
-        //For transpose kernels, we assume K is a multiple of 4 (satisfied by prior assert), and M is a multiple of 4
-        GGML_ASSERT(M % 4 == 0);
-
-        // transpose is out of place, so we need to allocate transposed buffers
-        // <----------------------------------------------------------------------------------> //
-        // use sub_buffer of max buffer size instead
-
-        size_t q_size_bytes = K * M / 8 * sizeof(float);
-        cl_buffer_region region;
-        region.origin = 0;
-        region.size = q_size_bytes;
-        cl_mem qT_d = clCreateSubBuffer(
-            backend_ctx->A_q_d_max,
-            0,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &err);
-        // cl_mem qT_d = clCreateBuffer(context, CL_MEM_READ_WRITE, q_size_bytes, NULL, &err);
-        CL_CHECK(err);
-
-        bool K_tile_trans = true;
-        if ((K / 32) % 4 != 0){
-            K_tile_trans =false;
-        }
-        size_t d_size_bytes = M * (K / 32) * 2;
-        region.origin = 0;
-        region.size = d_size_bytes;
-        cl_mem dT_d = clCreateSubBuffer(
-            backend_ctx->A_s_d_max,
-            0,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &err);
-        // cl_mem dT_d = clCreateBuffer(context, CL_MEM_READ_WRITE, d_size_bytes, NULL, &err);
-        CL_CHECK(err);
-
-        // <----------------------------------------------------------------------------------> //
-
-
-        // create images from the buffers
-        // <----------------------------------------------------------------------------------> //
-        cl_mem q_d_image1D;
-        cl_mem d_d_image1D;
-        cl_mem qT_d_image1D;
-        cl_mem dT_d_image1D;
-
-        cl_image_format img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-        cl_image_desc img_desc_1d;
-
-        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.image_width = M * K / 4 / 4;
-        img_desc_1d.buffer = extra->q;
-        q_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-        CL_CHECK(err);
-
-        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.image_width = M * K / 4 / 4;
-        img_desc_1d.buffer = qT_d;
-        qT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-        CL_CHECK(err);
-
-        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        if (K_tile_trans) {
-            img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-            img_desc_1d.image_width = M * K / 32 / 4;
-        } else {
-            img_fmt_1d = { CL_R, CL_HALF_FLOAT };
-            img_desc_1d.image_width = M * K / 32;
-        }
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.buffer = extra->d;
-        d_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-        CL_CHECK(err);
-
-        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.image_width = M * K / 32 / 4;
-        img_desc_1d.buffer = dT_d;
-        dT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-        CL_CHECK(err);
-        // <----------------------------------------------------------------------------------> //
-
-        // set up and call the transpose kernels
-        // <----------------------------------------------------------------------------------> //
-        // weights
-        int height_q = M / 4;
-        int width_q = K / 4 / 4;
-        kernel = backend_ctx->kernel_transpose_16;
-
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &q_d_image1D));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &qT_d_image1D));
-        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_q));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &width_q));
-
-        size_t local_size_q[3] = {4, 16, 1};
-        size_t global_size_q[3] = {static_cast<size_t>(width_q), static_cast<size_t>(height_q), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-
-        // scales
-        int height_s = M / 4;
-        int width_s = K / 32 / 4;
-
-        kernel = backend_ctx->kernel_transpose_16;
-        if (!K_tile_trans) {
-            kernel = backend_ctx->kernel_transpose_16_4x1;
-            width_s = K / 32;
-        }
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_d_image1D));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &dT_d_image1D));
-        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int), &height_s));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &width_s));
-
-        size_t local_size_s[3] = {4, 16, 1};
-        size_t global_size_s[3] = {static_cast<size_t>(width_s), static_cast<size_t>(height_s), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-        // <----------------------------------------------------------------------------------> //
-
-        // copy transposed buffer contents to original buffers
-        // <----------------------------------------------------------------------------------> //
-        // weights
-        CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-
-        // scales
-        CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-        // <----------------------------------------------------------------------------------> //
-
-        // deallocate transpose buffers
-        // <----------------------------------------------------------------------------------> //
-        CL_CHECK(clReleaseMemObject(qT_d));
-        CL_CHECK(clReleaseMemObject(dT_d));
-
-        // deallocate temporary images
-        CL_CHECK(clReleaseMemObject(q_d_image1D));
-        CL_CHECK(clReleaseMemObject(d_d_image1D));
-        CL_CHECK(clReleaseMemObject(qT_d_image1D));
-        CL_CHECK(clReleaseMemObject(dT_d_image1D));
-        // <----------------------------------------------------------------------------------> //
-        // end transpose
-        // <----------------------------------------------------------------------------------> //
+            int M = tensor->ne[1];   // ne01
+            int K = tensor->ne[0];   // ne00
+            GGML_ASSERT(K % 32 == 0);
+            GGML_ASSERT(M % 4 == 0);
+            int rc = ggml_opencl_run_q4_0_adreno_transpose(backend_ctx, queue, extra, M, K);
+            if (rc != 0) {
+                GGML_LOG_ERROR("ggml_opencl: q4_0 Adreno transpose failed rc=%d for '%s'\n", rc, tensor->name);
+            }
         }
     #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+        // ───── elastic SOA register (Q4_0 — 含 Adreno transpose) ─────────────
+        // Adreno fast path 启用时 (use_adreno_kernels = true)，set_tensor 已经
+        // 跑了 transpose 把 q/d 内容重排成 transpose layout；reload 时要重做：
+        // 1. 跑 convert kernel (raw → q/d, Adreno 路径用 noshuffle 变种)
+        // 2. 跑 Adreno transpose helper (q/d 就地转置)
+        // 不走 Adreno (ne[0]/ne[1] < 512) 只跑 convert。
+        if (auto *bctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+            bctx->mode == ggml_backend_opencl_buffer_context::MODE_ELASTIC &&
+            offset == 0 && size == ggml_nbytes(tensor)) {
+            const void *host_ptr        = data;
+            size_t nbytes               = ggml_nbytes(tensor);
+            const size_t cap_n_blocks   = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+            const size_t cap_size_q     = size_q;
+            const size_t cap_size_d     = size_d;
+            const bool need_transpose   = use_adreno_kernels(backend_ctx, tensor);
+            cl_kernel cap_kernel        = need_transpose
+                                          ? backend_ctx->kernel_convert_block_q4_0_noshuffle
+                                          : backend_ctx->kernel_convert_block_q4_0;
+            const int cap_M = tensor->ne[1];
+            const int cap_K = tensor->ne[0];
+            elastic::wbm_opencl_ctx *octx = &ggml_opencl_elastic()->octx;
+            ggml_tensor_extra_cl_q4_0 *cap_extra = extra;
+            ggml_backend_opencl_buffer_context *cap_bctx = bctx;
+            ggml_backend_opencl_context *cap_backend_ctx = backend_ctx;
+            cl_context cap_ctx = context;
+            cl_command_queue cap_q = queue;
+
+            auto evict_fn = [octx, cap_extra, nbytes]() -> int {
+                int idx = cap_extra->wbm_idx;
+                // SOA pool: parent + d + q 一起入池，不 reset extra (sub-buffer 还活着)
+                if (octx->retain_cl_mem && cap_extra->parent_buffer) {
+                    // pool cap 满则 FIFO 释放最老的 entry (跟 size pool 共用 cached_bytes)
+                    if (octx->cache_byte_limit > 0) {
+                        while (octx->cached_bytes + nbytes > octx->cache_byte_limit &&
+                               !octx->retain_order_sizes.empty()) {
+                            size_t old_sz = octx->retain_order_sizes.front();
+                            octx->retain_order_sizes.pop_front();
+                            auto pit = octx->soa_pool_by_size.find(old_sz);
+                            if (pit != octx->soa_pool_by_size.end() && !pit->second.empty()) {
+                                auto e = pit->second.back(); pit->second.pop_back();
+                                if (e.q) clReleaseMemObject((cl_mem)e.q);
+                                if (e.d) clReleaseMemObject((cl_mem)e.d);
+                                if (e.parent) clReleaseMemObject((cl_mem)e.parent);
+                                octx->n_releases += 3;
+                                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+                            } else {
+                                // 也可能是普通 size pool 的 entry
+                                auto sit = octx->retained_buffers_by_size.find(old_sz);
+                                if (sit != octx->retained_buffers_by_size.end() && !sit->second.empty()) {
+                                    cl_mem ob = (cl_mem)sit->second.back(); sit->second.pop_back();
+                                    clReleaseMemObject(ob);
+                                    octx->n_releases += 1;
+                                    octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+                                }
+                            }
+                        }
+                    }
+                    elastic::soa_pool_entry e;
+                    e.parent = cap_extra->parent_buffer;
+                    e.d      = cap_extra->d;
+                    e.q      = cap_extra->q;
+                    octx->soa_pool_by_size[nbytes].push_back(e);
+                    octx->retain_order_sizes.push_back(nbytes);
+                    octx->cached_bytes += nbytes;
+                    cap_extra->parent_buffer = nullptr;
+                    cap_extra->d = nullptr;
+                    cap_extra->q = nullptr;
+                    octx->bytes_evicted_total += nbytes;
+                    elastic::wbm_mark_evicted(octx->wbm, idx);
+                    return 0;
+                }
+                // 不开 retain：直接 release sub-buffer + parent
+                cap_extra->reset();
+                ggml_opencl_elastic_evict_parent_pool_or_release(octx, cap_extra->parent_buffer, nbytes, idx);
+                cap_extra->parent_buffer = nullptr;
+                return 0;
+            };
+            auto reload_fn = [octx, cap_extra, cap_bctx, cap_backend_ctx, host_ptr, nbytes, cap_n_blocks,
+                              cap_size_q, cap_size_d, cap_q, cap_ctx, cap_kernel,
+                              need_transpose, cap_M, cap_K]() -> int {
+                int idx = cap_extra->wbm_idx;
+                cl_int err = CL_SUCCESS;
+                cl_mem new_parent = nullptr;
+                bool soa_hit = false;
+                // 先查 SOA pool (parent + d + q 三件套都复用，省 4 个 sub-buffer 操作)
+                if (octx->retain_cl_mem) {
+                    auto it = octx->soa_pool_by_size.find(nbytes);
+                    if (it != octx->soa_pool_by_size.end() && !it->second.empty()) {
+                        auto e = it->second.back(); it->second.pop_back();
+                        new_parent     = (cl_mem)e.parent;
+                        cap_extra->d   = (cl_mem)e.d;
+                        cap_extra->q   = (cl_mem)e.q;
+                        cap_extra->size_d = cap_size_d;
+                        cap_extra->size_q = cap_size_q;
+                        soa_hit = true;
+                        // 从 FIFO 列表移除一个 == nbytes 的 entry
+                        for (auto lit = octx->retain_order_sizes.rbegin();
+                             lit != octx->retain_order_sizes.rend(); ++lit) {
+                            if (*lit == nbytes) { octx->retain_order_sizes.erase(std::next(lit).base()); break; }
+                        }
+                        octx->cached_bytes -= std::min(octx->cached_bytes, nbytes);
+                    }
+                }
+                if (!new_parent) {
+                    new_parent = ggml_opencl_elastic_alloc_or_pool_parent(octx, cap_ctx, nbytes);
+                    if (!new_parent) return -1;
+                }
+                cap_extra->parent_buffer = new_parent;
+                if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
+                    cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
+                }
+                cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
+                if (!staging) { return -2; }
+                // Async pipeline: staging write 走 xfer_queue (跟 compute_queue 并行)，
+                // 但 staging 被复用 —— 必须 wait 前一次 reload 的 convert kernel 完成。
+                // 用 octx->soa_staging_last_use_ev 串行 staging 访问。
+                cl_event write_ev = nullptr;
+                cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
+                cl_event prev_use_ev = octx->soa_staging_last_use_ev;
+                // GGML_ELASTIC_DIRECT_IO=1: 用 O_DIRECT pread 从 disk 真读 host_ptr
+                // 对应的 file 区域, 然后 DMA 到 staging. 比 mmap memcpy 慢 (绕 cache),
+                // 但模拟 model > RAM 场景真实 disk IO 行为.
+                static const bool s_direct_io = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_DIRECT_IO");
+                    return e && *e && *e != '0';
+                }();
+                static thread_local std::vector<char> direct_scratch;
+                const void *src_for_dma = host_ptr;
+                if (s_direct_io) {
+                    auto reg = llama_mmap_registry_find(host_ptr);
+                    if (!reg.filename.empty()) {
+                        size_t file_offset = (const char*)host_ptr - (const char*)reg.base;
+                        if (direct_scratch.size() < nbytes) direct_scratch.resize(nbytes);
+                        int rc = llama_pread_direct(reg.filename.c_str(), direct_scratch.data(), file_offset, nbytes);
+                        if (rc == 0) {
+                            src_for_dma = direct_scratch.data();
+                        } else {
+                            std::fprintf(stderr, "[direct-io] pread_direct rc=%d, fallback mmap\n", rc);
+                        }
+                    }
+                }
+                err = clEnqueueWriteBuffer(xfer_q, staging, CL_FALSE,
+                                           0, nbytes, src_for_dma,
+                                           prev_use_ev ? 1 : 0,
+                                           prev_use_ev ? &prev_use_ev : nullptr,
+                                           &write_ev);
+                if (err != CL_SUCCESS) { return -3; }
+                if (xfer_q != cap_q) clFlush(xfer_q);
+                if (prev_use_ev) clReleaseEvent(prev_use_ev);
+
+                if (!soa_hit) {
+                    cl_buffer_region region = {0, cap_size_d};
+                    cap_extra->d = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                    if (err != CL_SUCCESS) { return -4; }
+                    region = {cap_size_d, cap_size_q};
+                    cap_extra->q = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                    if (err != CL_SUCCESS) { clReleaseMemObject(cap_extra->d); cap_extra->d = nullptr; return -5; }
+                    cap_extra->size_q = cap_size_q;
+                    cap_extra->size_d = cap_size_d;
+                }
+                // GGML_ELASTIC_RELOAD_ON_XFER=1: convert + transpose 也跑在 xfer_queue
+                // 上, 不挤占 compute_queue. 需要的 barrier 改成 "compute_queue 等
+                // 最终 reload event" — phase 2 attempt to push GPU-reload-block 出
+                // compute_queue. 默认关 (Adreno 上多 queue 是否并行不确定, 留 env 开关).
+                static const bool s_reload_on_xfer = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_RELOAD_ON_XFER");
+                    return e && *e && *e != '0';
+                }();
+                cl_command_queue kernel_q = s_reload_on_xfer ? xfer_q : cap_q;
+                if (!s_reload_on_xfer) {
+                    // 原路径: compute_queue 等 write_ev 完成才能开 convert kernel
+                    cl_int berr = clEnqueueBarrierWithWaitList(cap_q, 1, &write_ev, nullptr);
+                    if (berr != CL_SUCCESS) clWaitForEvents(1, &write_ev);
+                }
+                clReleaseEvent(write_ev);
+                CL_CHECK(clSetKernelArg(cap_kernel, 0, sizeof(cl_mem), &staging));
+                CL_CHECK(clSetKernelArg(cap_kernel, 1, sizeof(cl_mem), &cap_extra->q));
+                CL_CHECK(clSetKernelArg(cap_kernel, 2, sizeof(cl_mem), &cap_extra->d));
+                size_t gws[3] = {cap_n_blocks, 1, 1};
+                size_t lws[3] = {64, 1, 1};
+                cl_event convert_ev = nullptr;
+                err = clEnqueueNDRangeKernel(kernel_q, cap_kernel, 3, nullptr, gws, lws, 0, nullptr, &convert_ev);
+                if (err != CL_SUCCESS) return -6;
+                octx->soa_staging_last_use_ev = convert_ev;
+                // Adreno path: 转置 q/d. 也跑在 kernel_q 上.
+                if (need_transpose) {
+                    int rc = ggml_opencl_run_q4_0_adreno_transpose(
+                        cap_backend_ctx, kernel_q, cap_extra, cap_M, cap_K, /*sync_each=*/false);
+                    if (rc != 0) {
+                        std::fprintf(stderr, "[soa-reload-q4_0] adreno transpose 失败 idx=%d rc=%d\n", idx, rc);
+                        return -7;
+                    }
+                }
+                // 如果 kernel 跑在 xfer_q 上, compute_queue 用 barrier 等最终 event
+                // (后续 matmul 入 compute_queue 时自动有依赖, 但显式 barrier 更稳)
+                if (s_reload_on_xfer && kernel_q != cap_q) {
+                    clFlush(kernel_q);
+                    cl_event final_ev = nullptr;
+                    if (clEnqueueMarkerWithWaitList(kernel_q, 0, nullptr, &final_ev) == CL_SUCCESS && final_ev) {
+                        clEnqueueBarrierWithWaitList(cap_q, 1, &final_ev, nullptr);
+                        clReleaseEvent(final_ev);
+                    }
+                }
+                octx->bytes_uploaded_total += nbytes;
+                elastic::wbm_mark_resident(octx->wbm, idx, static_cast<void*>(new_parent));
+                return 0;
+            };
+            ggml_opencl_elastic_register_soa(buffer, tensor, extra,
+                extra_orig->data_device, extra_orig->ctx_slot,
+                host_ptr, nbytes, cap_ctx, cap_q,
+                std::move(evict_fn), std::move(reload_fn));
+        }
 
         return;
 
@@ -4352,6 +4932,87 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         tensor->extra = extra;
 
+        // ───── elastic SOA register (Q8_0) ───────────────────────────────────
+        if (auto *bctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+            bctx->mode == ggml_backend_opencl_buffer_context::MODE_ELASTIC &&
+            offset == 0 && size == ggml_nbytes(tensor)) {
+            const void *host_ptr        = data;
+            size_t nbytes               = ggml_nbytes(tensor);
+            const size_t cap_n_blocks   = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+            const size_t cap_size_q     = size_q;
+            const size_t cap_size_d     = size_d;
+            cl_kernel cap_kernel        = backend_ctx->kernel_convert_block_q8_0;
+            elastic::wbm_opencl_ctx *octx = &ggml_opencl_elastic()->octx;
+            ggml_tensor_extra_cl_q8_0 *cap_extra = extra;
+            ggml_backend_opencl_buffer_context *cap_bctx = bctx;
+            cl_context cap_ctx = context;
+            cl_command_queue cap_q = queue;
+
+            auto evict_fn = [octx, cap_extra, nbytes]() -> int {
+                int idx = cap_extra->wbm_idx;
+                cap_extra->reset();
+                ggml_opencl_elastic_evict_parent_pool_or_release(octx, cap_extra->parent_buffer, nbytes, idx);
+                cap_extra->parent_buffer = nullptr;
+                return 0;
+            };
+            auto reload_fn = [octx, cap_extra, cap_bctx, host_ptr, nbytes, cap_n_blocks,
+                              cap_size_q, cap_size_d, cap_q, cap_ctx, cap_kernel]() -> int {
+                int idx = cap_extra->wbm_idx;
+                cl_int err = CL_SUCCESS;
+                cl_mem new_parent = ggml_opencl_elastic_alloc_or_pool_parent(octx, cap_ctx, nbytes);
+                if (!new_parent) return -1;
+                cap_extra->parent_buffer = new_parent;
+                if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
+                    cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
+                }
+                cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
+                if (!staging) { clReleaseMemObject(new_parent); return -2; }
+                // Async pipeline (Q8_0 同 Q4_0): xfer_queue staging write + 串行事件链
+                cl_event write_ev = nullptr;
+                cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
+                cl_event prev_use_ev = octx->soa_staging_last_use_ev;
+                err = clEnqueueWriteBuffer(xfer_q, staging, CL_FALSE,
+                                           0, nbytes, host_ptr,
+                                           prev_use_ev ? 1 : 0,
+                                           prev_use_ev ? &prev_use_ev : nullptr,
+                                           &write_ev);
+                if (err != CL_SUCCESS) { clReleaseMemObject(new_parent); return -3; }
+                if (xfer_q != cap_q) clFlush(xfer_q);
+                cl_int berr = clEnqueueBarrierWithWaitList(cap_q, 1, &write_ev, nullptr);
+                if (berr != CL_SUCCESS) clWaitForEvents(1, &write_ev);
+                clReleaseEvent(write_ev);
+                if (prev_use_ev) clReleaseEvent(prev_use_ev);
+
+                cl_buffer_region region = {0, cap_size_d};
+                cap_extra->d = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                 CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                if (err != CL_SUCCESS) { clReleaseMemObject(new_parent); return -4; }
+                region = {cap_size_d, cap_size_q};
+                cap_extra->q = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                 CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                if (err != CL_SUCCESS) { clReleaseMemObject(cap_extra->d); cap_extra->d = nullptr;
+                                         clReleaseMemObject(new_parent); return -5; }
+                cap_extra->size_q = cap_size_q;
+                cap_extra->size_d = cap_size_d;
+                CL_CHECK(clSetKernelArg(cap_kernel, 0, sizeof(cl_mem), &staging));
+                CL_CHECK(clSetKernelArg(cap_kernel, 1, sizeof(cl_mem), &cap_extra->q));
+                CL_CHECK(clSetKernelArg(cap_kernel, 2, sizeof(cl_mem), &cap_extra->d));
+                size_t gws[3] = {cap_n_blocks, 1, 1};
+                size_t lws[3] = {64, 1, 1};
+                cl_event convert_ev = nullptr;
+                err = clEnqueueNDRangeKernel(cap_q, cap_kernel, 3, nullptr, gws, lws, 0, nullptr, &convert_ev);
+                if (err != CL_SUCCESS) return -6;
+                octx->soa_staging_last_use_ev = convert_ev;
+                octx->bytes_uploaded_total += nbytes;
+                elastic::wbm_mark_resident(octx->wbm, idx, static_cast<void*>(new_parent));
+                return 0;
+            };
+            ggml_opencl_elastic_register_soa(buffer, tensor, extra,
+                extra_orig->data_device, extra_orig->ctx_slot,
+                host_ptr, nbytes, cap_ctx, cap_q,
+                std::move(evict_fn), std::move(reload_fn));
+        }
+
         return;
     }
 #endif // GGML_OPENCL_SOA_Q
@@ -4419,20 +5080,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
                     // GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1：把 token_embd（501 MB
                     // 但只用 1 行 / token，每次 reload 要 ~240 ms）pin 起来，并
-                    // 把它的字节数加到 extra_target_bytes 上：动态模式下
-                    // target = B(t) - kv - misc + extra，等于"该 tensor 的开销
+                    // 把它的字节数加到 static_target_bytes 上等于"对它的开销
                     // 不计入预算"。技术上违反 spec §5 的 M_floor 契约（实际 GPU
-                    // 占用 = B(t) + embed_bytes），但因为是 read-only 的固定量，
-                    // 可以理解成对 B(t) 的常数偏置。
+                    // 占用 = M_floor + embed_bytes），但因为是 read-only 的固定
+                    // 量，可以理解成对 M_floor 的常数偏置。
                     static const bool s_embed_out = []() {
                         const char *e = std::getenv("GGML_ELASTIC_EMBED_OUTSIDE_BUDGET");
                         return e && *e && *e != '0';
                     }();
                     if (s_embed_out && suffix == "token_embd") {
                         elastic::wbm_set_pinned(&s->wbm, idx, true);
-                        s->extra_target_bytes += size;
-                        GGML_LOG_INFO("ggml_opencl elastic: pin token_embd (%zu MB) outside budget → extra=%zu MB\n",
-                                      size / 1024 / 1024, s->extra_target_bytes / 1024 / 1024);
+                        s->static_target_bytes += size;
+                        GGML_LOG_INFO("ggml_opencl elastic: pin token_embd (%zu MB) outside budget → target=%zu MB\n",
+                                      size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
                     }
                 }
             }

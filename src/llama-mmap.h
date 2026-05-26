@@ -74,3 +74,22 @@ private:
 };
 
 size_t llama_path_max();
+
+// Global mmap registry — 让 backend 能反查 "这个 host_ptr 在哪个 file 的哪个 offset",
+// 用于 elastic 把 reload 从 mmap memcpy 切到 O_DIRECT pread.
+// llama_mmap ctor 自动注册; dtor 自动反注册.
+// thread-safe (内部 mutex). lookup 返 empty filename 表示未找到.
+// 注意: 存 filename 字符串而非 llama_file* — file 对象在 loader 析构时释放,
+// 但 mmap 还在 model 里活着 → 不能拿 file*. backend 自己再 open 一个 fd.
+#include <string>
+struct llama_mmap_registry_entry {
+    void *      base = nullptr;     // mmap 起始虚拟地址
+    size_t      size = 0;
+    std::string filename;           // GGUF 文件路径
+};
+llama_mmap_registry_entry llama_mmap_registry_find(const void * host_ptr);
+
+// 独立 O_DIRECT pread helper (不依赖 llama_file 对象, 自己 open/cache fd)
+// 路径为 filename 的文件: lazy 开 O_DIRECT fd, 对齐 bounce buffer, pread.
+// 返 0 成功, <0 失败.
+int llama_pread_direct(const char * filename, void * dst, size_t file_offset, size_t len);

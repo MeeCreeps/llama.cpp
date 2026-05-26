@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 
 #if !defined(_WIN32)
     #include <sys/types.h>
@@ -532,8 +533,97 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
-llama_mmap::~llama_mmap() = default;
+// === Global mmap registry ===
+#include <mutex>
+namespace {
+std::mutex g_mmap_reg_mtx;
+std::vector<llama_mmap_registry_entry> g_mmap_registry;
+}
+
+static void mmap_registry_add(void *base, size_t size, const std::string &filename) {
+    std::lock_guard<std::mutex> lk(g_mmap_reg_mtx);
+    g_mmap_registry.push_back({base, size, filename});
+}
+static void mmap_registry_remove(void *base) {
+    std::lock_guard<std::mutex> lk(g_mmap_reg_mtx);
+    g_mmap_registry.erase(
+        std::remove_if(g_mmap_registry.begin(), g_mmap_registry.end(),
+                       [base](const auto &e) { return e.base == base; }),
+        g_mmap_registry.end());
+}
+llama_mmap_registry_entry llama_mmap_registry_find(const void *host_ptr) {
+    std::lock_guard<std::mutex> lk(g_mmap_reg_mtx);
+    for (const auto &e : g_mmap_registry) {
+        if (host_ptr >= e.base && host_ptr < (char*)e.base + e.size) return e;
+    }
+    return {};
+}
+
+// 独立 O_DIRECT pread: backend 不依赖 llama_file (它在 loader destruct 时释放).
+// 内部按 filename 缓存 fd + bounce buffer.
+struct direct_io_handle {
+    int    fd      = -1;
+    size_t blk     = 4096;
+    void * bounce  = nullptr;
+    size_t bcap    = 0;
+};
+static std::mutex g_direct_mtx;
+static std::unordered_map<std::string, direct_io_handle> g_direct_handles;
+int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size_t len) {
+#if defined(__linux__) || defined(__ANDROID__)
+    std::lock_guard<std::mutex> lk(g_direct_mtx);
+    auto &h = g_direct_handles[filename];
+    if (h.fd < 0) {
+        int fd = open(filename, O_RDONLY | O_DIRECT);
+        if (fd < 0) {
+            fprintf(stderr, "[llama_pread_direct] open O_DIRECT failed %s: %s\n", filename, strerror(errno));
+            return -1;
+        }
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_blksize >= 4096 && (st.st_blksize & (st.st_blksize-1)) == 0) {
+            h.blk = (size_t)st.st_blksize;
+        }
+        h.fd = fd;
+    }
+    size_t blk = h.blk;
+    size_t off_aligned = file_offset & ~(blk - 1);
+    size_t head_skip   = file_offset - off_aligned;
+    size_t aligned_sz  = ((head_skip + len + blk - 1) / blk) * blk;
+    if (h.bcap < aligned_sz) {
+        if (h.bounce) free(h.bounce);
+        h.bounce = nullptr;
+        if (posix_memalign(&h.bounce, blk, aligned_sz) != 0) { h.bcap = 0; return -2; }
+        h.bcap = aligned_sz;
+    }
+    ssize_t rd = pread(h.fd, h.bounce, aligned_sz, off_aligned);
+    if (rd < 0) { fprintf(stderr, "[llama_pread_direct] pread fail: %s\n", strerror(errno)); return -3; }
+    memcpy(dst, (char*)h.bounce + head_skip, len);
+    return 0;
+#else
+    (void)filename; (void)dst; (void)file_offset; (void)len;
+    return -1;
+#endif
+}
+
+static std::string mmap_file_path(struct llama_file *f) {
+    // 用 file_id() 反查 /proc/self/fd/<id> 的 symlink 拿绝对路径
+    if (!f) return "";
+    int fd = f->file_id();
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    char buf[4096];
+    ssize_t n = readlink(link, buf, sizeof(buf)-1);
+    if (n <= 0) return "";
+    buf[n] = 0;
+    return std::string(buf);
+}
+
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {
+    mmap_registry_add(pimpl->addr, pimpl->size, mmap_file_path(file));
+}
+llama_mmap::~llama_mmap() {
+    if (pimpl) mmap_registry_remove(pimpl->addr);
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
