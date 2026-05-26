@@ -269,10 +269,18 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
             int v = std::atoi(pf);
             if (v > 0) s->prefetch_lookahead = v;
         }
+        // 默认 MRU. LLM decode 是 round-robin (layer 0..N..0..N), LRU 总把"马上
+        // 再用的"踢出 → 命中率近 0; MRU 把"刚用的"踢出, 下次 cycle 再装回来.
+        // 实测 3B F16 B=5000: LRU 2546 ms/tok, MRU 699 (3.6× 差距).
+        // GGML_ELASTIC_EVICT_POLICY=lru 可显式切回 LRU 调试用.
+        s->wbm.evict_mru = true;
         if (const char *policy = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
-            if (std::string(policy) == "mru") {
-                s->wbm.evict_mru = true;
-                GGML_LOG_INFO("elastic: MRU policy\n");
+            std::string ps(policy);
+            if (ps == "lru") {
+                s->wbm.evict_mru = false;
+                GGML_LOG_INFO("elastic: LRU policy (explicit override)\n");
+            } else if (ps == "mru") {
+                GGML_LOG_INFO("elastic: MRU policy (default)\n");
             }
         }
         if (const char *p = std::getenv("GGML_ELASTIC_PROFILE"); p && *p && *p != '0') {
