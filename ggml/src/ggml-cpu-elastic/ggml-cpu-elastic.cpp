@@ -21,6 +21,7 @@
 #include "budget_watcher.h"
 // O_DIRECT path (跟 GPU 共用 src/llama-mmap registry + pread_direct)
 #include "../../../src/llama-mmap.h"
+#include "../../../src/llama-uring.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -554,47 +555,106 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     }();
 
     if (s_chunk_size > 0) {
-        // Chunked execution with overlap
+        // GGML_ELASTIC_URING=1: 用 io_uring 替代 std::thread worker, kernel 异步执行
+        // pread, 主线程跑 compute. 无 thread spawn/join 开销, 无 DRAM 竞争 (UFS DMA
+        // 走独立 hardware path). Linux/Android kernel >= 5.1.
+        static const bool s_uring = []() {
+            const char *e = std::getenv("GGML_ELASTIC_URING");
+            return e && *e && *e != '0';
+        }();
+
         const int n_nodes = cgraph->n_nodes;
-        auto ensure_chunk = [&](int i0, int i1) {
+        // Sync ensure (worker thread 或 fallback 用)
+        auto ensure_chunk_sync = [&](int i0, int i1) {
             for (int i = i0; i < i1; i++) {
                 ggml_tensor *n = cgraph->nodes[i];
-                if (n) {
-                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                        ggml_tensor *src = n->src[k];
-                        if (!src) continue;
-                        int idx; void *h;
-                        if (!resolve(src, idx, h)) continue;
-                        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-                        if (!bm || bm->resident) continue;
+                if (n) for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor *src = n->src[k];
+                    if (!src) continue;
+                    int idx; void *h;
+                    if (!resolve(src, idx, h)) continue;
+                    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+                    if (!bm || bm->resident) continue;
+                    ensure_block_resident(s, idx, h);
+                }
+            }
+        };
+
+        // Async ensure via io_uring: submit aligned reads, fall back sync for unaligned.
+        // 返回 submitted block 列表 (caller 在 wait_all 后 mark_resident).
+        auto ensure_chunk_uring_submit = [&](int i0, int i1, std::vector<std::pair<int,size_t>> &pending) {
+            for (int i = i0; i < i1; i++) {
+                ggml_tensor *n = cgraph->nodes[i];
+                if (!n) continue;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor *src = n->src[k];
+                    if (!src) continue;
+                    int idx; void *h;
+                    if (!resolve(src, idx, h)) continue;
+                    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+                    if (!bm || bm->resident || !bm->host_ptr || !bm->backend_handle) continue;
+                    auto reg = llama_mmap_registry_find(bm->host_ptr);
+                    if (reg.filename.empty()) {
+                        ensure_block_resident(s, idx, h);
+                        continue;
+                    }
+                    size_t file_offset = (const char*)bm->host_ptr - (const char*)reg.base;
+                    // 必须 4096-aligned 才能 io_uring + O_DIRECT 直写
+                    const bool ok = ((uintptr_t)bm->backend_handle & 4095) == 0
+                                 && (file_offset & 4095) == 0
+                                 && (bm->byte_size & 4095) == 0;
+                    if (ok && llama_uring::submit_pread_aligned(reg.filename.c_str(),
+                                                                  bm->backend_handle, file_offset, bm->byte_size) == 0) {
+                        pending.emplace_back(idx, bm->byte_size);
+                    } else {
                         ensure_block_resident(s, idx, h);
                     }
                 }
             }
         };
-        // First chunk sync
+        auto mark_pending_resident = [&](std::vector<std::pair<int,size_t>> &pending) {
+            llama_uring::wait_all();
+            for (auto &p : pending) {
+                int idx = p.first;
+                const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+                if (bm && bm->backend_handle) {
+                    elastic::wbm_mark_resident(&s->wbm, idx, bm->backend_handle);
+                    s->n_reloads_total += 1;
+                    s->bytes_reloaded_total += p.second;
+                }
+            }
+            pending.clear();
+        };
+
         int i0 = 0, i1 = std::min(s_chunk_size, n_nodes);
-        ensure_chunk(i0, i1);
+        ensure_chunk_sync(i0, i1);  // first chunk fully sync
         pick_some_ctx(cgraph->nodes[i0]);
 
         ggml_status st_chunk = GGML_STATUS_SUCCESS;
+        std::vector<std::pair<int,size_t>> pending;  // uring path
+
         while (i0 < n_nodes) {
             const int next_i0 = i1;
             const int next_i1 = std::min(i1 + s_chunk_size, n_nodes);
 
-            // Start worker for next chunk's ensure (if exists)
-            std::thread worker;
-            if (next_i0 < n_nodes) {
-                worker = std::thread([&ensure_chunk, next_i0, next_i1]() {
-                    ensure_chunk(next_i0, next_i1);
-                });
+            if (s_uring) {
+                // io_uring path: submit next chunk's reads, then compute current
+                if (next_i0 < n_nodes) ensure_chunk_uring_submit(next_i0, next_i1, pending);
+                struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
+                st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
+                if (!pending.empty()) mark_pending_resident(pending);
+            } else {
+                // worker thread path (fallback, 默认)
+                std::thread worker;
+                if (next_i0 < n_nodes) {
+                    worker = std::thread([&ensure_chunk_sync, next_i0, next_i1]() {
+                        ensure_chunk_sync(next_i0, next_i1);
+                    });
+                }
+                struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
+                st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
+                if (worker.joinable()) worker.join();
             }
-
-            // Compute current chunk
-            struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
-            st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
-
-            if (worker.joinable()) worker.join();
             if (st_chunk != GGML_STATUS_SUCCESS) break;
 
             i0 = next_i0;
