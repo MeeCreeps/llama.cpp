@@ -585,19 +585,103 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
         }
         h.fd = fd;
     }
-    size_t blk = h.blk;
-    size_t off_aligned = file_offset & ~(blk - 1);
-    size_t head_skip   = file_offset - off_aligned;
-    size_t aligned_sz  = ((head_skip + len + blk - 1) / blk) * blk;
-    if (h.bcap < aligned_sz) {
-        if (h.bounce) free(h.bounce);
-        h.bounce = nullptr;
-        if (posix_memalign(&h.bounce, blk, aligned_sz) != 0) { h.bcap = 0; return -2; }
-        h.bcap = aligned_sz;
+    const size_t blk = h.blk;
+
+    // Fast path: dst, file_offset, len 都 blk 对齐 → pread 直接到 dst, 零 memcpy.
+    const bool dst_aligned    = (reinterpret_cast<uintptr_t>(dst) % blk) == 0;
+    const bool offset_aligned = (file_offset % blk) == 0;
+    const bool len_aligned    = (len % blk) == 0;
+    if (dst_aligned && offset_aligned && len_aligned && len > 0) {
+        ssize_t rd = pread(h.fd, dst, len, file_offset);
+        if (rd < 0) { fprintf(stderr, "[llama_pread_direct fastpath] pread fail: %s\n", strerror(errno)); return -3; }
+        return 0;
     }
-    ssize_t rd = pread(h.fd, h.bounce, aligned_sz, off_aligned);
-    if (rd < 0) { fprintf(stderr, "[llama_pread_direct] pread fail: %s\n", strerror(errno)); return -3; }
-    memcpy(dst, (char*)h.bounce + head_skip, len);
+
+    // Split path: 头尾用 bounce 处理对齐, 中间 (如果对齐) 直接 pread 到 dst.
+    // 省掉 99% 的 bounce→dst memcpy (对于 50+ MB tensor 而言, 头尾 < 8 KB).
+    const size_t head_off_aligned = file_offset & ~(blk - 1);
+    const size_t head_skip        = file_offset - head_off_aligned;
+    const size_t head_block_size  = blk - head_skip;  // 第一个 block 内有效字节
+    const size_t tail_end         = file_offset + len;
+    const size_t tail_end_aligned = (tail_end + blk - 1) & ~(blk - 1);
+
+    // 如果 len 很小整个落在 head block 内, 直接 bounce
+    if (len <= head_block_size) {
+        size_t need = ((head_skip + len + blk - 1) / blk) * blk;
+        if (h.bcap < need) {
+            if (h.bounce) free(h.bounce);
+            h.bounce = nullptr;
+            if (posix_memalign(&h.bounce, blk, need) != 0) { h.bcap = 0; return -2; }
+            h.bcap = need;
+        }
+        if (pread(h.fd, h.bounce, need, head_off_aligned) < 0) {
+            fprintf(stderr, "[llama_pread_direct head-only] pread fail: %s\n", strerror(errno)); return -3;
+        }
+        memcpy(dst, (char*)h.bounce + head_skip, len);
+        return 0;
+    }
+
+    char *dst_c = (char *)dst;
+
+    // 1) Head bounce: 读对齐起始 1 block, 拷贝有效部分到 dst[0..head_block_size)
+    {
+        if (h.bcap < blk) {
+            if (h.bounce) free(h.bounce);
+            h.bounce = nullptr;
+            if (posix_memalign(&h.bounce, blk, blk) != 0) { h.bcap = 0; return -2; }
+            h.bcap = blk;
+        }
+        if (pread(h.fd, h.bounce, blk, head_off_aligned) < 0) {
+            fprintf(stderr, "[llama_pread_direct head] pread fail: %s\n", strerror(errno)); return -3;
+        }
+        memcpy(dst_c, (char*)h.bounce + head_skip, head_block_size);
+    }
+
+    // 2) Middle direct: 从 file_offset+head_block_size 开始, 必然 blk-aligned.
+    //    长度尽量取 blk 倍数, 写到 dst+head_block_size (检查是否 blk-aligned).
+    const size_t mid_file_off = file_offset + head_block_size;       // blk-aligned
+    char *mid_dst             = dst_c + head_block_size;
+    const size_t remaining    = len - head_block_size;
+    const size_t mid_blocks   = remaining / blk;                     // 完整 block 数
+    const size_t mid_size     = mid_blocks * blk;
+    const size_t tail_size    = remaining - mid_size;
+
+    if (mid_size > 0) {
+        if ((reinterpret_cast<uintptr_t>(mid_dst) % blk) == 0) {
+            // mid_dst blk-aligned → direct pread, 零 memcpy
+            ssize_t rd = pread(h.fd, mid_dst, mid_size, mid_file_off);
+            if (rd < 0) { fprintf(stderr, "[llama_pread_direct mid] pread fail: %s\n", strerror(errno)); return -3; }
+        } else {
+            // 罕见: dst 不 blk-aligned, 中段也 bounce. 跟旧路径等效.
+            if (h.bcap < mid_size) {
+                if (h.bounce) free(h.bounce);
+                h.bounce = nullptr;
+                if (posix_memalign(&h.bounce, blk, mid_size) != 0) { h.bcap = 0; return -2; }
+                h.bcap = mid_size;
+            }
+            if (pread(h.fd, h.bounce, mid_size, mid_file_off) < 0) {
+                fprintf(stderr, "[llama_pread_direct mid-bounce] pread fail: %s\n", strerror(errno)); return -3;
+            }
+            memcpy(mid_dst, h.bounce, mid_size);
+        }
+    }
+
+    // 3) Tail bounce: 读最后 1 block, 拷贝前 tail_size 字节
+    if (tail_size > 0) {
+        const size_t tail_file_off = mid_file_off + mid_size;        // blk-aligned
+        if (h.bcap < blk) {
+            if (h.bounce) free(h.bounce);
+            h.bounce = nullptr;
+            if (posix_memalign(&h.bounce, blk, blk) != 0) { h.bcap = 0; return -2; }
+            h.bcap = blk;
+        }
+        if (pread(h.fd, h.bounce, blk, tail_file_off) < 0) {
+            fprintf(stderr, "[llama_pread_direct tail] pread fail: %s\n", strerror(errno)); return -3;
+        }
+        memcpy(mid_dst + mid_size, h.bounce, tail_size);
+    }
+
+    (void)tail_end_aligned;
     return 0;
 #else
     (void)filename; (void)dst; (void)file_offset; (void)len;

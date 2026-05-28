@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdio>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -206,9 +207,13 @@ const char * elastic_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU_Elastic";
 }
 
+// O_DIRECT 需要 dst 4096 byte 对齐才能 pread 直写, 省掉 bounce buffer memcpy.
+// 32 (默认 ggml 对齐) 对 SIMD 足够, 但 pread direct 必须 4096. 改成 4096
+// 让 region 内每个 tensor 起始地址都 page-aligned. 内存浪费可忽略 (每 tensor
+// 多 ~4 KB padding, 3B model ~280 tensors × 4 KB = 1.1 MB).
 size_t elastic_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return 32;  // 跟 CPU buffer 对齐保持一致
+    return 4096;  // O_DIRECT direct-pread 需要; 也包含 SIMD 32B 对齐要求
 }
 
 bool elastic_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -408,7 +413,8 @@ const ggml_backend_buffer_i elastic_buffer_i = {
 };
 
 ggml_backend_buffer_t elastic_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void *data = std::aligned_alloc(32, (size + 31) & ~size_t(31));
+    // Region 4096 对齐让 O_DIRECT pread 能 direct 写到 region+offset (省 bounce memcpy)
+    void *data = std::aligned_alloc(4096, (size + 4095) & ~size_t(4095));
     if (!data) {
         GGML_LOG_ERROR("elastic: alloc %zu 失败\n", size);
         return nullptr;
@@ -527,20 +533,97 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     //    需要的 src 都加载好，compute 期间不能动它们。
     // 2) prefetch 期间 madvise WILLNEED 给后 N 个 node 的 srcs 预读 mmap 页
     elastic_buffer_ctx *some_ctx = nullptr;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        ensure_node(cgraph->nodes[i]);
-        // 记一个 elastic buffer ctx，后面 evict 时挑一个用
-        ggml_tensor *node = cgraph->nodes[i];
-        if (!some_ctx && node) {
-            for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                ggml_tensor *src = node->src[k];
-                if (src && src->buffer &&
-                    src->buffer->iface.set_tensor == elastic_buffer_set_tensor) {
-                    some_ctx = (elastic_buffer_ctx *)src->buffer->context;
-                    break;
-                }
+    auto pick_some_ctx = [&](ggml_tensor *node) {
+        if (some_ctx || !node) return;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            ggml_tensor *src = node->src[k];
+            if (src && src->buffer &&
+                src->buffer->iface.set_tensor == elastic_buffer_set_tensor) {
+                some_ctx = (elastic_buffer_ctx *)src->buffer->context;
+                break;
             }
         }
+    };
+
+    // GGML_ELASTIC_CHUNK_SIZE=N: 把 graph 切成 N node 一段, 段间插 worker thread
+    // 跑 NEXT chunk 的 ensure_phase, 主线程跑 CURRENT chunk 的 graph_compute.
+    // 真正实现 IO/compute overlap. =0 (default) 走原 monolithic 路径.
+    static const int s_chunk_size = []() {
+        const char *e = std::getenv("GGML_ELASTIC_CHUNK_SIZE");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+
+    if (s_chunk_size > 0) {
+        // Chunked execution with overlap
+        const int n_nodes = cgraph->n_nodes;
+        auto ensure_chunk = [&](int i0, int i1) {
+            for (int i = i0; i < i1; i++) {
+                ggml_tensor *n = cgraph->nodes[i];
+                if (n) {
+                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                        ggml_tensor *src = n->src[k];
+                        if (!src) continue;
+                        int idx; void *h;
+                        if (!resolve(src, idx, h)) continue;
+                        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+                        if (!bm || bm->resident) continue;
+                        ensure_block_resident(s, idx, h);
+                    }
+                }
+            }
+        };
+        // First chunk sync
+        int i0 = 0, i1 = std::min(s_chunk_size, n_nodes);
+        ensure_chunk(i0, i1);
+        pick_some_ctx(cgraph->nodes[i0]);
+
+        ggml_status st_chunk = GGML_STATUS_SUCCESS;
+        while (i0 < n_nodes) {
+            const int next_i0 = i1;
+            const int next_i1 = std::min(i1 + s_chunk_size, n_nodes);
+
+            // Start worker for next chunk's ensure (if exists)
+            std::thread worker;
+            if (next_i0 < n_nodes) {
+                worker = std::thread([&ensure_chunk, next_i0, next_i1]() {
+                    ensure_chunk(next_i0, next_i1);
+                });
+            }
+
+            // Compute current chunk
+            struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
+            st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
+
+            if (worker.joinable()) worker.join();
+            if (st_chunk != GGML_STATUS_SUCCESS) break;
+
+            i0 = next_i0;
+            i1 = next_i1;
+        }
+        // Skip the monolithic path; jump to post-compute evict section using goto-ish
+        // (mimicked by setting st and skipping below).
+        // Run the post-compute housekeeping by falling through to evict section below.
+        if (s->profile) {
+            // Roughly attribute: count ensure as IO, graph_compute as compute.
+            // (we don't have fine-grained per-chunk timing without more invasive code)
+            s->profile_n_graph += 1;
+        }
+        // 4) evict to target
+        if (s->bw_inited && some_ctx) {
+            const size_t target = target_bytes();
+            if (target != SIZE_MAX && s->wbm.resident_bytes > target) {
+                std::vector<int> victims;
+                int n_v = elastic::wbm_evict_to_byte_budget(&s->wbm, target, -1, &victims);
+                if (n_v > 0) evict_blocks(s, some_ctx, victims);
+            }
+        }
+        dbg_graph_n++;
+        return st_chunk;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ensure_node(cgraph->nodes[i]);
+        pick_some_ctx(cgraph->nodes[i]);
         // CPU prefetch (madvise WILLNEED) 给后 N 个 node 的 srcs
         if (s->prefetch_lookahead > 0) {
             int maxj = std::min(i + 1 + s->prefetch_lookahead, cgraph->n_nodes);
