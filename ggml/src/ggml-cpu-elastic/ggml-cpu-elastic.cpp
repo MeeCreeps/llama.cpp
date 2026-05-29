@@ -16,6 +16,13 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
+// async worker / event infrastructure
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
+
 #include "weight_buffer_manager.h"
 #include "weight_buffer_manager_cpu.h"
 #include "budget_watcher.h"
@@ -809,9 +816,178 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     return st;
 }
 
+// ============================================================
+// Async worker: 让 ggml-cpu compute 跑在后台线程, 主线程 graph_compute_async
+// 立刻返回. 配合 event_record/wait 让 ggml-sched 在 CPU 跑期间能去 dispatch GPU.
+// 开关: LLAMA_ELASTIC_CPU_ASYNC=1
+//
+// 设计:
+//   - 全局单 worker thread + 任务 queue (per backend instance)
+//   - 任务种类: COMPUTE(cgraph), EVENT_RECORD(event), EVENT_WAIT(event)
+//   - 主线程: graph_compute_async push COMPUTE, 立刻返回
+//   - Worker: pop 任务, 顺序处理, 保留 ggml-sched 期望的依赖序
+// ============================================================
+struct elastic_event_state {
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    signaled = false;
+};
+
+struct elastic_async_task {
+    enum kind_t { COMPUTE, EVENT_RECORD, EVENT_WAIT } kind;
+    ggml_backend_t          backend = nullptr;
+    ggml_cgraph *           cgraph  = nullptr;
+    elastic_event_state *   event   = nullptr;
+};
+
+struct elastic_async_worker {
+    std::thread             th;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<elastic_async_task> queue;
+    std::atomic<bool>       stop{false};
+    bool                    started = false;
+};
+
+static elastic_async_worker * get_async_worker() {
+    static elastic_async_worker w;
+    return &w;
+}
+
+static void async_worker_loop(elastic_async_worker *w) {
+    while (!w->stop.load(std::memory_order_acquire)) {
+        elastic_async_task task;
+        {
+            std::unique_lock<std::mutex> lk(w->mtx);
+            w->cv.wait(lk, [&]{ return w->stop.load(std::memory_order_acquire) || !w->queue.empty(); });
+            if (w->stop.load(std::memory_order_acquire)) return;
+            task = std::move(w->queue.front());
+            w->queue.pop_front();
+        }
+        switch (task.kind) {
+            case elastic_async_task::COMPUTE: {
+                // Direct call to underlying CPU backend (skip elastic ensure since
+                // sync ensure_phase already happened on main thread before enqueue).
+                auto *bctx = (elastic_buffer_ctx *) task.backend->context;
+                // Re-enter our own elastic graph_compute path (which itself ensures + computes)
+                // 不直接调 bctx->cpu, 因为 ensure_phase 还要做.
+                extern ggml_status elastic_backend_graph_compute(ggml_backend_t, ggml_cgraph *);
+                elastic_backend_graph_compute(task.backend, task.cgraph);
+                (void)bctx;
+                break;
+            }
+            case elastic_async_task::EVENT_RECORD: {
+                std::lock_guard<std::mutex> lk(task.event->m);
+                task.event->signaled = true;
+                task.event->cv.notify_all();
+                break;
+            }
+            case elastic_async_task::EVENT_WAIT: {
+                std::unique_lock<std::mutex> lk(task.event->m);
+                task.event->cv.wait(lk, [&]{ return task.event->signaled; });
+                break;
+            }
+        }
+    }
+}
+
+static void async_worker_start() {
+    auto *w = get_async_worker();
+    static std::once_flag f;
+    std::call_once(f, [&]{ w->th = std::thread(async_worker_loop, w); w->started = true; });
+}
+static void async_worker_enqueue(elastic_async_task t) {
+    auto *w = get_async_worker();
+    {
+        std::lock_guard<std::mutex> lk(w->mtx);
+        w->queue.push_back(std::move(t));
+    }
+    w->cv.notify_one();
+}
+static bool async_enabled() {
+    static const bool enabled = []{
+        const char *e = std::getenv("LLAMA_ELASTIC_CPU_ASYNC");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+// Async-aware wrappers (default fall back sync if async disabled)
+ggml_status elastic_backend_graph_compute_async(ggml_backend_t backend, ggml_cgraph *cgraph) {
+    if (!async_enabled()) {
+        extern ggml_status elastic_backend_graph_compute(ggml_backend_t, ggml_cgraph *);
+        return elastic_backend_graph_compute(backend, cgraph);
+    }
+    async_worker_start();
+    elastic_async_task t{};
+    t.kind = elastic_async_task::COMPUTE;
+    t.backend = backend;
+    t.cgraph  = cgraph;
+    async_worker_enqueue(std::move(t));
+    return GGML_STATUS_SUCCESS;  // dispatched, completion via events
+}
+
+void elastic_backend_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    (void)backend;
+    if (!async_enabled()) return;  // sync mode: event always considered ready
+    async_worker_start();
+    elastic_async_task t{};
+    t.kind = elastic_async_task::EVENT_RECORD;
+    t.event = (elastic_event_state *) event->context;
+    async_worker_enqueue(std::move(t));
+}
+
+void elastic_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    (void)backend;
+    if (!async_enabled()) return;
+    async_worker_start();
+    elastic_async_task t{};
+    t.kind = elastic_async_task::EVENT_WAIT;
+    t.event = (elastic_event_state *) event->context;
+    async_worker_enqueue(std::move(t));
+}
+
+// Device-level event APIs
+ggml_backend_event_t elastic_device_event_new(ggml_backend_dev_t dev) {
+    auto *st = new elastic_event_state();
+    auto *e = new ggml_backend_event{ dev, st };
+    return e;
+}
+void elastic_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    (void)dev;
+    delete (elastic_event_state *) event->context;
+    delete event;
+}
+void elastic_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    (void)dev;
+    auto *st = (elastic_event_state *) event->context;
+    std::unique_lock<std::mutex> lk(st->m);
+    st->cv.wait(lk, [&]{ return st->signaled; });
+}
+
+void elastic_backend_synchronize(ggml_backend_t backend) {
+    (void)backend;
+    if (!async_enabled()) return;
+    // 等 worker queue 清空: enqueue 一个 event, wait it
+    auto *st = new elastic_event_state();
+    auto *e = new ggml_backend_event{ nullptr, st };
+    elastic_backend_event_record(backend, e);
+    {
+        std::unique_lock<std::mutex> lk(st->m);
+        st->cv.wait(lk, [&]{ return st->signaled; });
+    }
+    delete st;
+    delete e;
+}
+
 const ggml_backend_i elastic_backend_i = {
     /* .get_name                = */ elastic_backend_get_name,
     /* .free                    = */ elastic_backend_free,
+    // NOTE: async path 已实现 (elastic_backend_graph_compute_async + event_* +
+    // worker thread) 但接到 iface 后引起 ggml-cpu ops.cpp 越界 assert — ggml-sched
+    // 调 compute_async 返回后, 主线程继续准备下一 split, 共享 cgraph 内部状态
+    // (tensor->data 等) 被 mutate, worker 还在读 → race. 要修需要 deep copy cgraph
+    // 或加更严同步. 暂时回退 sync iface, 代码留着.
     /* .set_tensor_async        = */ nullptr,
     /* .get_tensor_async        = */ nullptr,
     /* .cpy_tensor_async        = */ nullptr,
@@ -853,6 +1029,7 @@ void elastic_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props *pr
     props->description = elastic_device_get_description(dev);
     props->type        = elastic_device_get_type(dev);
     elastic_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    // async iface 暂未启用 (race issue, 见 backend_i 注释), caps 保持 sync.
     props->caps = { /*async*/false, /*host_buffer*/false, /*buffer_from_host_ptr*/true, /*events*/false };
 }
 ggml_backend_buffer_type_t elastic_device_get_buffer_type(ggml_backend_dev_t dev) {
