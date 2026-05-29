@@ -28,6 +28,7 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <unordered_map>
 
 #include <sys/mman.h>   // posix_madvise
 #include <unistd.h>     // sysconf(_SC_PAGESIZE)
@@ -2929,11 +2930,58 @@ struct ggml_opencl_elastic_state {
     uint64_t   t_compute_gpu_us  = 0;   // sum of GPU profiling time on matmul kernels
     uint64_t   n_reload_gpu_ev   = 0;   // count of GPU events sampled
     uint64_t   n_compute_gpu_ev  = 0;
+
+    // === Runtime scheduler 集成: tensor name → wbm_idx ===
+    std::mutex                              sched_mtx;
+    std::unordered_map<std::string, int>    name_to_wbm;
+    bool                                    sched_registered = false;
 };
 
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
     static ggml_opencl_elastic_state s;
     return &s;
+}
+
+// === Runtime scheduler handlers (registered with llama-mmap registry) ===
+static bool opencl_sched_residency_query(const char *name, void * /*ud*/) {
+    if (!name) return false;
+    auto *s = ggml_opencl_elastic();
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto it = s->name_to_wbm.find(name);
+    if (it == s->name_to_wbm.end()) return false;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
+    return bm && bm->resident;
+}
+
+static int opencl_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
+    if (!name) return -1;
+    auto *s = ggml_opencl_elastic();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;  // 让 chain 试下一个 provider
+        idx = it->second;
+    }
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -3;
+    if (evict) {
+        if (!bm->resident) return 0;
+        int rc = elastic::wbmcl_evict_batch(&s->octx, &idx, 1);
+        s->n_evicts_total += rc > 0 ? 1 : 0;
+        return 0;
+    }
+    if (bm->resident) return 0;
+    int rc = elastic::wbmcl_ensure_resident(&s->octx, idx);
+    return rc == 0 ? 0 : -4;
+}
+
+static void opencl_sched_register_once() {
+    auto *s = ggml_opencl_elastic();
+    if (s->sched_registered) return;
+    s->sched_registered = true;
+    llama_weight_residency_register(opencl_sched_residency_query, nullptr);
+    llama_weight_movement_register (opencl_sched_movement_request, nullptr);
 }
 
 // 提取 tensor 名后缀用于 profile 聚合：blk.<N>.<X>.weight → X
@@ -4194,6 +4242,13 @@ static void ggml_opencl_elastic_register_soa(
         bctx->wbm_idx_per_slot[ctx_slot] = idx;
     }
     elastic::wbmcl_register_soa(&s->octx, idx, std::move(evict_fn), std::move(reload_fn));
+
+    // Runtime scheduler 用的 name → idx 索引
+    if (tensor && tensor->name[0]) {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        s->name_to_wbm[tensor->name] = idx;
+    }
+    opencl_sched_register_once();
 
     // Pin 策略
     static const std::string s_pin_policy = []() {
