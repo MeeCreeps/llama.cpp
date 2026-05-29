@@ -45,6 +45,9 @@
 
 namespace {
 
+// fwd decls
+struct elastic_buffer_ctx;
+
 // ============================================================
 // 单例 elastic state（与 ggml-opencl 的对偶，简化版）
 // ============================================================
@@ -76,11 +79,74 @@ struct elastic_state {
     double   profile_compute_total_ms = 0.0;  // delegate compute 时间
     double   profile_overhead_total_ms = 0.0; // 其它（evict + bookkeeping）
     uint64_t profile_n_graph = 0;
+
+    // === Runtime scheduler integration ===
+    // name → wbm_idx for residency query / movement request from llama_context.
+    // bctx_by_idx allows movement request to find the backend handle on demand.
+    std::mutex                              sched_mtx;
+    std::unordered_map<std::string, int>    name_to_wbm;
+    std::unordered_map<int, elastic_buffer_ctx *> bctx_by_idx;
+    bool                                    sched_registered = false;
 };
 
 elastic_state * get_state() {
     static elastic_state s;
     return &s;
+}
+
+// === Static handlers exposed to llama-mmap registry (called by llama_context) ===
+// 单例 state 假设: 一个进程内仅有一个 elastic-cpu backend.
+bool elastic_sched_residency_query(const char *name, void * /*ud*/) {
+    auto *s = get_state();
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto it = s->name_to_wbm.find(name ? name : "");
+    if (it == s->name_to_wbm.end()) return false;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
+    return bm && bm->resident;
+}
+
+// 接到 ensure_block_resident / evict_blocks 的同步路径. 在 graph_compute
+// 流之外被调用 (e.g. llama_decode 的 scheduler hook), 必须线程安全.
+// 这里直接调 sync 版本 — backend_handle 是 region+offset 永久指针, 安全.
+extern void ensure_block_resident(elastic_state *s, int wbm_idx, void *backend_handle);
+extern void evict_blocks(elastic_state *s, elastic_buffer_ctx *bctx,
+                         const std::vector<int> &victims);
+
+int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
+    if (!name) return -1;
+    auto *s = get_state();
+    int idx = -1;
+    elastic_buffer_ctx *bctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;
+        idx = it->second;
+        auto bit = s->bctx_by_idx.find(idx);
+        if (bit != s->bctx_by_idx.end()) bctx = bit->second;
+    }
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -3;
+    if (evict) {
+        if (!bm->resident) return 0;
+        if (!bctx)         return -4;
+        evict_blocks(s, bctx, {idx});
+        s->n_evicts_total += 1;
+        return 0;
+    }
+    // prefetch
+    if (bm->resident) return 0;
+    if (!bm->backend_handle) return -5;
+    ensure_block_resident(s, idx, bm->backend_handle);
+    return 0;
+}
+
+void elastic_sched_register_once() {
+    auto *s = get_state();
+    if (s->sched_registered) return;
+    s->sched_registered = true;
+    llama_weight_residency_register(elastic_sched_residency_query, nullptr);
+    llama_weight_movement_register (elastic_sched_movement_request, nullptr);
 }
 
 // pinned 策略 / EMBED_OUTSIDE_BUDGET
@@ -348,6 +414,14 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
             elastic::wbm_touch(&s->wbm, idx, 0);
             bctx->tensor_to_wbm[tensor] = idx;
             while ((int)bctx->block_pinned.size() <= idx) bctx->block_pinned.push_back(false);
+
+            // Runtime scheduler 用的 name → idx 索引 + bctx 反查
+            {
+                std::lock_guard<std::mutex> lk(s->sched_mtx);
+                s->name_to_wbm[tensor->name] = idx;
+                s->bctx_by_idx[idx] = bctx;
+            }
+            elastic_sched_register_once();
 
             // pin policy
             std::string suf = tensor_suffix(tensor->name);

@@ -222,6 +222,62 @@ int main(int argc, char ** argv) {
         });
     }
 
+    // ===== Demo: runtime scheduler (LLAMA_TEST_RUNTIME_SCHED=1) =====
+    // 每次 decode 之前 sample MemAvailable. 变化 >= LLAMA_RUNTIME_SCHED_THRESH_MB (默认 100)
+    // 触发回调. 回调演示:
+    //   - mem 下降时, 调 llama_weight_request_evict 把名字含 "ffn_up" 的 weight 主动 evict
+    //   - mem 上升时, 调 llama_weight_request_prefetch 把当前 layer 的 attn weight 预 load
+    //   - 同时切 op_schedule_fn 改路由 (mem 紧时 ffn→CPU 让 GPU 缓口气)
+    if (const char *e = std::getenv("LLAMA_TEST_RUNTIME_SCHED"); e && *e && *e != '0') {
+        int thresh = 100;
+        if (const char *t = std::getenv("LLAMA_RUNTIME_SCHED_THRESH_MB")) thresh = std::atoi(t);
+        llama_set_memory_watch_threshold(ctx, thresh);
+        struct rt_state { uint64_t n_fires = 0; uint64_t n_evict = 0; uint64_t n_pref = 0; };
+        static rt_state rs;
+
+        llama_set_scheduler(ctx, [](struct llama_context *c,
+                                     const struct llama_runtime_state *st,
+                                     void *ud) {
+            auto *s = (rt_state *)ud;
+            s->n_fires++;
+            LOG_INF("[runtime-sched] fire #%llu  decode_step=%llu  mem=%lld MB  delta=%+lld MB\n",
+                    (unsigned long long)s->n_fires,
+                    (unsigned long long)st->decode_step,
+                    (long long)st->mem_avail_mb, (long long)st->mem_delta_mb);
+            // Demo policy:
+            //   delta < -50 MB → 触发 ffn_up.* evict (释放 GPU buffer)
+            //   delta > +50 MB → 触发若干 attn_q.* prefetch (把空间利用起来)
+            const char *patterns_ev[] = { "ffn_up.weight" };
+            const char *patterns_pf[] = { "attn_q.weight", "attn_k.weight" };
+            if (st->mem_delta_mb < -50) {
+                for (int l = 0; l < 4; l++) {
+                    for (auto p : patterns_ev) {
+                        char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
+                        if (llama_weight_is_resident(c, nm)) {
+                            if (llama_weight_request_evict(c, nm) == 0) s->n_evict++;
+                        }
+                    }
+                }
+            } else if (st->mem_delta_mb > +50) {
+                for (int l = 0; l < 4; l++) {
+                    for (auto p : patterns_pf) {
+                        char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
+                        if (!llama_weight_is_resident(c, nm)) {
+                            if (llama_weight_request_prefetch(c, nm) == 0) s->n_pref++;
+                        }
+                    }
+                }
+            }
+        }, &rs);
+
+        std::atexit([]() {
+            LOG_INF("[runtime-sched] fires=%llu evicts=%llu prefetches=%llu\n",
+                    (unsigned long long)rs.n_fires,
+                    (unsigned long long)rs.n_evict,
+                    (unsigned long long)rs.n_pref);
+        });
+    }
+
     auto * mem = llama_get_memory(ctx);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

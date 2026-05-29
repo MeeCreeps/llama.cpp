@@ -103,3 +103,18 @@ int llama_pread_direct(const char * filename, void * dst, size_t file_offset, si
 typedef bool (*llama_weight_pin_fn_t)(const char * name, int layer, size_t byte_size, void * user_data);
 void llama_weight_pin_register(llama_weight_pin_fn_t fn, void * user_data);
 bool llama_weight_pin_query   (const char * name, int layer, size_t byte_size);
+
+// === Weight residency probe + movement request (shared across elastic backends) ===
+// elastic backends call _register on init, expose runtime state to user schedulers.
+// Public API (llama_weight_is_resident / _request_prefetch / _request_evict) lives
+// in llama.h and delegates here.
+typedef bool (*llama_weight_residency_fn_t)(const char * name, void * user_data);
+// evict=false → prefetch, evict=true → evict. Return 0 on enqueue OK, <0 fail.
+typedef int  (*llama_weight_movement_fn_t)(const char * name, bool evict, void * user_data);
+
+void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data);
+void llama_weight_movement_register (llama_weight_movement_fn_t  fn, void * user_data);
+
+// Public query/action used by llama_context.cpp.
+bool llama_weight_residency_query(const char * name);
+int  llama_weight_movement_request(const char * name, bool evict);

@@ -82,8 +82,14 @@ struct llama_context {
 
     void set_op_schedule(llama_op_schedule_fn fn, void * user_data);
     void set_weight_pin (llama_weight_pin_fn  fn, void * user_data);
+    void set_scheduler  (llama_scheduler_fn   fn, void * user_data);
+    void set_mem_watch_threshold(int mb);
     int  n_backends() const;
     const char * backend_name(int i) const;
+
+    // Fires the runtime scheduler if MemAvailable changed by ≥ threshold since last tick.
+    // Called pre-decode. Updates last_mem_avail_mb + decode_step.
+    void maybe_run_scheduler();
 
     void set_adapter_lora(
             llama_adapter_lora * adapter,
@@ -287,6 +293,13 @@ private:
     void *               op_schedule_ud  = nullptr;
     llama_weight_pin_fn  weight_pin_fn   = nullptr;
     void *               weight_pin_ud   = nullptr;
+
+    // Runtime scheduler — fired pre-decode when MemAvailable changes by ≥ threshold.
+    llama_scheduler_fn  scheduler_fn        = nullptr;
+    void *              scheduler_ud        = nullptr;
+    int                 mem_watch_threshold = 100;   // MB
+    int64_t             last_mem_avail_mb   = -1;    // -1 = never sampled
+    uint64_t            decode_step         = 0;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -944,6 +944,59 @@ extern "C" {
             llama_weight_pin_fn    fn,
             void *                 user_data);
 
+    // === Runtime dynamic scheduler ===
+    // Memory-change-triggered hook for joint op-backend + weight-movement decisions.
+    //
+    // 触发: 每次 llama_decode 之前 sample MemAvailable. 若 |delta| >= watch_threshold_mb
+    // 则调用 scheduler_fn. Scheduler 可在 callback 内调:
+    //   - llama_set_op_schedule  : 改 op-backend 决策函数 (下次 graph build 生效)
+    //   - llama_weight_request_prefetch / _evict : 即时入队 weight 搬运请求
+    //   - llama_weight_is_resident : 查询当前驻留状态
+    // 注册 scheduler 自动 graph_reuse_disable=true (保证 op-backend 决策每 token 重跑).
+
+    struct llama_runtime_state {
+        int64_t mem_avail_mb;       // current /proc/meminfo MemAvailable in MB
+        int64_t mem_avail_prev_mb;  // value at previous scheduler tick
+        int64_t mem_delta_mb;       // mem_avail_mb - mem_avail_prev_mb (signed)
+        uint64_t decode_step;       // monotonic decode counter (n tokens produced)
+    };
+
+    typedef void (*llama_scheduler_fn)(
+            struct llama_context *             ctx,
+            const struct llama_runtime_state * state,
+            void *                             user_data);
+
+    LLAMA_API void llama_set_scheduler(
+            struct llama_context * ctx,
+            llama_scheduler_fn     fn,
+            void *                 user_data);
+
+    // Threshold in MB. If |MemAvailable change| since last tick >= this, scheduler fires.
+    // Default 100 MB. Set to 0 to fire on every decode (most reactive but expensive).
+    LLAMA_API void llama_set_memory_watch_threshold(
+            struct llama_context * ctx,
+            int                    mb);
+
+    // Standalone query (no ctx needed) — reads /proc/meminfo MemAvailable in MB.
+    LLAMA_API int64_t llama_runtime_mem_avail_mb(void);
+
+    // Query if a weight tensor is currently resident on its assigned backend buffer.
+    // 接 ggml-cpu-elastic / ggml-opencl-elastic 的 weight buffer manager.
+    LLAMA_API bool llama_weight_is_resident(
+            struct llama_context * ctx,
+            const char *           tensor_name);
+
+    // Async request: 把 tensor_name 在下次 ensure_phase 之前预 load 进 backend 缓冲.
+    // 返 0 成功入队, <0 失败 (e.g. weight 不存在 / backend 不支持).
+    LLAMA_API int llama_weight_request_prefetch(
+            struct llama_context * ctx,
+            const char *           tensor_name);
+
+    // Async request: 把 tensor_name 从 backend 缓冲驱逐 (若 pinned 则 no-op).
+    LLAMA_API int llama_weight_request_evict(
+            struct llama_context * ctx,
+            const char *           tensor_name);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

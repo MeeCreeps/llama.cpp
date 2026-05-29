@@ -8,9 +8,13 @@
 #include "llama-model.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+// Forward decls for use before file-scope definitions later in this TU.
+static size_t read_mem_available_mb();
 
 //
 // llama_context
@@ -723,6 +727,46 @@ void llama_context::set_warmup(bool value) {
 void llama_context::set_op_schedule(llama_op_schedule_fn fn, void * user_data) {
     op_schedule_fn = fn;
     op_schedule_ud = user_data;
+    // Runtime op-backend decisions need fresh graph build each decode.
+    if (fn != nullptr && !graph_reuse_disable) {
+        graph_reuse_disable = true;
+        LLAMA_LOG_INFO("%s: op_schedule registered → graph_reuse_disable=1\n", __func__);
+    }
+}
+
+void llama_context::set_scheduler(llama_scheduler_fn fn, void * user_data) {
+    scheduler_fn = fn;
+    scheduler_ud = user_data;
+    if (fn != nullptr && !graph_reuse_disable) {
+        graph_reuse_disable = true;
+        LLAMA_LOG_INFO("%s: scheduler registered → graph_reuse_disable=1\n", __func__);
+    }
+}
+
+void llama_context::set_mem_watch_threshold(int mb) {
+    mem_watch_threshold = mb >= 0 ? mb : 0;
+}
+
+void llama_context::maybe_run_scheduler() {
+    decode_step++;
+    if (scheduler_fn == nullptr) {
+        return;
+    }
+    const int64_t cur = (int64_t) read_mem_available_mb();
+    const int64_t prev = last_mem_avail_mb;
+    const int64_t delta = (prev < 0) ? 0 : (cur - prev);
+
+    const bool first_tick = (prev < 0);
+    const bool exceeded = (std::abs((long long) delta) >= (long long) mem_watch_threshold);
+    if (first_tick || exceeded) {
+        llama_runtime_state st;
+        st.mem_avail_mb      = cur;
+        st.mem_avail_prev_mb = prev < 0 ? cur : prev;
+        st.mem_delta_mb      = delta;
+        st.decode_step       = decode_step;
+        scheduler_fn(this, &st, scheduler_ud);
+        last_mem_avail_mb = cur;
+    }
 }
 
 void llama_context::set_weight_pin(llama_weight_pin_fn fn, void * user_data) {
@@ -1004,6 +1048,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+
+    // Runtime scheduler hook — observes MemAvailable + fires user callback when
+    // delta ≥ threshold. Scheduler can mutate op_schedule_fn / call
+    // llama_weight_request_prefetch/_evict to influence this decode + next.
+    maybe_run_scheduler();
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2591,6 +2640,30 @@ void llama_set_op_schedule(llama_context * ctx, llama_op_schedule_fn fn, void * 
 
 void llama_set_weight_pin(llama_context * ctx, llama_weight_pin_fn fn, void * user_data) {
     ctx->set_weight_pin(fn, user_data);
+}
+
+void llama_set_scheduler(llama_context * ctx, llama_scheduler_fn fn, void * user_data) {
+    ctx->set_scheduler(fn, user_data);
+}
+
+void llama_set_memory_watch_threshold(llama_context * ctx, int mb) {
+    ctx->set_mem_watch_threshold(mb);
+}
+
+int64_t llama_runtime_mem_avail_mb(void) {
+    return (int64_t) read_mem_available_mb();
+}
+
+bool llama_weight_is_resident(llama_context * /*ctx*/, const char * tensor_name) {
+    return llama_weight_residency_query(tensor_name);
+}
+
+int llama_weight_request_prefetch(llama_context * /*ctx*/, const char * tensor_name) {
+    return llama_weight_movement_request(tensor_name, /*evict=*/false);
+}
+
+int llama_weight_request_evict(llama_context * /*ctx*/, const char * tensor_name) {
+    return llama_weight_movement_request(tensor_name, /*evict=*/true);
 }
 
 int llama_n_backends(const llama_context * ctx) {

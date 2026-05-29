@@ -727,6 +727,47 @@ bool llama_weight_pin_query(const char * name, int layer, size_t byte_size) {
     return fn(name, layer, byte_size, ud);
 }
 
+// === Weight residency probe + movement request registry ===
+namespace {
+std::mutex                    g_weight_res_mtx;
+llama_weight_residency_fn_t   g_weight_res_fn = nullptr;
+void *                        g_weight_res_ud = nullptr;
+llama_weight_movement_fn_t    g_weight_mov_fn = nullptr;
+void *                        g_weight_mov_ud = nullptr;
+}
+void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_res_fn = fn;
+    g_weight_res_ud = user_data;
+}
+void llama_weight_movement_register(llama_weight_movement_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_mov_fn = fn;
+    g_weight_mov_ud = user_data;
+}
+bool llama_weight_residency_query(const char * name) {
+    llama_weight_residency_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        fn = g_weight_res_fn;
+        ud = g_weight_res_ud;
+    }
+    if (!fn) return false;
+    return fn(name, ud);
+}
+int llama_weight_movement_request(const char * name, bool evict) {
+    llama_weight_movement_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        fn = g_weight_mov_fn;
+        ud = g_weight_mov_ud;
+    }
+    if (!fn) return -1;
+    return fn(name, evict, ud);
+}
+
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {
     mmap_registry_add(pimpl->addr, pimpl->size, mmap_file_path(file));
 }
