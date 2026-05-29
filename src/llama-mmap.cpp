@@ -702,6 +702,31 @@ static std::string mmap_file_path(struct llama_file *f) {
     return std::string(buf);
 }
 
+// === Weight pin schedule registry (cross-translation-unit hook) ===
+// elastic backends 在 pin 决策时调 llama_weight_pin_query. 默认空 = 让 elastic
+// 按 env 的 PIN policy 决定. 设置 callback → callback 优先.
+namespace {
+std::mutex             g_weight_pin_mtx;
+llama_weight_pin_fn_t  g_weight_pin_fn = nullptr;
+void *                 g_weight_pin_ud = nullptr;
+}
+void llama_weight_pin_register(llama_weight_pin_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_pin_mtx);
+    g_weight_pin_fn = fn;
+    g_weight_pin_ud = user_data;
+}
+bool llama_weight_pin_query(const char * name, int layer, size_t byte_size) {
+    llama_weight_pin_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_pin_mtx);
+        fn = g_weight_pin_fn;
+        ud = g_weight_pin_ud;
+    }
+    if (!fn) return false;
+    return fn(name, layer, byte_size, ud);
+}
+
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {
     mmap_registry_add(pimpl->addr, pimpl->size, mmap_file_path(file));
 }

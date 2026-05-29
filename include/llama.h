@@ -909,6 +909,41 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    //
+    // Op-level dynamic scheduling (Schedule interface, replaces env-strategies)
+    //
+    // 每次 build_graph 时, per-tensor 调 fn(node, name, layer, user_data) → backend_id.
+    // -1 = 用 ggml-sched 默认决策. 否则 backend index 0..n-1 (用 llama_n_backends 拿).
+    // 设计用途: 接 LP solver / 自定义 schedule logic. user_data 透传上下文.
+    typedef int (*llama_op_schedule_fn)(
+            const struct ggml_tensor * node,
+            const char *               name,    // tensor 名 (e.g. "Qcur-3")
+            int                        layer,   // -1 = no layer
+            void *                     user_data);
+
+    LLAMA_API void llama_set_op_schedule(
+            struct llama_context * ctx,
+            llama_op_schedule_fn   fn,
+            void *                 user_data);
+
+    // 列出可用 backends (CPU + GPU 等). schedule callback 用 backend_id 索引到这.
+    LLAMA_API int          llama_n_backends   (const struct llama_context * ctx);
+    LLAMA_API const char * llama_backend_name (const struct llama_context * ctx, int i);
+
+    // Weight residence schedule. 每次 elastic backend 决定哪些 weight 驻留前调.
+    // 返回 true → pin (永不 evict), false → 让 elastic 按 budget 决策.
+    // 给 schedule (LP solver 之类) 一个机会显式 override pin/evict.
+    typedef bool (*llama_weight_pin_fn)(
+            const char * tensor_name,   // e.g. "blk.5.ffn_down.weight"
+            int          layer,
+            size_t       byte_size,
+            void *       user_data);
+
+    LLAMA_API void llama_set_weight_pin(
+            struct llama_context * ctx,
+            llama_weight_pin_fn    fn,
+            void *                 user_data);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

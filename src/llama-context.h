@@ -80,6 +80,11 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    void set_op_schedule(llama_op_schedule_fn fn, void * user_data);
+    void set_weight_pin (llama_weight_pin_fn  fn, void * user_data);
+    int  n_backends() const;
+    const char * backend_name(int i) const;
+
     void set_adapter_lora(
             llama_adapter_lora * adapter,
             float scale);
@@ -275,6 +280,13 @@ private:
     // Counter incremented per build_graph call (== per decode batch).
     uint64_t    op_sched_counter = 0;
     std::string op_sched_strategy;  // empty = disabled
+
+    // Schedule callbacks (set via llama_set_op_schedule / llama_set_weight_pin).
+    // 优先级高于 env strategies — fn 非空且返回 valid id 时覆盖.
+    llama_op_schedule_fn op_schedule_fn  = nullptr;
+    void *               op_schedule_ud  = nullptr;
+    llama_weight_pin_fn  weight_pin_fn   = nullptr;
+    void *               weight_pin_ud   = nullptr;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

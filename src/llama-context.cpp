@@ -715,6 +715,24 @@ void llama_context::set_warmup(bool value) {
     cparams.warmup = value;
 }
 
+void llama_context::set_op_schedule(llama_op_schedule_fn fn, void * user_data) {
+    op_schedule_fn = fn;
+    op_schedule_ud = user_data;
+}
+
+void llama_context::set_weight_pin(llama_weight_pin_fn fn, void * user_data) {
+    weight_pin_fn = fn;
+    weight_pin_ud = user_data;
+    // 同时注册到全局让 elastic backends 能查 (跨 translation unit)
+    llama_weight_pin_register((llama_weight_pin_fn_t)fn, user_data);
+}
+
+int llama_context::n_backends() const { return (int)backends.size(); }
+const char * llama_context::backend_name(int i) const {
+    if (i < 0 || i >= (int)backends.size()) return nullptr;
+    return ggml_backend_name(backends[i].get());
+}
+
 void llama_context::set_adapter_lora(
             llama_adapter_lora * adapter,
             float scale) {
@@ -1545,7 +1563,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
 
         // ===== Op-level dynamic scheduler =====
-        if (!self->op_sched_strategy.empty() && cur->op == GGML_OP_MUL_MAT) {
+        // 优先: 注册的 callback (LP solver / 自定义). 其次: env strategy.
+        if (self->op_schedule_fn) {
+            int bid = self->op_schedule_fn(cur, name, il, self->op_schedule_ud);
+            if (bid >= 0 && bid < (int)backends.size()) {
+                ggml_backend_t target = backends[bid].get();
+                if (ggml_backend_supports_op(target, cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+                }
+            }
+        } else if (!self->op_sched_strategy.empty() && cur->op == GGML_OP_MUL_MAT) {
             ggml_backend_t target = nullptr;
             ggml_backend_t gpu = nullptr;
             for (const auto &b : backends) {
@@ -2551,6 +2578,22 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_op_schedule(llama_context * ctx, llama_op_schedule_fn fn, void * user_data) {
+    ctx->set_op_schedule(fn, user_data);
+}
+
+void llama_set_weight_pin(llama_context * ctx, llama_weight_pin_fn fn, void * user_data) {
+    ctx->set_weight_pin(fn, user_data);
+}
+
+int llama_n_backends(const llama_context * ctx) {
+    return ctx->n_backends();
+}
+
+const char * llama_backend_name(const llama_context * ctx, int i) {
+    return ctx->backend_name(i);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

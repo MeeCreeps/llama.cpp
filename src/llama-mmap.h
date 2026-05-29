@@ -93,3 +93,13 @@ llama_mmap_registry_entry llama_mmap_registry_find(const void * host_ptr);
 // 路径为 filename 的文件: lazy 开 O_DIRECT fd, 对齐 bounce buffer, pread.
 // 返 0 成功, <0 失败.
 int llama_pread_direct(const char * filename, void * dst, size_t file_offset, size_t len);
+
+// === Weight pin schedule hook (shared with llama-context API) ===
+// elastic backends call llama_weight_pin_query during pin decision. Returns true
+// → force pin. Default = false (let elastic budget decide). LP solver / 自定义 schedule
+// 通过 llama_set_weight_pin (公开 API in llama.h) 注册 callback. 见
+// llama-context.cpp::llama_set_weight_pin.
+#include <cstddef>
+typedef bool (*llama_weight_pin_fn_t)(const char * name, int layer, size_t byte_size, void * user_data);
+void llama_weight_pin_register(llama_weight_pin_fn_t fn, void * user_data);
+bool llama_weight_pin_query   (const char * name, int layer, size_t byte_size);

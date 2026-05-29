@@ -358,6 +358,12 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 if (contains("q") && suf == "attn_q") should_pin = true;
                 if (contains("o") && suf == "attn_output") should_pin = true;
             }
+            // 外部 schedule hook (LP solver / 自定义): callback 返回 true 则覆盖 env policy
+            // 也强制 pin. callback 为空时 fall back 到 env policy. 不允许 callback 解 pin
+            // (env pin 是基线), 但允许 callback 额外 pin.
+            if (llama_weight_pin_query(tensor->name, -1, size)) {
+                should_pin = true;
+            }
             if (should_pin) {
                 elastic::wbm_set_pinned(&s->wbm, idx, true);
                 bctx->block_pinned[idx] = true;
