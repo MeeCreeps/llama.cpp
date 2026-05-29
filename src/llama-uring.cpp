@@ -221,5 +221,31 @@ stats get_stats() {
     return { g_ring.n_submitted, g_ring.n_completed };
 }
 
+int wait_n(int n_to_wait) {
+    std::lock_guard<std::mutex> lk(g_ring.mtx);
+    if (g_ring.ring_fd < 0) return 0;
+    int drained = 0;
+    while (drained < n_to_wait && g_ring.n_inflight > 0) {
+        sys_io_uring_enter(g_ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+        unsigned chead = __atomic_load_n(g_ring.cq_head, __ATOMIC_ACQUIRE);
+        unsigned ctail = __atomic_load_n(g_ring.cq_tail, __ATOMIC_ACQUIRE);
+        while (chead != ctail && drained < n_to_wait) {
+            struct io_uring_cqe *cqe = &g_ring.cqes[chead & *g_ring.cq_mask];
+            if (cqe->res < 0) fprintf(stderr, "[uring] CQE err: res=%d\n", cqe->res);
+            chead++;
+            drained++;
+            g_ring.n_inflight--;
+            g_ring.n_completed++;
+        }
+        __atomic_store_n(g_ring.cq_head, chead, __ATOMIC_RELEASE);
+    }
+    return drained;
+}
+
+int inflight() {
+    std::lock_guard<std::mutex> lk(g_ring.mtx);
+    return (int)g_ring.n_inflight;
+}
+
 } // namespace llama_uring
 #endif

@@ -612,37 +612,76 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                 }
             }
         };
-        auto mark_pending_resident = [&](std::vector<std::pair<int,size_t>> &pending) {
-            llama_uring::wait_all();
-            for (auto &p : pending) {
-                int idx = p.first;
+        // Wait for first `n` completions, mark those pending blocks resident.
+        // Uses io_uring wait_n so future-chunk submissions stay in-flight.
+        auto mark_first_n_resident = [&](std::vector<std::pair<int,size_t>> &pending, int n) {
+            if (n <= 0 || pending.empty()) return;
+            llama_uring::wait_n(n);
+            for (int i = 0; i < n && i < (int)pending.size(); ++i) {
+                int idx = pending[i].first;
                 const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
                 if (bm && bm->backend_handle) {
                     elastic::wbm_mark_resident(&s->wbm, idx, bm->backend_handle);
                     s->n_reloads_total += 1;
-                    s->bytes_reloaded_total += p.second;
+                    s->bytes_reloaded_total += pending[i].second;
                 }
             }
-            pending.clear();
+            pending.erase(pending.begin(), pending.begin() + std::min(n, (int)pending.size()));
         };
+
+        // GGML_ELASTIC_URING_LOOKAHEAD=K: 预提交 K 个 chunk 的 IO 让 kernel 用 UFS
+        // queue depth>1 并行处理. K=1 (default) = 上面老行为. K=2-4 让 disk read
+        // 跟 compute 更深 pipeline.
+        static const int s_lookahead = []() {
+            const char *e = std::getenv("GGML_ELASTIC_URING_LOOKAHEAD");
+            return (e && *e) ? std::max(1, std::atoi(e)) : 1;
+        }();
 
         int i0 = 0, i1 = std::min(s_chunk_size, n_nodes);
         ensure_chunk_sync(i0, i1);  // first chunk fully sync
         pick_some_ctx(cgraph->nodes[i0]);
 
         ggml_status st_chunk = GGML_STATUS_SUCCESS;
-        std::vector<std::pair<int,size_t>> pending;  // uring path
+        // Per chunk pending list. pending[k] = chunks N+1, N+2, ..., N+lookahead.
+        // Index 0 always = next chunk's pending (to wait before computing next).
+        std::vector<std::vector<std::pair<int,size_t>>> pending_q;
+
+        // Initial: pre-submit lookahead chunks 1..lookahead
+        if (s_uring) {
+            int sub_i = i1;
+            for (int la = 0; la < s_lookahead && sub_i < n_nodes; ++la) {
+                int e = std::min(sub_i + s_chunk_size, n_nodes);
+                pending_q.emplace_back();
+                ensure_chunk_uring_submit(sub_i, e, pending_q.back());
+                sub_i = e;
+            }
+        }
+        // Track next submission point (one past last pre-submitted chunk)
+        int next_sub_i0 = i1 + s_chunk_size * (int)pending_q.size();
 
         while (i0 < n_nodes) {
             const int next_i0 = i1;
             const int next_i1 = std::min(i1 + s_chunk_size, n_nodes);
 
             if (s_uring) {
-                // io_uring path: submit next chunk's reads, then compute current
-                if (next_i0 < n_nodes) ensure_chunk_uring_submit(next_i0, next_i1, pending);
+                // Submit chunk lookahead-ahead (if any left), so UFS queue stays deep
+                int new_sub_end = std::min(next_sub_i0 + s_chunk_size, n_nodes);
+                if (next_sub_i0 < n_nodes) {
+                    pending_q.emplace_back();
+                    ensure_chunk_uring_submit(next_sub_i0, new_sub_end, pending_q.back());
+                    next_sub_i0 = new_sub_end;
+                }
+
+                // Compute current chunk in parallel with kernel processing pre-submitted IOs
                 struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
                 st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
-                if (!pending.empty()) mark_pending_resident(pending);
+
+                // Wait for next chunk's IO (front of pending_q) before computing it next iter
+                if (!pending_q.empty()) {
+                    int n_to_wait = (int)pending_q.front().size();
+                    mark_first_n_resident(pending_q.front(), n_to_wait);
+                    pending_q.erase(pending_q.begin());
+                }
             } else {
                 // worker thread path (fallback, 默认)
                 std::thread worker;

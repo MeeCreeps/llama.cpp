@@ -23,6 +23,14 @@ int submit_pread_aligned(const char *filename, void *dst, size_t file_offset, si
 // Returns # completed.
 int wait_all();
 
+// Wait until at least N completions have arrived since last drain. Lets caller
+// submit more requests after this returns while N+ are still pending in kernel.
+// Used for multi-chunk lookahead pipelining.
+int wait_n(int n_to_wait);
+
+// Current in-flight count (submitted but not completed).
+int inflight();
+
 // Stats
 struct stats {
     uint64_t n_submitted;
