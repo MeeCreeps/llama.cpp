@@ -262,6 +262,11 @@ llama_context::llama_context(
             model.params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
+        // LLAMA_FORCE_PIPELINE_PARALLEL=1 强制开 (单 GPU + CPU 也试 multi-buffer 跨 decode pipeline)
+        if (const char *e = std::getenv("LLAMA_FORCE_PIPELINE_PARALLEL"); e && *e && *e != '0') {
+            pipeline_parallel = true;
+            LLAMA_LOG_INFO("%s: pipeline_parallel forced ON via env\n", __func__);
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
