@@ -20,6 +20,7 @@
 #endif
 #include <CL/cl.h>
 
+#include <functional>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,21 @@
 #include "weight_buffer_manager.h"
 
 namespace elastic {
+
+// SOA-aware evict/reload 回调. set_tensor 完成 SOA-split 后注册, ensure/evict
+// 命中此 idx 时改走回调路径 (默认 cl_mem create+write 重建 SOA layout 错). 详见
+// wbmcl_register_soa.
+struct soa_callbacks {
+    std::function<int()> evict_fn;
+    std::function<int()> reload_fn;
+};
+
+// SOA pool entry: parent buffer + d/q sub-buffer 一起回收避免重建子视图开销.
+struct soa_pool_entry {
+    void *parent = nullptr;
+    void *d      = nullptr;
+    void *q      = nullptr;
+};
 
 struct wbm_opencl_ctx {
     weight_buffer_manager *wbm;           // 不持有所有权
@@ -61,7 +77,18 @@ struct wbm_opencl_ctx {
     size_t bytes_evicted_total;           // 历史累计释放字节
     int    n_creates;                     // clCreateBuffer 调用次数
     int    n_releases;                    // clReleaseMemObject 调用次数
+
+    // SOA: per-idx 回调 + 按 size 复用 parent+d+q triple + 共享 staging buffer.
+    std::unordered_map<int, soa_callbacks>             soa_per_idx;
+    std::unordered_map<size_t, std::vector<soa_pool_entry>> soa_pool_by_size;
+    cl_mem            soa_staging          = nullptr;
+    size_t            soa_staging_capacity = 0;
+    cl_event          soa_staging_last_use_ev = nullptr;
 };
+
+void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
+                        std::function<int()> evict_fn,
+                        std::function<int()> reload_fn);
 
 // 绑定一个已存在的 WBM 和 OpenCL 上下文。不接管 cl_context / queue 的生命周期，
 // 调用方仍负责销毁。xfer_queue 可传 nullptr，此时 prefetch / 同步上传走

@@ -1485,6 +1485,10 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+    if (std::getenv("LLAMA_OP_SCHED_DEBUG")) {
+        fprintf(stderr, "[op-sched] post-compute graph splits = %d\n",
+                ggml_backend_sched_get_n_splits(sched.get()));
+    }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
@@ -1553,7 +1557,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
             } else if (strat == "all-gpu" && gpu) {
                 target = gpu;
             } else if (strat == "alternate") {
-                target = (self->op_sched_counter % 2 == 0)
+                // per-OP alternate: graph 内每个 MUL_MAT 轮换 backend, 强制 activation
+                // 跨 backend 流动. ggml-sched 自动插 GPU↔CPU copy ops.
+                static thread_local uint64_t op_idx = 0;
+                target = ((op_idx++) % 2 == 0)
                        ? backend_cpu : (gpu ? gpu : backend_cpu);
             } else if (strat == "memory" && gpu) {
                 size_t avail = read_mem_available_mb();
@@ -1565,8 +1572,29 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 if (b && !strcmp(b, "gpu") && gpu) target = gpu;
                 else if (b) target = backend_cpu;
             }
-            if (target && ggml_backend_supports_op(target, cur)) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+            if (target) {
+                static int dbg_cnt[2] = {0,0};
+                static const bool dbg = std::getenv("LLAMA_OP_SCHED_DEBUG") != nullptr;
+                bool supported = ggml_backend_supports_op(target, cur);
+                if (dbg && dbg_cnt[0]+dbg_cnt[1] < 200) {
+                    fprintf(stderr, "[op-sched] node=%s op=%s target=%s supported=%d\n",
+                            name, ggml_op_name(cur->op),
+                            ggml_backend_name(target), (int)supported);
+                }
+                if (supported) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+                    dbg_cnt[target == backend_cpu ? 0 : 1] += 1;
+                } else {
+                    dbg_cnt[0] += 0; // unsupported
+                }
+                if (dbg) {
+                    static int last_print = 0;
+                    if (dbg_cnt[0]+dbg_cnt[1] - last_print >= 50) {
+                        fprintf(stderr, "[op-sched] cumulative cpu=%d gpu=%d\n",
+                                dbg_cnt[0], dbg_cnt[1]);
+                        last_print = dbg_cnt[0]+dbg_cnt[1];
+                    }
+                }
             }
         }
 
