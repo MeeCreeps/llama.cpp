@@ -1557,10 +1557,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (sched->callback_runtime_dispatch) {
             // === Runtime per-op dispatch with target-grouping ===
-            // 一次扫描 → 每个 op 解决 effective backend, cache 到 op_backend[].
-            // 然后 greedy 把连续 same-target ops 合成一段 sub-graph 一次 compute_async.
+            // 1. 一次扫描每个 op 调 hook 拿 target, cache op_backend[]
+            // 2. 安全检查: target backend 必须能读 op 的 inputs (buffer type 兼容).
+            //    不兼容则保持 split_backend (避免读 GPU 内存到 CPU 触发 garbage).
+            // 3. Greedy group 连续 same-target ops 一次 compute_async.
             const int n_nodes = split->graph.n_nodes;
             std::vector<ggml_backend_t> op_backend(n_nodes, nullptr);
+
+            // Helper: check whether all op's inputs are on buffers compatible with target backend.
+            auto inputs_compatible = [&](struct ggml_tensor * op, ggml_backend_t target) -> bool {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    struct ggml_tensor * src = op->src[s];
+                    if (!src) continue;
+                    ggml_backend_buffer_t buf = src->buffer;
+                    if (!buf) continue;
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+                    if (!ggml_backend_supports_buft(target, buft)) return false;
+                }
+                return true;
+            };
+
             for (int j = 0; j < n_nodes; j++) {
                 struct ggml_tensor * t = split->graph.nodes[j];
                 int tgt = sched->callback_runtime_dispatch(
@@ -1569,7 +1585,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_t b = split_backend;
                 if (tgt >= 0 && tgt < sched->n_backends
                     && tgt != split_backend_id
-                    && ggml_backend_supports_op(sched->backends[tgt], t)) {
+                    && ggml_backend_supports_op(sched->backends[tgt], t)
+                    && inputs_compatible(t, sched->backends[tgt])) {
                     b = sched->backends[tgt];
                 }
                 op_backend[j] = b;

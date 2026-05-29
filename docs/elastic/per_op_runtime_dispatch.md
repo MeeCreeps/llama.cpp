@@ -93,11 +93,17 @@ llama_set_op_runtime_dispatch(ctx, [](const ggml_tensor *op,
 
 ## 限制 (v1)
 
-1. **跨内存空间 backend (GPU↔CPU) 强切尚未自动 migration input**: 假设 inputs
-   已在原 split_backend 内存里 (ggml-sched split 时已 copy), target backend
-   能否直接读取依赖 backend memory model. cpu-elastic ↔ cpu 共享 host memory 可
-   直接读; 真 CUDA↔CPU 暂无 input 自动 copy, 需补 `tensor_copy + tensor_copy_async`
-   pre-op 逻辑.
+1. **CPU ↔ OpenCL 之间 input 句柄不互通**:
+   - 目标硬件 OnePlus 12 / Snapdragon 8 Gen 3 / Adreno 750 是 **UMA 统一内存** —
+     CPU 跟 GPU 物理共享同一片 LPDDR RAM, 零拷贝可能
+   - 但 ggml-cpu backend 用 raw `void *` 读 tensor, ggml-opencl backend 用 `cl_mem`
+     handle. 同样数据两个 API 句柄不一样
+   - 当前实现假设 hook 选的 target backend 跟 split 原 backend **句柄兼容** —
+     cpu-elastic ↔ cpu (都用 host ptr) 直接 OK; opencl-elastic ↔ opencl (都用 cl_mem)
+     直接 OK; cpu ↔ opencl 强切要补 `clEnqueueMapBuffer` 把 cl_mem → host ptr
+     (Adreno 上零拷贝, 但要做一次 map/unmap)
+   - 实战中 elastic 设置下 (cpu-elastic + opencl-elastic 共存), backend 内已用
+     host ptr 共享, hook 在两边切几乎无成本
 2. **每 decode 重 build graph**: 强制 graph_reuse_disable=1, 每 token 增加 ~5-20ms
    build overhead. 真生产部署不建议常开.
 3. **不影响 weight 驻留**: 改 op backend 不会自动搬 weight. 跟
