@@ -997,6 +997,29 @@ extern "C" {
             struct llama_context * ctx,
             const char *           tensor_name);
 
+    // === True per-op runtime dispatch ===
+    // 区别于 llama_set_op_schedule (graph-build 时一次性决策):
+    // 这个 hook 在每个 op COMPUTE 即将开始之前调, 可根据当前 runtime 状态
+    // (e.g., 上一 op 实测时间, queue depth, mem) 动态决定该 op 跑哪个 backend.
+    //
+    // 注册后强制 per-op 单 op 执行 (graph_compute 不再批量跑), 整体吞吐下降,
+    // 用于动态 routing 实验. 跟 llama_set_op_schedule 可同时用 (schedule 决定
+    // graph 默认 routing, dispatch hook 在 compute 时进一步覆盖).
+    //
+    // 返回值:
+    //   -1                  → 用 split 默认 backend
+    //   0..n_backends-1     → 强制路由到该 backend (若不支持该 op 会 fallback)
+    typedef int (*llama_op_runtime_dispatch_fn)(
+            const struct ggml_tensor * op,
+            int                        default_backend_id,
+            int                        n_backends,
+            void *                     user_data);
+
+    LLAMA_API void llama_set_op_runtime_dispatch(
+            struct llama_context *         ctx,
+            llama_op_runtime_dispatch_fn   fn,
+            void *                         user_data);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

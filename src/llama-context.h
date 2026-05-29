@@ -84,6 +84,7 @@ struct llama_context {
     void set_weight_pin (llama_weight_pin_fn  fn, void * user_data);
     void set_scheduler  (llama_scheduler_fn   fn, void * user_data);
     void set_mem_watch_threshold(int mb);
+    void set_op_runtime_dispatch(llama_op_runtime_dispatch_fn fn, void * user_data);
     int  n_backends() const;
     const char * backend_name(int i) const;
 
@@ -300,6 +301,11 @@ private:
     int                 mem_watch_threshold = 100;   // MB
     int64_t             last_mem_avail_mb   = -1;    // -1 = never sampled
     uint64_t            decode_step         = 0;
+
+    // True per-op runtime dispatch hook — called by ggml-sched compute_splits
+    // before each op compute. Plumbed via ggml_backend_sched_set_runtime_dispatch.
+    llama_op_runtime_dispatch_fn op_runtime_dispatch_fn = nullptr;
+    void *                       op_runtime_dispatch_ud = nullptr;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

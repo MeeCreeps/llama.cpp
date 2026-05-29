@@ -717,6 +717,12 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    // Runtime per-op dispatch hook (set via ggml_backend_sched_set_runtime_dispatch).
+    // 非 NULL 时强制 per-op iteration in compute_splits (类似 callback_eval 模式),
+    // 每个 op 之前调 fn 决定 target backend.
+    ggml_backend_sched_runtime_dispatch_fn callback_runtime_dispatch;
+    void * callback_runtime_dispatch_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1549,7 +1555,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (sched->callback_runtime_dispatch) {
+            // === Runtime per-op dispatch ===
+            // 每个 op 单独 compute, hook 决定每个 op 跑哪个 backend.
+            // 若 hook 返回 -1 或 target 不支持该 op, 用 split 默认 backend.
+            for (int j = 0; j < split->graph.n_nodes; j++) {
+                struct ggml_tensor * t = split->graph.nodes[j];
+                int target_id = sched->callback_runtime_dispatch(
+                        t, split_backend_id, sched->n_backends,
+                        sched->callback_runtime_dispatch_user_data);
+                ggml_backend_t exec_backend = split_backend;
+                if (target_id >= 0 && target_id < sched->n_backends
+                    && target_id != split_backend_id
+                    && ggml_backend_supports_op(sched->backends[target_id], t)) {
+                    exec_backend = sched->backends[target_id];
+                    // Note: inputs/outputs may not be on target backend's memory;
+                    // 假设 inputs 已经 copy 到 split_backend (在前面 input copy 阶段
+                    // 处理过), 跨 backend 临时执行依赖 backend 支持 host-shared mem
+                    // 或 inputs 是 weight 类 (mmap / shared). 对于真正异构 (CUDA↔CPU)
+                    // 强切, 需要后续加 per-op input migration.
+                }
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, j + 1);
+                enum ggml_status ec = ggml_backend_graph_compute_async(exec_backend, &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+                if (exec_backend != split_backend) {
+                    // 同步保证 cross-backend op 数据可见
+                    ggml_backend_synchronize(exec_backend);
+                }
+            }
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1770,6 +1806,15 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_runtime_dispatch(
+        ggml_backend_sched_t                       sched,
+        ggml_backend_sched_runtime_dispatch_fn     fn,
+        void *                                     user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_runtime_dispatch = fn;
+    sched->callback_runtime_dispatch_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

@@ -743,6 +743,34 @@ void llama_context::set_scheduler(llama_scheduler_fn fn, void * user_data) {
     }
 }
 
+void llama_context::set_op_runtime_dispatch(llama_op_runtime_dispatch_fn fn, void * user_data) {
+    op_runtime_dispatch_fn = fn;
+    op_runtime_dispatch_ud = user_data;
+    // 把 hook 转发到 ggml-sched. Wrapper 在 ctx->sched 上注册.
+    static thread_local llama_context * s_active_ctx_for_dispatch = nullptr;
+    s_active_ctx_for_dispatch = this;
+    if (sched) {
+        struct DispatchTrampoline {
+            static int call(const struct ggml_tensor * op,
+                            int default_backend_id, int n_backends, void * ud) {
+                auto * ctx = (llama_context *) ud;
+                if (!ctx->op_runtime_dispatch_fn) return -1;
+                return ctx->op_runtime_dispatch_fn(op, default_backend_id,
+                                                   n_backends,
+                                                   ctx->op_runtime_dispatch_ud);
+            }
+        };
+        ggml_backend_sched_set_runtime_dispatch(
+                sched.get(),
+                fn ? DispatchTrampoline::call : nullptr,
+                this);
+    }
+    if (fn != nullptr && !graph_reuse_disable) {
+        graph_reuse_disable = true;
+        LLAMA_LOG_INFO("%s: op_runtime_dispatch registered → graph_reuse_disable=1\n", __func__);
+    }
+}
+
 void llama_context::set_mem_watch_threshold(int mb) {
     mem_watch_threshold = mb >= 0 ? mb : 0;
 }
@@ -2644,6 +2672,10 @@ void llama_set_weight_pin(llama_context * ctx, llama_weight_pin_fn fn, void * us
 
 void llama_set_scheduler(llama_context * ctx, llama_scheduler_fn fn, void * user_data) {
     ctx->set_scheduler(fn, user_data);
+}
+
+void llama_set_op_runtime_dispatch(llama_context * ctx, llama_op_runtime_dispatch_fn fn, void * user_data) {
+    ctx->set_op_runtime_dispatch(fn, user_data);
 }
 
 void llama_set_memory_watch_threshold(llama_context * ctx, int mb) {

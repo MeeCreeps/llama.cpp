@@ -336,6 +336,58 @@ int main(int argc, char ** argv) {
         });
     }
 
+    // ===== Demo: TRUE per-op runtime dispatch (LLAMA_TEST_OP_RUNTIME_DISPATCH=1) =====
+    // 真 runtime per-op 决策: 每个 op 即将 compute 前 hook 触发, 可基于当前 state
+    // (上一 op 时间, op 计数器, 当前 op 类型) 即时选 backend.
+    // 这跟 op_schedule 区别在: op_schedule 在 graph build 时跑一次, 决策固化进
+    // graph splits; runtime_dispatch 每个 op 都跑, 决策影响 compute 那一刻.
+    if (const char *e = std::getenv("LLAMA_TEST_OP_RUNTIME_DISPATCH"); e && *e && *e != '0') {
+        struct dispatch_state {
+            uint64_t n_calls       = 0;
+            uint64_t n_overrides   = 0;
+            uint64_t n_mulmat      = 0;
+            uint64_t n_mulmat_cpu  = 0;
+            uint64_t n_mulmat_gpu  = 0;
+            int cpu_id = 0;
+            int gpu_id = -1;
+        };
+        static dispatch_state ds;
+        ds.cpu_id = llama_n_backends(ctx) - 1;
+        ds.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+
+        // Policy: mul_mat 每偶数 op 强制 CPU, 奇数 op 默认 (= split 决定);
+        //         非 mul_mat 不动. 演示 per-op 粒度切换的 effect.
+        llama_set_op_runtime_dispatch(ctx, [](const struct ggml_tensor *op,
+                                                int default_backend_id, int n_backends,
+                                                void *ud) -> int {
+            auto *s = (dispatch_state *)ud;
+            s->n_calls++;
+            if (op && op->op == GGML_OP_MUL_MAT) {
+                s->n_mulmat++;
+                // 每偶数 mul_mat 路由到 CPU
+                int target = (s->n_mulmat % 2 == 0) ? s->cpu_id : -1;
+                if (target == s->cpu_id) {
+                    s->n_mulmat_cpu++;
+                    if (target != default_backend_id) s->n_overrides++;
+                    return target;
+                } else {
+                    s->n_mulmat_gpu++;
+                }
+            }
+            (void)n_backends;
+            return -1;
+        }, &ds);
+
+        std::atexit([]() {
+            LOG_INF("[op-runtime-dispatch] calls=%llu overrides=%llu  mul_mat(total=%llu cpu=%llu gpu=%llu)\n",
+                    (unsigned long long)ds.n_calls,
+                    (unsigned long long)ds.n_overrides,
+                    (unsigned long long)ds.n_mulmat,
+                    (unsigned long long)ds.n_mulmat_cpu,
+                    (unsigned long long)ds.n_mulmat_gpu);
+        });
+    }
+
     auto * mem = llama_get_memory(ctx);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

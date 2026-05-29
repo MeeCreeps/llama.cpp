@@ -339,6 +339,28 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // === Runtime per-op dispatch ===
+    // 在每个 op 即将 compute 前调一次, hook 返回 target backend_id 可覆盖 split
+    // 预分配的 backend. 跟 set_eval_callback 一样会强制 per-op 拆开 graph compute
+    // (一次一个 op 跑), 所以打开后整体 throughput 会下降. 用于动态 routing 实验.
+    //
+    // 返回值:
+    //   -1                  → 用 default (split 原本的 backend)
+    //   0..n_backends-1     → 强制路由到该 backend
+    //
+    // 注意: target backend 若不支持该 op 会静默 fallback 到 default
+    //       (ggml_backend_supports_op 检查).
+    typedef int (*ggml_backend_sched_runtime_dispatch_fn)(
+            const struct ggml_tensor * op,
+            int                        default_backend_id,
+            int                        n_backends,
+            void *                     user_data);
+
+    GGML_API void                 ggml_backend_sched_set_runtime_dispatch(
+            ggml_backend_sched_t                       sched,
+            ggml_backend_sched_runtime_dispatch_fn     fn,
+            void *                                     user_data);
+
     //
     // Utils
     //
