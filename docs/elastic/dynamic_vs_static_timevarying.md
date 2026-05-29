@@ -40,3 +40,28 @@ mobile OS memory pressure 变化 (后台 app 启停). Static worst-case 配置�
 90% 时段可用内存. Dynamic 让推理"随波逐流".
 
 CSV: `b_dynamic.csv`, `b_static_safe.csv`. 格式 `t_ms,B_MB`.
+
+## 内存压力下 (5GB eater) 复测
+
+| | r1 | r2 | r3 | min | avg |
+|---|---:|---:|---:|----:|----:|
+| static-safe (const 2000) | 2909 | 2388 | 2543 | 2388 | 2614 |
+| dynamic | 2563 | 2575 | 2465 | 2465 | 2534 |
+
+Dynamic 仅快 3% (跟无压力时 3.4× 形成对比).
+
+### 原因
+
+无压力: dynamic 在 B(t)=5000 段能真把更多 weight 装 RAM → 速度起飞
+有压力: OS 强制限制总驻留 ≤ 系统空闲, 我们的 budget 是软指标; kernel 还是会
+        swap/evict, dynamic 多配的 budget 兑现不了
+
+### 实际意义
+
+Dynamic budget 是**机会主义**优化: 没人抢内存时吃满 RAM, 系统紧张时退化到 static.
+不能"保护"应用免受系统压力, 只能在好场景下利用闲置内存.
+
+适用 mobile inference 场景判断:
+- 系统空闲: dynamic 大胜 static-safe (3-4×)
+- 系统紧张: 两者持平
+- 综合: 默认开 dynamic 总比 static-safe 不亏
