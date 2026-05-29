@@ -232,38 +232,93 @@ int main(int argc, char ** argv) {
         int thresh = 100;
         if (const char *t = std::getenv("LLAMA_RUNTIME_SCHED_THRESH_MB")) thresh = std::atoi(t);
         llama_set_memory_watch_threshold(ctx, thresh);
-        struct rt_state { uint64_t n_fires = 0; uint64_t n_evict = 0; uint64_t n_pref = 0; };
+        struct rt_state {
+            uint64_t n_fires = 0;
+            uint64_t n_evict = 0;
+            uint64_t n_pref  = 0;
+            // op-backend routing state (mutated by scheduler):
+            int      cpu_id = -1;
+            int      gpu_id = -1;
+            int      ffn_target = -1;   // 当前 ffn op 目标 backend, -1 = default
+            uint64_t n_ffn_to_cpu = 0;
+            uint64_t n_ffn_to_gpu = 0;
+            uint64_t n_op_calls  = 0;
+        };
         static rt_state rs;
+        rs.cpu_id = llama_n_backends(ctx) - 1;
+        rs.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+
+        // op_schedule_fn 在每次 graph build 时跑 (graph_reuse_disable=1 由
+        // llama_set_scheduler 自动设). 它读 rs.ffn_target 决定 ffn 上哪个 backend.
+        llama_set_op_schedule(ctx, [](const struct ggml_tensor */*node*/, const char *name,
+                                       int /*layer*/, void *ud) -> int {
+            auto *s = (rt_state *)ud;
+            s->n_op_calls++;
+            if (!name) return -1;
+            if (strstr(name, "ffn")) {
+                if (s->ffn_target >= 0) {
+                    if (s->ffn_target == s->cpu_id) s->n_ffn_to_cpu++;
+                    else if (s->ffn_target == s->gpu_id) s->n_ffn_to_gpu++;
+                    return s->ffn_target;
+                }
+            }
+            return -1;
+        }, &rs);
 
         llama_set_scheduler(ctx, [](struct llama_context *c,
                                      const struct llama_runtime_state *st,
                                      void *ud) {
             auto *s = (rt_state *)ud;
             s->n_fires++;
-            LOG_INF("[runtime-sched] fire #%llu  decode_step=%llu  mem=%lld MB  delta=%+lld MB\n",
+
+            // Policy:
+            //   mem_avail < 4096 MB (紧): ffn → CPU 卸载 GPU 压力, evict ffn_up
+            //   mem_avail > 8192 MB (松): ffn → GPU 抢回去, 预 prefetch attn
+            //   中间区: 保持
+            //   LLAMA_RUNTIME_SCHED_LO_MB / _HI_MB 覆盖阈值
+            int lo = 4096, hi = 8192;
+            if (const char *e = std::getenv("LLAMA_RUNTIME_SCHED_LO_MB")) lo = std::atoi(e);
+            if (const char *e = std::getenv("LLAMA_RUNTIME_SCHED_HI_MB")) hi = std::atoi(e);
+            int new_target = s->ffn_target;
+            if (st->mem_avail_mb < lo) {
+                new_target = s->cpu_id;
+            } else if (st->mem_avail_mb > hi || st->decode_step == 1) {
+                new_target = s->gpu_id;
+            }
+            bool routing_changed = (new_target != s->ffn_target);
+            s->ffn_target = new_target;
+
+            LOG_INF("[runtime-sched] fire #%llu  step=%llu  mem=%lld MB  delta=%+lld MB  ffn→%s%s\n",
                     (unsigned long long)s->n_fires,
                     (unsigned long long)st->decode_step,
-                    (long long)st->mem_avail_mb, (long long)st->mem_delta_mb);
-            // Demo policy:
-            //   delta < -50 MB → 触发 ffn_up.* evict (释放 GPU buffer)
-            //   delta > +50 MB → 触发若干 attn_q.* prefetch (把空间利用起来)
-            const char *patterns_ev[] = { "ffn_up.weight" };
-            const char *patterns_pf[] = { "attn_q.weight", "attn_k.weight" };
-            if (st->mem_delta_mb < -50) {
-                for (int l = 0; l < 4; l++) {
-                    for (auto p : patterns_ev) {
-                        char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
-                        if (llama_weight_is_resident(c, nm)) {
-                            if (llama_weight_request_evict(c, nm) == 0) s->n_evict++;
+                    (long long)st->mem_avail_mb, (long long)st->mem_delta_mb,
+                    (s->ffn_target < 0 ? "default" :
+                     (s->ffn_target == s->cpu_id ? "CPU" : "GPU")),
+                    routing_changed ? " (CHANGED)" : "");
+
+            // Weight movement (仅在 LLAMA_RUNTIME_SCHED_WEIGHT_MOVE=1 时主动 evict/prefetch.
+            // 默认不动 weight, 因为粗 demo policy 会破坏 correctness — 真接 LP solver
+            // 时 weight 选择基于精确 use-序列, 安全.)
+            const bool wm_on = std::getenv("LLAMA_RUNTIME_SCHED_WEIGHT_MOVE") != nullptr;
+            if (wm_on) {
+                const char *patterns_ev[] = { "ffn_up.weight" };
+                const char *patterns_pf[] = { "attn_q.weight", "attn_k.weight" };
+                if (st->mem_delta_mb < -50) {
+                    for (int l = 0; l < 4; l++) {
+                        for (auto p : patterns_ev) {
+                            char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
+                            if (llama_weight_is_resident(c, nm)) {
+                                if (llama_weight_request_evict(c, nm) == 0) s->n_evict++;
+                            }
                         }
                     }
-                }
-            } else if (st->mem_delta_mb > +50) {
-                for (int l = 0; l < 4; l++) {
-                    for (auto p : patterns_pf) {
-                        char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
-                        if (!llama_weight_is_resident(c, nm)) {
-                            if (llama_weight_request_prefetch(c, nm) == 0) s->n_pref++;
+                } else if (st->mem_delta_mb > +50) {
+                    for (int l = 0; l < 4; l++) {
+                        for (auto p : patterns_pf) {
+                            char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s", l, p);
+                            if (!llama_weight_is_resident(c, nm)) {
+                                if (llama_weight_request_prefetch(c, nm) == 0) s->n_pref++;
+                            }
                         }
                     }
                 }
@@ -271,10 +326,13 @@ int main(int argc, char ** argv) {
         }, &rs);
 
         std::atexit([]() {
-            LOG_INF("[runtime-sched] fires=%llu evicts=%llu prefetches=%llu\n",
+            LOG_INF("[runtime-sched] fires=%llu evicts=%llu prefetches=%llu  ffn_routing(cpu=%llu gpu=%llu)  total_op_calls=%llu\n",
                     (unsigned long long)rs.n_fires,
                     (unsigned long long)rs.n_evict,
-                    (unsigned long long)rs.n_pref);
+                    (unsigned long long)rs.n_pref,
+                    (unsigned long long)rs.n_ffn_to_cpu,
+                    (unsigned long long)rs.n_ffn_to_gpu,
+                    (unsigned long long)rs.n_op_calls);
         });
     }
 
