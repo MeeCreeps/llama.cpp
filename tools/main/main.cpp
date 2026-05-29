@@ -135,6 +135,25 @@ int main(int argc, char ** argv) {
 
     std::vector<common_chat_msg> chat_msgs;
 
+    // Demo pin callback registered BEFORE model load so it's queried during weight setup.
+    // op-schedule callback registered AFTER load (needs ctx) — done below.
+    if (const char *e = std::getenv("LLAMA_TEST_SCHEDULE"); e && *e && *e != '0') {
+        extern void llama_weight_pin_register(bool (*)(const char *, int, size_t, void *), void *);
+        struct test_pin_state { uint64_t n_calls = 0; uint64_t n_pinned = 0; };
+        static test_pin_state ps;
+        llama_weight_pin_register([](const char *name, int /*layer*/, size_t byte_size, void *ud) -> bool {
+            auto *p = (test_pin_state *)ud;
+            p->n_calls++;
+            const bool pin = byte_size < 10 * 1024 * 1024;
+            if (pin) p->n_pinned++;
+            return pin;
+        }, &ps);
+        std::atexit([]() {
+            LOG_INF("[test-sched-pin] pin_calls=%llu pinned=%llu\n",
+                    (unsigned long long)ps.n_calls, (unsigned long long)ps.n_pinned);
+        });
+    }
+
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
     common_init_result llama_init = common_init_from_params(params);
@@ -145,6 +164,62 @@ int main(int argc, char ** argv) {
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
         return 1;
+    }
+
+    // ===== Demo: schedule callback (LLAMA_TEST_SCHEDULE=1) =====
+    // 演示 op-schedule + weight-pin callback API. 真实 LP solver 接入时用类似 pattern.
+    if (const char *e = std::getenv("LLAMA_TEST_SCHEDULE"); e && *e && *e != '0') {
+        struct test_sched_state {
+            int n_backends = 0;
+            int cpu_id = 0;     // 假定最后一个 backend = CPU (llama convention)
+            int gpu_id = 0;     // 假定第 0 个 = GPU (有 -ngl 时)
+            uint64_t n_op_calls = 0;
+            uint64_t n_pin_calls = 0;
+            uint64_t n_pinned = 0;
+            uint64_t n_to_cpu = 0;
+            uint64_t n_to_gpu = 0;
+        };
+        static test_sched_state ts;
+        ts.n_backends = llama_n_backends(ctx);
+        ts.cpu_id = ts.n_backends - 1;        // llama 约定 CPU 在最后
+        ts.gpu_id = (ts.n_backends > 1) ? 0 : -1;  // 第一个非 CPU
+        LOG_INF("[test-sched] registered. n_backends=%d cpu_id=%d gpu_id=%d\n",
+                ts.n_backends, ts.cpu_id, ts.gpu_id);
+        for (int i = 0; i < ts.n_backends; i++) {
+            LOG_INF("[test-sched] backend[%d] = %s\n", i, llama_backend_name(ctx, i));
+        }
+
+        // Op-schedule: attn ops 到 GPU, ffn ops 到 CPU (示意)
+        llama_set_op_schedule(ctx, [](const struct ggml_tensor *node, const char *name,
+                                       int layer, void *ud) -> int {
+            auto *s = (test_sched_state *)ud;
+            s->n_op_calls++;
+            if (s->gpu_id < 0) return -1;
+            // 简单规则: name 含 "attn" → GPU, 含 "ffn" → CPU, 其它默认
+            if (name && strstr(name, "attn")) { s->n_to_gpu++; return s->gpu_id; }
+            if (name && strstr(name, "ffn"))  { s->n_to_cpu++; return s->cpu_id; }
+            return -1;
+        }, &ts);
+
+        // Weight-pin: 大 weight (>=10 MB) 不 pin, 小的 pin (避免 reload)
+        llama_set_weight_pin(ctx, [](const char *name, int layer, size_t byte_size,
+                                       void *ud) -> bool {
+            auto *s = (test_sched_state *)ud;
+            s->n_pin_calls++;
+            const bool pin = byte_size < 10 * 1024 * 1024;  // < 10 MB → pin
+            if (pin) s->n_pinned++;
+            return pin;
+        }, &ts);
+
+        // 退出时打印统计
+        std::atexit([]() {
+            LOG_INF("[test-sched] stats: op_calls=%llu (cpu=%llu gpu=%llu) pin_calls=%llu pinned=%llu\n",
+                    (unsigned long long)ts.n_op_calls,
+                    (unsigned long long)ts.n_to_cpu,
+                    (unsigned long long)ts.n_to_gpu,
+                    (unsigned long long)ts.n_pin_calls,
+                    (unsigned long long)ts.n_pinned);
+        });
     }
 
     auto * mem = llama_get_memory(ctx);
