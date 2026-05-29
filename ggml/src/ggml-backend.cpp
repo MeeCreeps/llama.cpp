@@ -1556,34 +1556,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (sched->callback_runtime_dispatch) {
-            // === Runtime per-op dispatch ===
-            // 每个 op 单独 compute, hook 决定每个 op 跑哪个 backend.
-            // 若 hook 返回 -1 或 target 不支持该 op, 用 split 默认 backend.
-            for (int j = 0; j < split->graph.n_nodes; j++) {
-                struct ggml_tensor * t = split->graph.nodes[j];
-                int target_id = sched->callback_runtime_dispatch(
-                        t, split_backend_id, sched->n_backends,
+            // === Runtime per-op dispatch with target-grouping ===
+            // 每个 op 调 hook 拿 target backend, 连续 same-target ops 合成一段
+            // sub-graph 一次 compute_async, 减少 per-op 启动开销.
+            //
+            // 不支持 op 或 hook 返回 -1 用 split 默认 backend.
+            const int n_nodes = split->graph.n_nodes;
+            int j = 0;
+            while (j < n_nodes) {
+                struct ggml_tensor * t0 = split->graph.nodes[j];
+                int tgt0 = sched->callback_runtime_dispatch(
+                        t0, split_backend_id, sched->n_backends,
                         sched->callback_runtime_dispatch_user_data);
                 ggml_backend_t exec_backend = split_backend;
-                if (target_id >= 0 && target_id < sched->n_backends
-                    && target_id != split_backend_id
-                    && ggml_backend_supports_op(sched->backends[target_id], t)) {
-                    exec_backend = sched->backends[target_id];
-                    // Note: inputs/outputs may not be on target backend's memory;
-                    // 假设 inputs 已经 copy 到 split_backend (在前面 input copy 阶段
-                    // 处理过), 跨 backend 临时执行依赖 backend 支持 host-shared mem
-                    // 或 inputs 是 weight 类 (mmap / shared). 对于真正异构 (CUDA↔CPU)
-                    // 强切, 需要后续加 per-op input migration.
+                if (tgt0 >= 0 && tgt0 < sched->n_backends
+                    && tgt0 != split_backend_id
+                    && ggml_backend_supports_op(sched->backends[tgt0], t0)) {
+                    exec_backend = sched->backends[tgt0];
                 }
-                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, j + 1);
+                // Greedy extend while next op has same effective target
+                int k = j + 1;
+                while (k < n_nodes) {
+                    struct ggml_tensor * tk = split->graph.nodes[k];
+                    int tgtk = sched->callback_runtime_dispatch(
+                            tk, split_backend_id, sched->n_backends,
+                            sched->callback_runtime_dispatch_user_data);
+                    ggml_backend_t bk = split_backend;
+                    if (tgtk >= 0 && tgtk < sched->n_backends
+                        && tgtk != split_backend_id
+                        && ggml_backend_supports_op(sched->backends[tgtk], tk)) {
+                        bk = sched->backends[tgtk];
+                    }
+                    if (bk != exec_backend) break;
+                    k++;
+                }
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, k);
                 enum ggml_status ec = ggml_backend_graph_compute_async(exec_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
                 if (exec_backend != split_backend) {
-                    // 同步保证 cross-backend op 数据可见
+                    // 同步保证 cross-backend 数据可见. 同 backend 段不需要 sync.
                     ggml_backend_synchronize(exec_backend);
                 }
+                j = k;
             }
         } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
