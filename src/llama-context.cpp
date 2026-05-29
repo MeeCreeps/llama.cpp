@@ -1491,13 +1491,85 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+// Read /proc/meminfo MemAvailable in MB. Used by op-scheduler "memory" strategy.
+// Cached per call; cheap fopen+small read.
+static size_t read_mem_available_mb() {
+#if defined(__linux__) || defined(__ANDROID__)
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char buf[128];
+    size_t mb = 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (strncmp(buf, "MemAvailable:", 13) == 0) {
+            size_t kb;
+            if (sscanf(buf + 13, " %zu kB", &kb) == 1) mb = kb / 1024;
+            break;
+        }
+    }
+    fclose(fp);
+    return mb;
+#else
+    return 0;
+#endif
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    // Per-decode op-scheduler. env LLAMA_OP_SCHED chooses strategy. State held
+    // on llama_context (counter, last memory). Applied via set_tensor_backend
+    // on heavy-compute ops; weights stay on their original backend (we only move
+    // compute, not storage).
+    //
+    // Strategies (set via env):
+    //   ""              : default ggml-sched (current behavior)
+    //   "all-cpu"       : force MUL_MAT to CPU backend
+    //   "all-gpu"       : force MUL_MAT to first non-CPU backend (if exists)
+    //   "alternate"     : MUL_MAT round-robins between backends per decode
+    //   "memory"        : MemAvailable >= LLAMA_OP_SCHED_GPU_THRESH_MB → GPU, else CPU
+    //   "external"      : LLAMA_OP_SCHED_BACKEND env per decode chooses "cpu"/"gpu"
+    auto *self = const_cast<llama_context *>(this);
+    self->op_sched_counter += 1;
+    self->op_sched_strategy = []() {
+        const char *e = std::getenv("LLAMA_OP_SCHED");
+        return e ? std::string(e) : std::string();
+    }();
+
+    return [&, self](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
         }
+
+        // ===== Op-level dynamic scheduler =====
+        if (!self->op_sched_strategy.empty() && cur->op == GGML_OP_MUL_MAT) {
+            ggml_backend_t target = nullptr;
+            ggml_backend_t gpu = nullptr;
+            for (const auto &b : backends) {
+                if (b.get() != backend_cpu) { gpu = b.get(); break; }
+            }
+            const auto &strat = self->op_sched_strategy;
+            if (strat == "all-cpu") {
+                target = backend_cpu;
+            } else if (strat == "all-gpu" && gpu) {
+                target = gpu;
+            } else if (strat == "alternate") {
+                target = (self->op_sched_counter % 2 == 0)
+                       ? backend_cpu : (gpu ? gpu : backend_cpu);
+            } else if (strat == "memory" && gpu) {
+                size_t avail = read_mem_available_mb();
+                size_t thresh = 8000;
+                if (const char *t = std::getenv("LLAMA_OP_SCHED_GPU_THRESH_MB")) thresh = atoi(t);
+                target = (avail >= thresh) ? gpu : backend_cpu;
+            } else if (strat == "external") {
+                const char *b = std::getenv("LLAMA_OP_SCHED_BACKEND");
+                if (b && !strcmp(b, "gpu") && gpu) target = gpu;
+                else if (b) target = backend_cpu;
+            }
+            if (target && ggml_backend_supports_op(target, cur)) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+            }
+        }
+
 
         if (!cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {

@@ -270,6 +270,12 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // Runtime op-level scheduler. Called from graph_get_cb per node, can override
+    // backend assignment. LLAMA_OP_SCHED env enables (string strategy name).
+    // Counter incremented per build_graph call (== per decode batch).
+    uint64_t    op_sched_counter = 0;
+    std::string op_sched_strategy;  // empty = disabled
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
