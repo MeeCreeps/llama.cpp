@@ -747,8 +747,6 @@ void llama_context::set_op_runtime_dispatch(llama_op_runtime_dispatch_fn fn, voi
     op_runtime_dispatch_fn = fn;
     op_runtime_dispatch_ud = user_data;
     // 把 hook 转发到 ggml-sched. Wrapper 在 ctx->sched 上注册.
-    static thread_local llama_context * s_active_ctx_for_dispatch = nullptr;
-    s_active_ctx_for_dispatch = this;
     if (sched) {
         struct DispatchTrampoline {
             static int call(const struct ggml_tensor * op,
@@ -765,10 +763,9 @@ void llama_context::set_op_runtime_dispatch(llama_op_runtime_dispatch_fn fn, voi
                 fn ? DispatchTrampoline::call : nullptr,
                 this);
     }
-    if (fn != nullptr && !graph_reuse_disable) {
-        graph_reuse_disable = true;
-        LLAMA_LOG_INFO("%s: op_runtime_dispatch registered → graph_reuse_disable=1\n", __func__);
-    }
+    // 注意: op_runtime_dispatch 不需要 graph_reuse_disable —— hook 只在 compute_splits
+    // 里改 backend, 不动 graph 拓扑. cached graph 复用 OK.
+    // (op_schedule_fn 才需要 disable, 因为它决策固化进 splits.)
 }
 
 void llama_context::set_mem_watch_threshold(int mb) {
