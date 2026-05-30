@@ -336,11 +336,16 @@ int main(int argc, char ** argv) {
         });
     }
 
-    // ===== Demo: TRUE per-op runtime dispatch (LLAMA_TEST_OP_RUNTIME_DISPATCH=1) =====
+    // ===== Demo: TRUE per-op runtime dispatch (LLAMA_TEST_OP_RUNTIME_DISPATCH=<policy>) =====
     // 真 runtime per-op 决策: 每个 op 即将 compute 前 hook 触发, 可基于当前 state
     // (上一 op 时间, op 计数器, 当前 op 类型) 即时选 backend.
-    // 这跟 op_schedule 区别在: op_schedule 在 graph build 时跑一次, 决策固化进
-    // graph splits; runtime_dispatch 每个 op 都跑, 决策影响 compute 那一刻.
+    //
+    // policy 选项 (env value):
+    //   "alternate" / "1"     : 偶数 mul_mat → CPU (default for backward compat)
+    //   "layer-half"          : layer < N/2 → GPU, ≥ N/2 → CPU (适合 GPU 内存紧时)
+    //   "ffn-cpu"             : 所有 ffn ops → CPU
+    //   "attn-cpu"            : 所有 attn ops → CPU
+    //   "memory-driven"       : 看当前 MemAvailable, < LO_MB 时所有 mul_mat → CPU
     if (const char *e = std::getenv("LLAMA_TEST_OP_RUNTIME_DISPATCH"); e && *e && *e != '0') {
         struct dispatch_state {
             uint64_t n_calls       = 0;
@@ -350,36 +355,75 @@ int main(int argc, char ** argv) {
             uint64_t n_mulmat_gpu  = 0;
             int cpu_id = 0;
             int gpu_id = -1;
+            std::string policy;
+            int mem_lo = 4096;
+            int n_layers = 28;  // 用 llama_model_n_layer 实际取
         };
         static dispatch_state ds;
         ds.cpu_id = llama_n_backends(ctx) - 1;
         ds.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+        ds.policy = std::string(e);
+        if (const char *p = std::getenv("LLAMA_OP_DISPATCH_LO_MB")) ds.mem_lo = std::atoi(p);
+        ds.n_layers = llama_model_n_layer(model);
+        LOG_INF("[op-runtime-dispatch] policy=%s cpu_id=%d gpu_id=%d n_layers=%d\n",
+                ds.policy.c_str(), ds.cpu_id, ds.gpu_id, ds.n_layers);
 
-        // Policy: mul_mat 每偶数 op 强制 CPU, 奇数 op 默认 (= split 决定);
-        //         非 mul_mat 不动. 演示 per-op 粒度切换的 effect.
         llama_set_op_runtime_dispatch(ctx, [](const struct ggml_tensor *op,
                                                 int default_backend_id, int n_backends,
                                                 void *ud) -> int {
             auto *s = (dispatch_state *)ud;
             s->n_calls++;
-            if (op && op->op == GGML_OP_MUL_MAT) {
-                s->n_mulmat++;
-                // 每偶数 mul_mat 路由到 CPU
-                int target = (s->n_mulmat % 2 == 0) ? s->cpu_id : -1;
-                if (target == s->cpu_id) {
-                    s->n_mulmat_cpu++;
-                    if (target != default_backend_id) s->n_overrides++;
-                    return target;
-                } else {
-                    s->n_mulmat_gpu++;
+            (void)n_backends;
+            if (!op) return -1;
+
+            int target = -1;
+            const std::string &pol = s->policy;
+            const char *name = op->name;
+
+            if (pol == "alternate" || pol == "1") {
+                if (op->op == GGML_OP_MUL_MAT) {
+                    s->n_mulmat++;
+                    target = (s->n_mulmat % 2 == 0) ? s->cpu_id : -1;
+                }
+            } else if (pol == "layer-half") {
+                if (op->op == GGML_OP_MUL_MAT && name) {
+                    s->n_mulmat++;
+                    int layer = -1;
+                    if (sscanf(name, "blk.%d", &layer) == 1
+                        || sscanf(name, "%*[^.].blk.%d", &layer) == 1) {
+                        target = (layer < s->n_layers / 2) ? -1 : s->cpu_id;
+                    }
+                }
+            } else if (pol == "ffn-cpu") {
+                if (op->op == GGML_OP_MUL_MAT && name && strstr(name, "ffn")) {
+                    s->n_mulmat++;
+                    target = s->cpu_id;
+                }
+            } else if (pol == "attn-cpu") {
+                if (op->op == GGML_OP_MUL_MAT && name && strstr(name, "attn")) {
+                    s->n_mulmat++;
+                    target = s->cpu_id;
+                }
+            } else if (pol == "memory-driven") {
+                if (op->op == GGML_OP_MUL_MAT) {
+                    s->n_mulmat++;
+                    int64_t avail = llama_runtime_mem_avail_mb();
+                    target = (avail < s->mem_lo) ? s->cpu_id : -1;
                 }
             }
-            (void)n_backends;
+
+            if (target == s->cpu_id) {
+                s->n_mulmat_cpu++;
+                if (target != default_backend_id) s->n_overrides++;
+                return target;
+            }
+            if (op->op == GGML_OP_MUL_MAT) s->n_mulmat_gpu++;
             return -1;
         }, &ds);
 
         std::atexit([]() {
-            LOG_INF("[op-runtime-dispatch] calls=%llu overrides=%llu  mul_mat(total=%llu cpu=%llu gpu=%llu)\n",
+            LOG_INF("[op-runtime-dispatch] policy=%s calls=%llu overrides=%llu  mul_mat(total=%llu cpu=%llu gpu=%llu)\n",
+                    ds.policy.c_str(),
                     (unsigned long long)ds.n_calls,
                     (unsigned long long)ds.n_overrides,
                     (unsigned long long)ds.n_mulmat,
