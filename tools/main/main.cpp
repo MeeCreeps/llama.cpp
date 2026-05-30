@@ -375,10 +375,39 @@ int main(int argc, char ** argv) {
             s->n_calls++;
             (void)n_backends;
             if (!op) return -1;
+            // dump first N op names for debugging
+            static int dump_count = 0;
+            if (std::getenv("LLAMA_OP_DISPATCH_DUMP_NAMES") && dump_count < 30 && op->op == GGML_OP_MUL_MAT) {
+                fprintf(stderr, "[op-name-dump] op=%s name='%s'\n",
+                        ggml_op_name(op->op), op->name);
+                dump_count++;
+            }
 
             int target = -1;
             const std::string &pol = s->policy;
             const char *name = op->name;
+
+            // op naming convention (decode graph): "Qcur-N", "Kcur-N", "Vcur-N",
+            // "kq-N", "kqv-N", "attn_out-N", "ffn_gate-N", "ffn_up-N", "ffn_out-N"
+            // 解析 layer: 找最后一个 '-' 之后的数字
+            auto parse_layer = [](const char *nm) -> int {
+                if (!nm) return -1;
+                const char *dash = strrchr(nm, '-');
+                if (!dash) return -1;
+                int l = -1;
+                if (sscanf(dash + 1, "%d", &l) == 1) return l;
+                return -1;
+            };
+            auto is_attn = [](const char *nm) -> bool {
+                if (!nm) return false;
+                return strncmp(nm, "Qcur", 4) == 0 || strncmp(nm, "Kcur", 4) == 0
+                    || strncmp(nm, "Vcur", 4) == 0 || strncmp(nm, "kq", 2) == 0
+                    || strncmp(nm, "kqv", 3) == 0 || strstr(nm, "attn_out") != nullptr;
+            };
+            auto is_ffn = [](const char *nm) -> bool {
+                if (!nm) return false;
+                return strncmp(nm, "ffn_", 4) == 0;
+            };
 
             if (pol == "alternate" || pol == "1") {
                 if (op->op == GGML_OP_MUL_MAT) {
@@ -386,21 +415,20 @@ int main(int argc, char ** argv) {
                     target = (s->n_mulmat % 2 == 0) ? s->cpu_id : -1;
                 }
             } else if (pol == "layer-half") {
-                if (op->op == GGML_OP_MUL_MAT && name) {
+                if (op->op == GGML_OP_MUL_MAT) {
                     s->n_mulmat++;
-                    int layer = -1;
-                    if (sscanf(name, "blk.%d", &layer) == 1
-                        || sscanf(name, "%*[^.].blk.%d", &layer) == 1) {
+                    int layer = parse_layer(name);
+                    if (layer >= 0) {
                         target = (layer < s->n_layers / 2) ? -1 : s->cpu_id;
                     }
                 }
             } else if (pol == "ffn-cpu") {
-                if (op->op == GGML_OP_MUL_MAT && name && strstr(name, "ffn")) {
+                if (op->op == GGML_OP_MUL_MAT && is_ffn(name)) {
                     s->n_mulmat++;
                     target = s->cpu_id;
                 }
             } else if (pol == "attn-cpu") {
-                if (op->op == GGML_OP_MUL_MAT && name && strstr(name, "attn")) {
+                if (op->op == GGML_OP_MUL_MAT && is_attn(name)) {
                     s->n_mulmat++;
                     target = s->cpu_id;
                 }
