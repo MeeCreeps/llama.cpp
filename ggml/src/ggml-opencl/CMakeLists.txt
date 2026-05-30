@@ -24,6 +24,13 @@ target_include_directories(${TARGET_NAME} PRIVATE
                            ${OpenCL_INCLUDE_DIRS}
                            ${_ELASTIC_RUNTIME_DIR})
 
+# Android NDK toolchain 默认 -Wl,--no-undefined 让 cross-lib 符号 (llama_mmap_*) 链接失败.
+# ignore-all 覆盖 (在 ld.lld 里后置 flag 胜出), runtime loader 解析.
+if (ANDROID)
+    target_link_options(${TARGET_NAME} PRIVATE -Wl,--unresolved-symbols=ignore-all)
+endif()
+
+
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")
     add_compile_definitions(GGML_OPENCL_PROFILING)
