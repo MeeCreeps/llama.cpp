@@ -1577,19 +1577,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return true;
             };
 
+            static const bool dbg_runtime = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_DEBUG") != nullptr;
+            int n_overrides_ok = 0, n_overrides_no_op = 0, n_overrides_no_buft = 0;
             for (int j = 0; j < n_nodes; j++) {
                 struct ggml_tensor * t = split->graph.nodes[j];
                 int tgt = sched->callback_runtime_dispatch(
                         t, split_backend_id, sched->n_backends,
                         sched->callback_runtime_dispatch_user_data);
                 ggml_backend_t b = split_backend;
-                if (tgt >= 0 && tgt < sched->n_backends
-                    && tgt != split_backend_id
-                    && ggml_backend_supports_op(sched->backends[tgt], t)
-                    && inputs_compatible(t, sched->backends[tgt])) {
-                    b = sched->backends[tgt];
+                if (tgt >= 0 && tgt < sched->n_backends && tgt != split_backend_id) {
+                    bool sup_op = ggml_backend_supports_op(sched->backends[tgt], t);
+                    bool sup_buft = sup_op && inputs_compatible(t, sched->backends[tgt]);
+                    if (sup_op && sup_buft) {
+                        b = sched->backends[tgt];
+                        n_overrides_ok++;
+                    } else {
+                        if (!sup_op)        n_overrides_no_op++;
+                        else if (!sup_buft) n_overrides_no_buft++;
+                        if (dbg_runtime) {
+                            fprintf(stderr,
+                                "[runtime-dispatch] override op=%s name=%s tgt=%s default=%s rejected: %s\n",
+                                ggml_op_name(t->op), t->name,
+                                ggml_backend_name(sched->backends[tgt]),
+                                ggml_backend_name(split_backend),
+                                sup_op ? "input buft incompat" : "op unsupported");
+                        }
+                    }
                 }
                 op_backend[j] = b;
+            }
+            if (dbg_runtime && (n_overrides_ok + n_overrides_no_op + n_overrides_no_buft) > 0) {
+                fprintf(stderr, "[runtime-dispatch] split %d: %d ok / %d no_op / %d no_buft\n",
+                        split_id, n_overrides_ok, n_overrides_no_op, n_overrides_no_buft);
             }
             int j = 0;
             while (j < n_nodes) {
