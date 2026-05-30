@@ -1644,50 +1644,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // For migration: per-op input migration (only when exec_backend ≠ split_backend)
                 std::vector<saved_src> group_saves;
+                // Per op: save original output tensor's data/buffer + 临时 output buffer
+                struct saved_output { int op_idx; void * data; ggml_backend_buffer_t buffer; ggml_backend_buffer_t tmp_buf; };
+                std::vector<saved_output> output_saves;
                 if (en_migrate && exec_backend != split_backend) {
+                    ggml_backend_buffer_type_t dst_buft = ggml_backend_get_default_buffer_type(exec_backend);
                     for (int g = j; g < k; g++) {
                         struct ggml_tensor * op = split->graph.nodes[g];
-                        if (dbg_runtime) fprintf(stderr, "[migrate] entering op %s (type=%s)\n", op->name, ggml_op_name(op->op));
+                        // === Input migration ===
                         for (int s = 0; s < GGML_MAX_SRC; s++) {
                             struct ggml_tensor * src = op->src[s];
-                            if (!src) { continue; }
-                            if (!src->buffer) {
-                                if (dbg_runtime) fprintf(stderr, "[migrate]   src[%d]=%s has no buffer, skip\n", s, src->name);
-                                continue;
-                            }
+                            if (!src || !src->buffer) continue;
                             ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
-                            if (ggml_backend_supports_buft(exec_backend, src_buft)) {
-                                if (dbg_runtime) fprintf(stderr, "[migrate]   src[%d]=%s compat, skip\n", s, src->name);
-                                continue;
-                            }
-                            ggml_backend_buffer_type_t dst_buft = ggml_backend_get_default_buffer_type(exec_backend);
-                            if (!dst_buft) {
-                                if (dbg_runtime) fprintf(stderr, "[migrate]   no dst buft\n");
-                                continue;
-                            }
+                            if (ggml_backend_supports_buft(exec_backend, src_buft)) continue;
                             size_t need_bytes = ggml_nbytes(src);
-                            if (dbg_runtime) fprintf(stderr, "[migrate]   allocating %zu bytes on %s\n", need_bytes,
-                                                      ggml_backend_buft_name(dst_buft));
                             ggml_backend_buffer_t tmp_buf = ggml_backend_buft_alloc_buffer(dst_buft, need_bytes);
-                            if (!tmp_buf) {
-                                if (dbg_runtime) fprintf(stderr, "[migrate]   alloc FAIL\n");
-                                continue;
-                            }
+                            if (!tmp_buf) continue;
                             struct ggml_tensor * tmp = ggml_dup_tensor_layout(sched->ctx, src);
-                            if (!tmp) {
-                                ggml_backend_buffer_free(tmp_buf);
-                                if (dbg_runtime) fprintf(stderr, "[migrate]   dup_tensor FAIL\n");
-                                continue;
-                            }
-                            if (dbg_runtime) fprintf(stderr, "[migrate]   tensor_alloc + copy\n");
+                            if (!tmp) { ggml_backend_buffer_free(tmp_buf); continue; }
                             ggml_backend_tensor_alloc(tmp_buf, tmp, ggml_backend_buffer_get_base(tmp_buf));
                             ggml_backend_tensor_copy(src, tmp);
-                            if (dbg_runtime) { fprintf(stderr, "[migrate]   copy DONE\n"); fflush(stderr); }
                             temp_buffers.push_back(tmp_buf);
                             group_saves.push_back({g, s, src});
-                            if (dbg_runtime) { fprintf(stderr, "[migrate]   about to swap src[%d] = tmp\n", s); fflush(stderr); }
                             op->src[s] = tmp;
-                            if (dbg_runtime) { fprintf(stderr, "[migrate]   swapped\n"); fflush(stderr); }
+                        }
+                        // === Output redirect (op IS the output tensor) ===
+                        // op->buffer 跟 exec_backend 不兼容时, 临时 redirect op->data
+                        // 到 exec_backend host buffer, compute 后 copy 回原 buffer.
+                        if (op->buffer) {
+                            ggml_backend_buffer_type_t op_buft = ggml_backend_buffer_get_type(op->buffer);
+                            if (!ggml_backend_supports_buft(exec_backend, op_buft)) {
+                                size_t out_bytes = ggml_nbytes(op);
+                                ggml_backend_buffer_t out_buf = ggml_backend_buft_alloc_buffer(dst_buft, out_bytes);
+                                if (out_buf) {
+                                    saved_output sv;
+                                    sv.op_idx = g;
+                                    sv.data   = op->data;
+                                    sv.buffer = op->buffer;
+                                    sv.tmp_buf = out_buf;
+                                    output_saves.push_back(sv);
+                                    op->data   = ggml_backend_buffer_get_base(out_buf);
+                                    op->buffer = out_buf;
+                                    if (dbg_runtime) fprintf(stderr, "[migrate]   redirect OUTPUT %s (%zu bytes)\n",
+                                                              op->name, out_bytes);
+                                }
+                            }
                         }
                     }
                 }
@@ -1704,8 +1705,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // Restore src ptrs after compute (sync first if backend not synchronous)
-                if (!group_saves.empty()) {
+                if (!group_saves.empty() || !output_saves.empty()) {
                     ggml_backend_synchronize(exec_backend);
+                    // 把 redirect 出去的 output 写回原 backend buffer
+                    for (auto & sv : output_saves) {
+                        struct ggml_tensor * op = split->graph.nodes[sv.op_idx];
+                        // op->data 现指向 host temp, 拿数据 write 回原 buffer
+                        // 用 ggml_backend_tensor_set 写到原 buffer (OpenCL clEnqueueWriteBuffer)
+                        // 但 op->buffer 现也指向 tmp_buf, 先恢复再 write.
+                        void * host_data = op->data;
+                        op->data   = sv.data;
+                        op->buffer = sv.buffer;
+                        ggml_backend_tensor_set(op, host_data, 0, ggml_nbytes(op));
+                        ggml_backend_buffer_free(sv.tmp_buf);
+                    }
+                    output_saves.clear();
                     for (auto & sv : group_saves) {
                         split->graph.nodes[sv.op_idx]->src[sv.src_idx] = sv.orig;
                     }
