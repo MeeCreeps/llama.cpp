@@ -1611,19 +1611,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         split_id, n_overrides_ok, n_overrides_no_op, n_overrides_no_buft);
             }
             int j = 0;
+            ggml_backend_t prev_backend = nullptr;
             while (j < n_nodes) {
                 ggml_backend_t exec_backend = op_backend[j];
                 int k = j + 1;
                 while (k < n_nodes && op_backend[k] == exec_backend) k++;
+                // 切换 backend 之前 sync 上一个 (保证它的 output 对当前可见).
+                // 同 backend 连续 group 不需要 sync (in-order).
+                if (prev_backend && prev_backend != exec_backend) {
+                    ggml_backend_synchronize(prev_backend);
+                }
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, k);
                 enum ggml_status ec = ggml_backend_graph_compute_async(exec_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
-                if (exec_backend != split_backend) {
-                    ggml_backend_synchronize(exec_backend);
-                }
+                prev_backend = exec_backend;
                 j = k;
+            }
+            // Split 末尾: 若最后一个 group 在 non-split_backend, sync 它
+            // (下一个 split 的 input copy 阶段会读这些 tensor)
+            if (prev_backend && prev_backend != split_backend) {
+                ggml_backend_synchronize(prev_backend);
             }
         } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
