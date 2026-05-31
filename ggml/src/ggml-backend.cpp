@@ -723,6 +723,16 @@ struct ggml_backend_sched {
     ggml_backend_sched_runtime_dispatch_fn callback_runtime_dispatch;
     void * callback_runtime_dispatch_user_data;
 
+    // v4: migration temp buffer pool. Key = (backend_id, size_bucket). 跨 decode
+    // 复用避免反复 alloc/free. 每 bucket 用 power-of-2 round up 减少碎片.
+    struct migration_buf_entry {
+        int    backend_id;
+        size_t size;          // 实际 alloc 的 size (round up)
+        ggml_backend_buffer_t buf;
+        bool   in_use;
+    };
+    std::vector<migration_buf_entry> migration_pool;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1629,8 +1639,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             // Saved src ptrs (per op) for restore after compute
             struct saved_src { int op_idx; int src_idx; struct ggml_tensor * orig; };
-            // Temp tensors created on alt backends, freed at end of split
-            std::vector<ggml_backend_buffer_t> temp_buffers;
+            // Temp buffer pool indices used in this split (mark in_use=false at end)
+            std::vector<int> migration_pool_used;
+
+            // Helper: get a temp buffer from pool (alloc if not cached)
+            auto get_migration_buffer = [&](int backend_id, size_t need_bytes) -> ggml_backend_buffer_t {
+                // Round up to nearest power of 2 (bucket) to maximize reuse
+                size_t bucket = 4096;
+                while (bucket < need_bytes) bucket <<= 1;
+                // Search free entry
+                for (size_t i = 0; i < sched->migration_pool.size(); i++) {
+                    auto & e = sched->migration_pool[i];
+                    if (!e.in_use && e.backend_id == backend_id && e.size >= bucket) {
+                        e.in_use = true;
+                        migration_pool_used.push_back((int)i);
+                        return e.buf;
+                    }
+                }
+                // Allocate new
+                ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(sched->backends[backend_id]);
+                if (!buft) return nullptr;
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, bucket);
+                if (!buf) return nullptr;
+                sched->migration_pool.push_back({backend_id, bucket, buf, true});
+                migration_pool_used.push_back((int)sched->migration_pool.size() - 1);
+                return buf;
+            };
 
             int j = 0;
             ggml_backend_t prev_backend = nullptr;
@@ -1648,34 +1682,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct saved_output { int op_idx; void * data; ggml_backend_buffer_t buffer; ggml_backend_buffer_t tmp_buf; };
                 std::vector<saved_output> output_saves;
                 if (en_migrate && exec_backend != split_backend) {
-                    ggml_backend_buffer_type_t dst_buft = ggml_backend_get_default_buffer_type(exec_backend);
+                    // 找 target backend id
+                    int target_bid = -1;
+                    for (int b = 0; b < sched->n_backends; b++) {
+                        if (sched->backends[b] == exec_backend) { target_bid = b; break; }
+                    }
                     for (int g = j; g < k; g++) {
                         struct ggml_tensor * op = split->graph.nodes[g];
-                        // === Input migration ===
+                        // === Input migration (用缓存的 buffer) ===
                         for (int s = 0; s < GGML_MAX_SRC; s++) {
                             struct ggml_tensor * src = op->src[s];
                             if (!src || !src->buffer) continue;
                             ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
                             if (ggml_backend_supports_buft(exec_backend, src_buft)) continue;
                             size_t need_bytes = ggml_nbytes(src);
-                            ggml_backend_buffer_t tmp_buf = ggml_backend_buft_alloc_buffer(dst_buft, need_bytes);
+                            ggml_backend_buffer_t tmp_buf = get_migration_buffer(target_bid, need_bytes);
                             if (!tmp_buf) continue;
                             struct ggml_tensor * tmp = ggml_dup_tensor_layout(sched->ctx, src);
-                            if (!tmp) { ggml_backend_buffer_free(tmp_buf); continue; }
+                            if (!tmp) continue;
                             ggml_backend_tensor_alloc(tmp_buf, tmp, ggml_backend_buffer_get_base(tmp_buf));
                             ggml_backend_tensor_copy(src, tmp);
-                            temp_buffers.push_back(tmp_buf);
                             group_saves.push_back({g, s, src});
                             op->src[s] = tmp;
                         }
-                        // === Output redirect (op IS the output tensor) ===
-                        // op->buffer 跟 exec_backend 不兼容时, 临时 redirect op->data
-                        // 到 exec_backend host buffer, compute 后 copy 回原 buffer.
+                        // === Output redirect ===
                         if (op->buffer) {
                             ggml_backend_buffer_type_t op_buft = ggml_backend_buffer_get_type(op->buffer);
                             if (!ggml_backend_supports_buft(exec_backend, op_buft)) {
                                 size_t out_bytes = ggml_nbytes(op);
-                                ggml_backend_buffer_t out_buf = ggml_backend_buft_alloc_buffer(dst_buft, out_bytes);
+                                ggml_backend_buffer_t out_buf = get_migration_buffer(target_bid, out_bytes);
                                 if (out_buf) {
                                     saved_output sv;
                                     sv.op_idx = g;
@@ -1685,8 +1720,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     output_saves.push_back(sv);
                                     op->data   = ggml_backend_buffer_get_base(out_buf);
                                     op->buffer = out_buf;
-                                    if (dbg_runtime) fprintf(stderr, "[migrate]   redirect OUTPUT %s (%zu bytes)\n",
-                                                              op->name, out_bytes);
                                 }
                             }
                         }
@@ -1710,14 +1743,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // 把 redirect 出去的 output 写回原 backend buffer
                     for (auto & sv : output_saves) {
                         struct ggml_tensor * op = split->graph.nodes[sv.op_idx];
-                        // op->data 现指向 host temp, 拿数据 write 回原 buffer
-                        // 用 ggml_backend_tensor_set 写到原 buffer (OpenCL clEnqueueWriteBuffer)
-                        // 但 op->buffer 现也指向 tmp_buf, 先恢复再 write.
                         void * host_data = op->data;
                         op->data   = sv.data;
                         op->buffer = sv.buffer;
                         ggml_backend_tensor_set(op, host_data, 0, ggml_nbytes(op));
-                        ggml_backend_buffer_free(sv.tmp_buf);
+                        // 不 free, 留给 pool 复用
                     }
                     output_saves.clear();
                     for (auto & sv : group_saves) {
@@ -1728,7 +1758,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     prev_backend = exec_backend;
                 }
                 if (ec != GGML_STATUS_SUCCESS) {
-                    for (auto buf : temp_buffers) ggml_backend_buffer_free(buf);
+                    // 错误也要释放 pool 占用
+                    for (int idx : migration_pool_used) sched->migration_pool[idx].in_use = false;
                     return ec;
                 }
                 j = k;
@@ -1736,8 +1767,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (prev_backend && prev_backend != split_backend) {
                 ggml_backend_synchronize(prev_backend);
             }
-            // Free all temp buffers allocated for migration this split
-            for (auto buf : temp_buffers) ggml_backend_buffer_free(buf);
+            // 标记本 split 用过的 pool entry 为 free, 留给后续 split / 后续 decode 复用
+            for (int idx : migration_pool_used) sched->migration_pool[idx].in_use = false;
         } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1850,6 +1881,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    // v4: free migration buffer pool
+    for (auto & e : sched->migration_pool) {
+        if (e.buf) ggml_backend_buffer_free(e.buf);
+    }
+    sched->migration_pool.clear();
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
