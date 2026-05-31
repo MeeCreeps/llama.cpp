@@ -397,7 +397,21 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
     if (ggml_backend_buffer_is_host(src->buffer)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst->buffer)) {
-        ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
+        // v8.4: 先尝试 host_ptr (mmap 源) 直接 memcpy. 用于 elastic mode 下
+        // weight cl_mem 已 release 但 mmap 还在的场景. 避免 clEnqueueReadBuffer
+        // 在 INVALID_MEM_OBJECT 上崩.
+        void *host_ptr = nullptr;
+        if (src->name[0]) {
+            host_ptr = llama_weight_host_ptr_query(src->name);
+        }
+        static const bool dbg_v84 = std::getenv("GGML_V84_DEBUG") != nullptr;
+        if (host_ptr) {
+            if (dbg_v84) fprintf(stderr, "[v8.4] tensor_copy %s via host_ptr (%zu bytes)\n", src->name, ggml_nbytes(src));
+            memcpy(dst->data, host_ptr, ggml_nbytes(src));
+        } else {
+            if (dbg_v84) fprintf(stderr, "[v8.4] tensor_copy %s via opencl get_tensor (no host_ptr)\n", src->name);
+            ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
+        }
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));

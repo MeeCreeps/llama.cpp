@@ -5117,6 +5117,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         static_cast<void*>(extra->data_device));
                     elastic::wbm_touch(&s->wbm, idx, s->current_token);
                     extra->wbm_idx = idx;
+
+                    // v8.4: 注册 name → idx 让 llama_weight_host_ptr_query 找得到.
+                    // 跟另一个 register 路径 (line 4188 area) 平行 — 两处都要 register.
+                    if (tensor && tensor->name[0]) {
+                        std::lock_guard<std::mutex> lk(s->sched_mtx);
+                        s->name_to_wbm[tensor->name] = idx;
+                    }
+                    opencl_sched_register_once();
                     // 同步 slot → wbm_idx，析构时能识别 WBM 已 evict 的 dead slot
                     if (extra->ctx_slot >= 0 &&
                         static_cast<size_t>(extra->ctx_slot) < bctx->wbm_idx_per_slot.size()) {
