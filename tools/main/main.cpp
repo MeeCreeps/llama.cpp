@@ -166,6 +166,50 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // ===== v8 demo: layer-partition via op_schedule (graph build time) =====
+    // 比 op_runtime_dispatch 简单 — 走 ggml-sched 已有的 split mechanism 处理
+    // cross-backend weight + activation, 不需要 v3-v6 的 runtime migration code.
+    //
+    // LLAMA_V8_PARTITION_LAYER=N: layer < N 的 ops → GPU, layer ≥ N → CPU
+    //   N=0: 全 CPU (= -ngl 0 但 weights 在 GPU buffer cl_mem 占用没释放)
+    //   N=28: 全 GPU (默认)
+    //   N=14: 前 14 层 GPU, 后 14 层 CPU (动态 budget 紧时 PoC)
+    //
+    // 决策也用 LP study (project_lp_oracle_findings): Belady+PF16 给出的"哪些 op
+    // 该在哪 backend"的 oracle. 这里只演示 layer-cut, 真接 LP 时把 layer < N 改成
+    // partition[op_name] 查表.
+    if (const char *pv8 = std::getenv("LLAMA_V8_PARTITION_LAYER")) {
+        struct v8_state {
+            int partition_layer = 0;
+            int cpu_id = 0;
+            int gpu_id = -1;
+            uint64_t n_ops_cpu = 0;
+            uint64_t n_ops_gpu = 0;
+        };
+        static v8_state v8s;
+        v8s.partition_layer = std::atoi(pv8);
+        v8s.cpu_id = llama_n_backends(ctx) - 1;
+        v8s.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+        LOG_INF("[v8-partition] layer < %d → GPU, ≥ → CPU (n_backends=%d cpu=%d gpu=%d)\n",
+                v8s.partition_layer, llama_n_backends(ctx), v8s.cpu_id, v8s.gpu_id);
+
+        llama_set_op_schedule(ctx, [](const struct ggml_tensor */*node*/, const char */*name*/,
+                                      int layer, void *ud) -> int {
+            auto *s = (v8_state *)ud;
+            if (layer < 0) return -1;  // 非 layer op (output / embed), 默认
+            int target = (layer < s->partition_layer) ? s->gpu_id : s->cpu_id;
+            if (target == s->gpu_id) s->n_ops_gpu++;
+            else                     s->n_ops_cpu++;
+            return target;
+        }, &v8s);
+
+        std::atexit([]() {
+            LOG_INF("[v8-partition] ops routed: GPU=%llu  CPU=%llu\n",
+                    (unsigned long long)v8s.n_ops_gpu,
+                    (unsigned long long)v8s.n_ops_cpu);
+        });
+    }
+
     // ===== Demo: schedule callback (LLAMA_TEST_SCHEDULE=1) =====
     // 演示 op-schedule + weight-pin callback API. 真实 LP solver 接入时用类似 pattern.
     if (const char *e = std::getenv("LLAMA_TEST_SCHEDULE"); e && *e && *e != '0') {
