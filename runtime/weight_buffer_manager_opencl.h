@@ -20,6 +20,7 @@
 #endif
 #include <CL/cl.h>
 
+#include <functional>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,22 @@
 #include "weight_buffer_manager.h"
 
 namespace elastic {
+
+// SOA pool: q4_0/q8_0/mxfp4 走 SOA 重建管线 (parent+scales(d)+quants(q) 三件套).
+// evict 时把这三个 cl_mem 一起塞 pool, reload 时按 nbytes 整组取出复用,
+// 省掉 4 次 sub-buffer + 一次 convert kernel.
+struct soa_pool_entry {
+    void *parent = nullptr;
+    void *d      = nullptr;   // scales
+    void *q      = nullptr;   // quants
+};
+
+// SOA per-block evict/reload 回调注册. 调用方在 register_soa 时绑.
+// reload_fn 由 prefetch 路径异步调; evict_fn 由 wbmcl_evict 替换走.
+struct soa_callback_pair {
+    std::function<int()> evict_fn;
+    std::function<int()> reload_fn;
+};
 
 struct wbm_opencl_ctx {
     weight_buffer_manager *wbm;           // 不持有所有权
@@ -61,7 +78,29 @@ struct wbm_opencl_ctx {
     size_t bytes_evicted_total;           // 历史累计释放字节
     int    n_creates;                     // clCreateBuffer 调用次数
     int    n_releases;                    // clReleaseMemObject 调用次数
+
+    // SOA (q4_0/q8_0/mxfp4) reload 共享 staging buffer (复用, 2× growth).
+    // ggml_opencl_elastic_ensure_soa_staging 维护.
+    cl_mem    soa_staging              = nullptr;
+    size_t    soa_staging_capacity     = 0;
+    // 上一次用 staging 的 convert kernel 完成 event — 下次 reuse 前要 wait,
+    // 否则新 write 会覆盖正在被 kernel 读的数据.
+    cl_event  soa_staging_last_use_ev  = nullptr;
+
+    // SOA pool: 按字节数索引 {parent,d,q} 三件套缓存. 跟 retained_buffers_by_size 配合,
+    // 共享同一个 cache_byte_limit / retain_order_sizes FIFO.
+    std::unordered_map<size_t, std::vector<soa_pool_entry>> soa_pool_by_size;
+
+    // SOA per-block 回调注册表. wbmcl_register_soa 加, prefetch 路径用 reload_fn.
+    std::unordered_map<int, soa_callback_pair>              soa_per_idx;
 };
+
+// 注册 SOA tensor 的 evict/reload 回调. idx 是 wbm 里的 block index.
+// 同一个 idx 多次注册以最后一次为准.
+void wbmcl_register_soa(wbm_opencl_ctx *octx,
+                        int idx,
+                        std::function<int()> evict_fn,
+                        std::function<int()> reload_fn);
 
 // 绑定一个已存在的 WBM 和 OpenCL 上下文。不接管 cl_context / queue 的生命周期，
 // 调用方仍负责销毁。xfer_queue 可传 nullptr，此时 prefetch / 同步上传走

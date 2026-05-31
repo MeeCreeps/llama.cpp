@@ -453,4 +453,15 @@ void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     octx->xfer_queue          = nullptr;
 }
 
+void wbmcl_register_soa(wbm_opencl_ctx *octx,
+                        int idx,
+                        std::function<int()> evict_fn,
+                        std::function<int()> reload_fn) {
+    if (!octx || idx < 0) return;
+    soa_callback_pair cb;
+    cb.evict_fn  = std::move(evict_fn);
+    cb.reload_fn = std::move(reload_fn);
+    octx->soa_per_idx[idx] = std::move(cb);
+}
+
 }  // namespace elastic

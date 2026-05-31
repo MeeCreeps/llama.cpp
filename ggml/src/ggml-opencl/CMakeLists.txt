@@ -24,6 +24,17 @@ target_include_directories(${TARGET_NAME} PRIVATE
                            ${OpenCL_INCLUDE_DIRS}
                            ${_ELASTIC_RUNTIME_DIR})
 
+# Elastic O_DIRECT reload 路径需要调 libllama 的 llama_mmap_registry_find /
+# llama_pread_direct. 这两个符号在 libllama.so 里, 跟 libggml-opencl.so 是
+# 跨 .so 引用. Android NDK 默认 -Wl,--no-undefined 会报错, 改成 ignore-in-shared-libs
+# (符号在 dlopen libllama 时解析). 跟 src/llama-mmap.cpp 配对.
+if (ANDROID)
+    # ignore-all 是因为 libllama 还没 link 时 libggml-opencl.so 先生成,
+    # 这俩符号在 .so 列表里都找不到 (不是 ignore-in-shared-libs 能处理的).
+    # 运行时 libllama.so 跟 libggml-opencl.so 一起被 dlopen, 符号能解析.
+    target_link_options(${TARGET_NAME} PRIVATE "LINKER:--unresolved-symbols=ignore-all")
+endif ()
+
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")
     add_compile_definitions(GGML_OPENCL_PROFILING)
