@@ -438,6 +438,28 @@ int main(int argc, char ** argv) {
                     int64_t avail = llama_runtime_mem_avail_mb();
                     target = (avail < s->mem_lo) ? s->cpu_id : -1;
                 }
+            } else if (pol == "smart-pressure") {
+                // v5 smart policy: 只在 GPU 真有压力时挑 ffn 切 CPU.
+                // 优先 ffn (mul_mat 中最大 weight, 切 1 个省 GPU 内存最多),
+                // 只切前 K 个 layer 的 ffn (避免雪崩).
+                // env: LLAMA_OP_DISPATCH_PRESSURE_MB (default 1500),
+                //     LLAMA_OP_DISPATCH_MAX_FFN_LAYERS (default 4).
+                static int pressure_lo = -1;
+                static int max_ffn_layers = -1;
+                if (pressure_lo < 0) {
+                    pressure_lo = 1500;
+                    if (const char *e = std::getenv("LLAMA_OP_DISPATCH_PRESSURE_MB")) pressure_lo = std::atoi(e);
+                    if (const char *e = std::getenv("LLAMA_OP_DISPATCH_MAX_FFN_LAYERS")) max_ffn_layers = std::atoi(e); else max_ffn_layers = 4;
+                }
+                if (op->op == GGML_OP_MUL_MAT && is_ffn(name)) {
+                    s->n_mulmat++;
+                    int64_t avail = llama_runtime_mem_avail_mb();
+                    int layer = parse_layer(name);
+                    // 只切前 max_ffn_layers 层的 ffn (避免全切)
+                    if (avail < pressure_lo && layer >= 0 && layer < max_ffn_layers) {
+                        target = s->cpu_id;
+                    }
+                }
             }
 
             if (target == s->cpu_id) {
