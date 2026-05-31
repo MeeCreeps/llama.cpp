@@ -2953,6 +2953,20 @@ static bool opencl_sched_residency_query(const char *name, void * /*ud*/) {
     return bm && bm->resident;
 }
 
+static void * opencl_sched_host_ptr_query(const char *name, void * /*ud*/) {
+    if (!name) return nullptr;
+    auto *s = ggml_opencl_elastic();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return nullptr;
+        idx = it->second;
+    }
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    return bm ? bm->host_ptr : nullptr;
+}
+
 static int opencl_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
     if (!name) return -1;
     auto *s = ggml_opencl_elastic();
@@ -2982,6 +2996,7 @@ static void opencl_sched_register_once() {
     s->sched_registered = true;
     llama_weight_residency_register(opencl_sched_residency_query, nullptr);
     llama_weight_movement_register (opencl_sched_movement_request, nullptr);
+    llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
 }
 
 // 提取 tensor 名后缀用于 profile 聚合：blk.<N>.<X>.weight → X

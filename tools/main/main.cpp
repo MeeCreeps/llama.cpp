@@ -358,11 +358,13 @@ int main(int argc, char ** argv) {
             std::string policy;
             int mem_lo = 4096;
             int n_layers = 28;  // 用 llama_model_n_layer 实际取
+            struct llama_context *ctx_ref = nullptr;  // 给 elastic-aware 用
         };
         static dispatch_state ds;
         ds.cpu_id = llama_n_backends(ctx) - 1;
         ds.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
         ds.policy = std::string(e);
+        ds.ctx_ref = ctx;
         if (const char *p = std::getenv("LLAMA_OP_DISPATCH_LO_MB")) ds.mem_lo = std::atoi(p);
         ds.n_layers = llama_model_n_layer(model);
         LOG_INF("[op-runtime-dispatch] policy=%s cpu_id=%d gpu_id=%d n_layers=%d\n",
@@ -438,6 +440,39 @@ int main(int argc, char ** argv) {
                     int64_t avail = llama_runtime_mem_avail_mb();
                     target = (avail < s->mem_lo) ? s->cpu_id : -1;
                 }
+            } else if (pol == "elastic-aware") {
+                // v6 动态 budget: 看 weight 在 GPU 是否常驻, 非常驻 → CPU.
+                // ggml-backend migration 用 llama_weight_host_ptr_query 拿 mmap 源
+                // ptr 直接 memcpy (绕过 cl_mem release 问题).
+                //
+                // 跳过 list: result_output / token_embd (特殊处理 op, 跨 backend 难)
+                //          + 只切 layer-* 的 mul_mat
+                static uint64_t n_resident_kept = 0, n_evicted_routed = 0;
+                if (op->op == GGML_OP_MUL_MAT && op->src[0] && name) {
+                    s->n_mulmat++;
+                    // 只考虑 weight×activation 的 mul_mat (跳 activation×activation 的
+                    // kq/kqv — src[0] 不是 weight, host_ptr 拿不到). 也跳 result_output.
+                    bool is_weight_mulmat =
+                        (strncmp(name, "Qcur-", 5) == 0 || strncmp(name, "Kcur-", 5) == 0
+                         || strncmp(name, "Vcur-", 5) == 0 || strncmp(name, "attn_out", 8) == 0
+                         || strncmp(name, "ffn_", 4) == 0);
+                    if (is_weight_mulmat) {
+                        const char *w_name = op->src[0]->name;
+                        if (w_name && w_name[0]) {
+                            bool resident = llama_weight_is_resident(s->ctx_ref, w_name);
+                            if (resident) {
+                                n_resident_kept++;
+                            } else {
+                                n_evicted_routed++;
+                                target = s->cpu_id;
+                                if (std::getenv("LLAMA_OP_DISPATCH_ELASTIC_DEBUG") && n_evicted_routed < 20) {
+                                    LOG_INF("[elastic-aware] %s evicted → CPU\n", w_name);
+                                }
+                            }
+                        }
+                    }
+                }
+                (void)n_resident_kept;
             } else if (pol == "smart-pressure") {
                 // v5 smart policy: 只在 GPU 真有压力时挑 ffn 切 CPU.
                 // 优先 ffn (mul_mat 中最大 weight, 切 1 个省 GPU 内存最多),

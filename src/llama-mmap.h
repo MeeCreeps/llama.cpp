@@ -118,3 +118,10 @@ void llama_weight_movement_register (llama_weight_movement_fn_t  fn, void * user
 // Public query/action used by llama_context.cpp.
 bool llama_weight_residency_query(const char * name);
 int  llama_weight_movement_request(const char * name, bool evict);
+
+// === Weight host (mmap) pointer query ===
+// elastic backends register: 给 name → host_ptr 查询 (mmap 区指针).
+// 用于跨 backend dispatch: weight 被 evict 时, 不走 cl_mem 而走 mmap 直接读.
+typedef void * (*llama_weight_host_ptr_fn_t)(const char * name, void * user_data);
+void llama_weight_host_ptr_register(llama_weight_host_ptr_fn_t fn, void * user_data);
+void * llama_weight_host_ptr_query (const char * name);

@@ -141,12 +141,27 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     return 0;
 }
 
+void * elastic_sched_host_ptr_query(const char *name, void * /*ud*/) {
+    if (!name) return nullptr;
+    auto *s = get_state();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return nullptr;
+        idx = it->second;
+    }
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    return bm ? bm->host_ptr : nullptr;
+}
+
 void elastic_sched_register_once() {
     auto *s = get_state();
     if (s->sched_registered) return;
     s->sched_registered = true;
     llama_weight_residency_register(elastic_sched_residency_query, nullptr);
     llama_weight_movement_register (elastic_sched_movement_request, nullptr);
+    llama_weight_host_ptr_register (elastic_sched_host_ptr_query, nullptr);
 }
 
 // pinned 策略 / EMBED_OUTSIDE_BUDGET

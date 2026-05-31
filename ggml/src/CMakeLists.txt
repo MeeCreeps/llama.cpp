@@ -216,6 +216,12 @@ if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
+# Android: ggml-base 引用 llama_weight_host_ptr_query (定义在 libllama.so) 用于
+# elastic v6 fallback. 让 runtime loader 解析跨 shared lib 符号.
+if (ANDROID)
+    target_link_options(ggml-base PRIVATE -Wl,--unresolved-symbols=ignore-all)
+endif()
+
 add_library(ggml
             ggml-backend-reg.cpp)
 add_library(ggml::ggml ALIAS ggml)

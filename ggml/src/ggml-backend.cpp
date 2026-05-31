@@ -24,6 +24,10 @@
 #include <unordered_map>
 #include <cstdint>
 
+// Forward decl: llama-mmap.cpp 提供. ggml-opencl-elastic 注册后, 给 evict 的 weight
+// 返回 mmap 区 host_ptr (绕 cl_mem 释放问题). 不可用时返 nullptr.
+extern void * llama_weight_host_ptr_query(const char * name);
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1722,7 +1726,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             struct ggml_tensor * tmp = ggml_dup_tensor_layout(sched->ctx, src);
                             if (!tmp) continue;
                             ggml_backend_tensor_alloc(tmp_buf, tmp, ggml_backend_buffer_get_base(tmp_buf));
-                            ggml_backend_tensor_copy(src, tmp);
+                            // v6: 优先用 host_ptr (mmap 源) 直接 memcpy, 避开 cl_mem
+                            // (elastic evict 后 cl_mem 已释放, clEnqueueRead 会崩).
+                            // 只对 target=CPU 才用 (CPU 直接读 host 内存 OK).
+                            void * host_ptr = nullptr;
+                            if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(tmp_buf))
+                                && src->name[0]) {
+                                host_ptr = llama_weight_host_ptr_query(src->name);
+                            }
+                            if (host_ptr) {
+                                std::memcpy(ggml_backend_buffer_get_base(tmp_buf),
+                                            host_ptr, need_bytes);
+                            } else {
+                                ggml_backend_tensor_copy(src, tmp);
+                            }
                             mig_cache[key] = tmp;
                             mig_cache_miss++;
                             group_saves.push_back({g, s, src});

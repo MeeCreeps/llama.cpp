@@ -997,6 +997,13 @@ extern "C" {
             struct llama_context * ctx,
             const char *           tensor_name);
 
+    // Get host (mmap) pointer for weight tensor. 用于 elastic 场景: weight 被 GPU
+    // evict 后, host 端 mmap 区还有, 可直接用.
+    // 返回 NULL 表示 weight 未在 mmap registry / 没有 host backing.
+    LLAMA_API void * llama_weight_get_host_ptr(
+            struct llama_context * ctx,
+            const char *           tensor_name);
+
     // === True per-op runtime dispatch ===
     // 区别于 llama_set_op_schedule (graph-build 时一次性决策):
     // 这个 hook 在每个 op COMPUTE 即将开始之前调, 可根据当前 runtime 状态

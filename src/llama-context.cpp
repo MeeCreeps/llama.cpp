@@ -2695,6 +2695,10 @@ int llama_weight_request_evict(llama_context * /*ctx*/, const char * tensor_name
     return llama_weight_movement_request(tensor_name, /*evict=*/true);
 }
 
+void * llama_weight_get_host_ptr(llama_context * /*ctx*/, const char * tensor_name) {
+    return llama_weight_host_ptr_query(tensor_name);
+}
+
 int llama_n_backends(const llama_context * ctx) {
     return ctx->n_backends();
 }

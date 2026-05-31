@@ -765,11 +765,32 @@ int llama_weight_movement_request(const char * name, bool evict) {
     for (auto & p : snap) {
         if (!p.first) continue;
         int rc = p.first(name, evict, p.second);
-        // 0 = handled OK, < 0 = error, > 0 = handled with info.
-        // -2 means "not found in this provider" — try next.
         if (rc != -2) return rc;
     }
-    return -2;  // not found in any provider
+    return -2;
+}
+
+// === Weight host (mmap) pointer registry ===
+namespace {
+std::mutex                 g_weight_hostptr_mtx;
+llama_weight_host_ptr_fn_t g_weight_hostptr_fn = nullptr;
+void *                     g_weight_hostptr_ud = nullptr;
+}
+void llama_weight_host_ptr_register(llama_weight_host_ptr_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_hostptr_mtx);
+    g_weight_hostptr_fn = fn;
+    g_weight_hostptr_ud = user_data;
+}
+void * llama_weight_host_ptr_query(const char * name) {
+    llama_weight_host_ptr_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_hostptr_mtx);
+        fn = g_weight_hostptr_fn;
+        ud = g_weight_hostptr_ud;
+    }
+    if (!fn) return nullptr;
+    return fn(name, ud);
 }
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {
