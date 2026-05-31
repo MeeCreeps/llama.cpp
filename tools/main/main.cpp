@@ -6,6 +6,7 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -264,6 +265,73 @@ int main(int argc, char ** argv) {
                     v82s.policy.c_str(),
                     (unsigned long long)v82s.n_cpu,
                     (unsigned long long)v82s.n_gpu);
+        });
+    }
+
+    // ===== v8.3: dynamic re-partition on memory event =====
+    // Scheduler 看 MemAvailable 变化 → 算新 partition layer → 触发下次 decode 重 build.
+    // 三档:
+    //   mem > HI_MB (默认 3000): baseline (全 GPU)
+    //   mem 中间: layer<MID (默认 20, 8 层 CPU)
+    //   mem < LO_MB (默认 1000): 重 offload, layer<LO_LAYER (默认 8)
+    // env: LLAMA_V83_HI_MB / _MID_MB / _LO_MB / _MID_LAYER / _LO_LAYER
+    if (const char *e = std::getenv("LLAMA_V8_DYNAMIC"); e && *e && *e != '0') {
+        struct v83_state {
+            int hi_mb = 3000, mid_mb = 1500, lo_mb = 1000;
+            int mid_layer = 20, lo_layer = 8;
+            int n_layers = 28;
+            int cpu_id = 0, gpu_id = -1;
+            std::atomic<int> current_partition{28};  // 28 = 全 GPU
+            uint64_t n_repartitions = 0;
+        };
+        static v83_state v83s;
+        if (const char *p = std::getenv("LLAMA_V83_HI_MB"))    v83s.hi_mb    = std::atoi(p);
+        if (const char *p = std::getenv("LLAMA_V83_MID_MB"))   v83s.mid_mb   = std::atoi(p);
+        if (const char *p = std::getenv("LLAMA_V83_LO_MB"))    v83s.lo_mb    = std::atoi(p);
+        if (const char *p = std::getenv("LLAMA_V83_MID_LAYER")) v83s.mid_layer = std::atoi(p);
+        if (const char *p = std::getenv("LLAMA_V83_LO_LAYER"))  v83s.lo_layer  = std::atoi(p);
+        v83s.n_layers = llama_model_n_layer(model);
+        v83s.cpu_id = llama_n_backends(ctx) - 1;
+        v83s.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+        LOG_INF("[v8.3-dynamic] init: layers=%d backends(cpu=%d gpu=%d)\n",
+                v83s.n_layers, v83s.cpu_id, v83s.gpu_id);
+        LOG_INF("[v8.3-dynamic] thresholds: HI=%d MID=%d LO=%d MB | MID_L=%d LO_L=%d\n",
+                v83s.hi_mb, v83s.mid_mb, v83s.lo_mb, v83s.mid_layer, v83s.lo_layer);
+
+        // Op_schedule reads current_partition
+        llama_set_op_schedule(ctx, [](const struct ggml_tensor */*node*/, const char */*name*/,
+                                       int layer, void *ud) -> int {
+            auto *s = (v83_state *)ud;
+            if (layer < 0) return -1;
+            int p = s->current_partition.load();
+            return (layer < p) ? s->gpu_id : s->cpu_id;
+        }, &v83s);
+
+        // Scheduler reacts to memory changes
+        llama_set_memory_watch_threshold(ctx, 100);  // 100 MB delta
+        llama_set_scheduler(ctx, [](struct llama_context *c,
+                                      const struct llama_runtime_state *st,
+                                      void *ud) {
+            auto *s = (v83_state *)ud;
+            int64_t mem = st->mem_avail_mb;
+            int new_p;
+            if (mem >= s->hi_mb) new_p = s->n_layers;       // 全 GPU
+            else if (mem >= s->lo_mb) new_p = s->mid_layer; // 中等 offload
+            else new_p = s->lo_layer;                       // 重 offload
+            int old_p = s->current_partition.load();
+            if (new_p != old_p) {
+                s->current_partition.store(new_p);
+                s->n_repartitions++;
+                LOG_INF("[v8.3-dynamic] step=%llu mem=%lld MB → repartition layer<%d (was <%d)\n",
+                        (unsigned long long)st->decode_step, (long long)mem, new_p, old_p);
+            }
+            (void)c;
+        }, &v83s);
+
+        std::atexit([]() {
+            LOG_INF("[v8.3-dynamic] total repartitions=%llu (final layer<%d)\n",
+                    (unsigned long long)v83s.n_repartitions,
+                    v83s.current_partition.load());
         });
     }
 
