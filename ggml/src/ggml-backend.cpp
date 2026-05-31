@@ -21,6 +21,8 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
+#include <cstdint>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1641,6 +1643,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct saved_src { int op_idx; int src_idx; struct ggml_tensor * orig; };
             // Temp buffer pool indices used in this split (mark in_use=false at end)
             std::vector<int> migration_pool_used;
+            // v5: per-split migration cache: (src_tensor*, target_backend_id) → tmp_tensor*
+            // 同一 src 在多个 group 都需迁移时 (e.g., attn_norm 出来给 Q/K/V) 不重复拷
+            std::unordered_map<uint64_t, struct ggml_tensor *> mig_cache;
+            int mig_cache_hits = 0, mig_cache_miss = 0;
+            auto mig_cache_key = [](const struct ggml_tensor * src, int backend_id) -> uint64_t {
+                uint64_t k = (uint64_t)(uintptr_t)src;
+                return (k * 31) ^ (uint64_t)backend_id;
+            };
 
             // Helper: get a temp buffer from pool (alloc if not cached)
             auto get_migration_buffer = [&](int backend_id, size_t need_bytes) -> ggml_backend_buffer_t {
@@ -1689,12 +1699,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     for (int g = j; g < k; g++) {
                         struct ggml_tensor * op = split->graph.nodes[g];
-                        // === Input migration (用缓存的 buffer) ===
+                        // === Input migration (v4 buffer pool + v5 src cache) ===
                         for (int s = 0; s < GGML_MAX_SRC; s++) {
                             struct ggml_tensor * src = op->src[s];
                             if (!src || !src->buffer) continue;
                             ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
                             if (ggml_backend_supports_buft(exec_backend, src_buft)) continue;
+
+                            // v5: check cache first
+                            uint64_t key = mig_cache_key(src, target_bid);
+                            auto cit = mig_cache.find(key);
+                            if (cit != mig_cache.end()) {
+                                group_saves.push_back({g, s, src});
+                                op->src[s] = cit->second;
+                                mig_cache_hits++;
+                                continue;
+                            }
+
                             size_t need_bytes = ggml_nbytes(src);
                             ggml_backend_buffer_t tmp_buf = get_migration_buffer(target_bid, need_bytes);
                             if (!tmp_buf) continue;
@@ -1702,6 +1723,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (!tmp) continue;
                             ggml_backend_tensor_alloc(tmp_buf, tmp, ggml_backend_buffer_get_base(tmp_buf));
                             ggml_backend_tensor_copy(src, tmp);
+                            mig_cache[key] = tmp;
+                            mig_cache_miss++;
                             group_saves.push_back({g, s, src});
                             op->src[s] = tmp;
                         }
@@ -1769,6 +1792,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             // 标记本 split 用过的 pool entry 为 free, 留给后续 split / 后续 decode 复用
             for (int idx : migration_pool_used) sched->migration_pool[idx].in_use = false;
+            if (dbg_runtime && (mig_cache_hits + mig_cache_miss) > 0) {
+                fprintf(stderr, "[runtime-dispatch] split %d migration cache: hits=%d misses=%d (saved %.0f%% copies)\n",
+                        split_id, mig_cache_hits, mig_cache_miss,
+                        100.0 * mig_cache_hits / (mig_cache_hits + mig_cache_miss));
+            }
         } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
