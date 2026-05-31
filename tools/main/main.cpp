@@ -210,6 +210,63 @@ int main(int argc, char ** argv) {
         });
     }
 
+    // ===== v8.2: smarter partition policies (基于 LP study + phase1 PIN= insight) =====
+    // LLAMA_V8_PARTITION=<policy>:
+    //   ffn-cpu       — 所有 ffn ops → CPU, attn ops → GPU
+    //                   (用 phase1 "PIN=norm,k,v,q" 思路: 小 weights 留 GPU, 大 ffn 移 CPU)
+    //   attn-cpu      — 反过来: ffn 留 GPU, attn 移 CPU
+    //   layer-mod-N   — 每 N 层 1 个 CPU (稀疏分布), e.g., N=4 → layer 3, 7, 11, ... 在 CPU
+    //   first-K-cpu   — 前 K 层 → CPU (early-layer offload, 余下 GPU)
+    if (const char *pv82 = std::getenv("LLAMA_V8_PARTITION")) {
+        struct v82_state {
+            std::string policy;
+            int param = 4;
+            int cpu_id = 0;
+            int gpu_id = -1;
+            uint64_t n_cpu = 0, n_gpu = 0;
+        };
+        static v82_state v82s;
+        v82s.policy = pv82;
+        if (const char *p = std::getenv("LLAMA_V8_PARTITION_PARAM")) v82s.param = std::atoi(p);
+        v82s.cpu_id = llama_n_backends(ctx) - 1;
+        v82s.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+        LOG_INF("[v8.2-partition] policy=%s param=%d cpu=%d gpu=%d\n",
+                v82s.policy.c_str(), v82s.param, v82s.cpu_id, v82s.gpu_id);
+
+        llama_set_op_schedule(ctx, [](const struct ggml_tensor */*node*/, const char *name,
+                                       int layer, void *ud) -> int {
+            auto *s = (v82_state *)ud;
+            if (layer < 0 || !name) return -1;
+            const std::string &pol = s->policy;
+            int target = -1;
+            bool is_ffn = (strncmp(name, "ffn_", 4) == 0);
+            // 只路由 attn 中带 weight 的 (Q/K/V proj + output proj), 不路由 kq/kqv
+            // (activation×activation, 没 weight, 跨 backend 自动 copy 在 ggml-sched
+            // split 里 OK 但实际有 case 崩, v8.3 再调).
+            bool is_attn = (strncmp(name, "Qcur", 4) == 0 || strncmp(name, "Kcur", 4) == 0
+                            || strncmp(name, "Vcur", 4) == 0 || strncmp(name, "attn_out", 8) == 0);
+            if (pol == "ffn-cpu") {
+                if (is_ffn) target = s->cpu_id;
+            } else if (pol == "attn-cpu") {
+                if (is_attn) target = s->cpu_id;
+            } else if (pol == "layer-mod-N") {
+                if (s->param > 0 && (layer % s->param) == (s->param - 1)) target = s->cpu_id;
+            } else if (pol == "first-K-cpu") {
+                if (layer < s->param) target = s->cpu_id;
+            }
+            if (target == s->cpu_id) s->n_cpu++;
+            else if (target != -1)   s->n_gpu++;
+            return target;
+        }, &v82s);
+
+        std::atexit([]() {
+            LOG_INF("[v8.2-partition] policy=%s ops: CPU=%llu  GPU=%llu\n",
+                    v82s.policy.c_str(),
+                    (unsigned long long)v82s.n_cpu,
+                    (unsigned long long)v82s.n_gpu);
+        });
+    }
+
     // ===== Demo: schedule callback (LLAMA_TEST_SCHEDULE=1) =====
     // 演示 op-schedule + weight-pin callback API. 真实 LP solver 接入时用类似 pattern.
     if (const char *e = std::getenv("LLAMA_TEST_SCHEDULE"); e && *e && *e != '0') {
