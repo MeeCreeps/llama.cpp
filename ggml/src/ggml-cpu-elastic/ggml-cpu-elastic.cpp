@@ -52,6 +52,7 @@ struct elastic_state {
     size_t misc_overhead   = 256ULL * 1024 * 1024;
     size_t static_target   = 0;       // = M_floor - kv - misc + extra_target
     size_t extra_target    = 0;       // EMBED_OUTSIDE_BUDGET 等加进来
+    bool   dynamic_target  = false;   // GGML_ELASTIC_DYNAMIC=1: 用 B(t) 实时算 target
     int    evict_interval  = 8;
 
     int    prefetch_lookahead = 0;    // posix_madvise lookahead
@@ -326,8 +327,12 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 size_t mfloor = s->bw.m_floor_mb * 1024 * 1024;
                 size_t kvm    = s->kv_bytes + s->misc_overhead;
                 s->static_target = mfloor > kvm ? mfloor - kvm : 0;
-                GGML_LOG_INFO("elastic: BudgetWatcher trace=%s M_floor=%zu MB -> static_target=%zu MB\n",
-                              csv, s->bw.m_floor_mb, s->static_target / 1024 / 1024);
+                if (const char *d = std::getenv("GGML_ELASTIC_DYNAMIC"); d && *d && *d != '0') {
+                    s->dynamic_target = true;
+                }
+                GGML_LOG_INFO("elastic: BudgetWatcher trace=%s M_floor=%zu MB -> static_target=%zu MB mode=%s\n",
+                              csv, s->bw.m_floor_mb, s->static_target / 1024 / 1024,
+                              s->dynamic_target ? "DYNAMIC" : "static");
             }
         }
     }
@@ -500,8 +505,14 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
         return true;
     };
 
-    auto target_bytes = [&]() {
+    auto target_bytes = [&]() -> size_t {
         if (!s->bw_inited) return SIZE_MAX;  // 没 trace → 不 evict
+        if (s->dynamic_target) {
+            const size_t bt   = elastic::budget_watcher_get(&s->bw) * size_t(1024 * 1024);
+            const size_t km   = s->kv_bytes + s->misc_overhead;
+            const size_t base = bt > km ? bt - km : 0;
+            return base + s->extra_target;
+        }
         return s->static_target;  // baseline 静态
     };
 
