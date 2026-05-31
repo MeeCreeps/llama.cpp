@@ -82,6 +82,26 @@ struct ggml_backend_sched {
 **CPU GEMM 时间占大头**, 不是 dispatch overhead 主导. v4 cache 主要省掉 alloc/free
 overhead (~3-5 ms/migration). 剩下慢的部分需要更深的改造.
 
+## v5 — smart-pressure policy (实用 deploy 模式)
+
+把无脑全切改成"只在压力下切几个 ffn":
+- mem_avail > threshold (默认 1500 MB) → 0 override = 0 overhead
+- mem_avail < threshold → 只切前 K 层 ffn (默认 4)
+
+实测:
+- **smart-pressure (无压力)**: 137 ms/tok = 跟 baseline 一致 (1×)
+- smart-pressure (强制触发, 12 over/tok): 236 ms/tok (1.7×)
+- alternate (无脑切 50%, 886 over/tok): 882 ms/tok (6.3×) — 太重
+
+```bash
+LLAMA_TEST_OP_RUNTIME_DISPATCH=smart-pressure
+LLAMA_OP_DISPATCH_PRESSURE_MB=1500     # 压力阈值
+LLAMA_OP_DISPATCH_MAX_FFN_LAYERS=4     # 最多切几层 ffn
+GGML_SCHED_RUNTIME_DISPATCH_MIGRATE=1  # 启用真切换
+```
+
+这是 deploy 推荐路径: 99% 时间走 GPU, 偶尔 mem 紧时 offload 几个 ffn 给 GPU 喘气.
+
 ## 何时用 / 何时不用
 
 ✅ **用**:
