@@ -194,6 +194,27 @@ int main(int argc, char ** argv) {
         LOG_INF("[v8-partition] layer < %d → GPU, ≥ → CPU (n_backends=%d cpu=%d gpu=%d)\n",
                 v8s.partition_layer, llama_n_backends(ctx), v8s.cpu_id, v8s.gpu_id);
 
+        // v9: 主动 evict partition-out 层的 weight cl_mem (释放 GPU 内存).
+        // 这些 weight 由 v8.4 host_ptr fallback 从 mmap 读, 不需要 cl_mem.
+        // 给 elastic backend 让出 budget headroom 给真正 GPU 上跑的 layer.
+        // env LLAMA_V9_EVICT_OUT=1 启用 (默认关, 因为需要 elastic mode 才有 evict API).
+        if (std::getenv("LLAMA_V9_EVICT_OUT")) {
+            uint64_t n_evicted = 0;
+            const char *tensors[] = {"attn_q", "attn_k", "attn_v", "attn_output",
+                                     "attn_norm", "ffn_norm",
+                                     "ffn_gate", "ffn_up", "ffn_down"};
+            for (int L = v8s.partition_layer; L < llama_model_n_layer(model); L++) {
+                for (auto t : tensors) {
+                    char nm[64]; std::snprintf(nm, sizeof(nm), "blk.%d.%s.weight", L, t);
+                    if (llama_weight_request_evict(ctx, nm) == 0) {
+                        n_evicted++;
+                    }
+                }
+            }
+            LOG_INF("[v9-evict] partition-out (layer ≥ %d) weights evicted: %llu\n",
+                    v8s.partition_layer, (unsigned long long)n_evicted);
+        }
+
         llama_set_op_schedule(ctx, [](const struct ggml_tensor */*node*/, const char */*name*/,
                                       int layer, void *ud) -> int {
             auto *s = (v8_state *)ud;
