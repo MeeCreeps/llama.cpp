@@ -1,0 +1,12 @@
+# preset: static_baseline
+# 静态预算 baseline — target 锁在 min(B(t)), 全程不变。MRU 驱逐 (默认)。
+# 等价命令:
+#   GGML_OPENCL_ELASTIC=1 \
+#   GGML_ELASTIC_BUDGET_CSV=<trace.csv> \
+#   ./llama-cli ...
+
+GGML_OPENCL_ELASTIC: 1
+GGML_ELASTIC_BUDGET_CSV: ./trace.csv
+GGML_ELASTIC_DYNAMIC: 0          # static
+GGML_ELASTIC_EVICT_POLICY: mru   # 默认
+GGML_ELASTIC_EVICT_WAIT: 0       # 默认不等 (MRU + sampling drain 安全)

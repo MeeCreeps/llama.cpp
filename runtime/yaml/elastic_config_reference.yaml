@@ -1,0 +1,189 @@
+# elastic_config_reference.yaml
+#
+# llama.cpp elastic weight-streaming 全部配置参考。
+# 目前这些配置由环境变量驱动 (运行时读 getenv)，本文件是它们的 YAML 化清单：
+# 每项给出 env 名、默认值、类型、含义。`env:` 字段是对应的环境变量名。
+#
+# 用法 (当前):  export <env>=<value>  然后跑 llama-cli
+# 例:  GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_DYNAMIC=1 \
+#      GGML_ELASTIC_BUDGET_CSV=trace.csv ./llama-cli ...
+#
+# 平台: OpenCL backend (Adreno) 用全部项; CPU-elastic backend 用其中
+#       budget/mode/eviction/prefetch/pin/io 子集 (无 cl_mem retain / xfer queue)。
+
+# ── 总开关 ───────────────────────────────────────────────
+gate:
+  enable_opencl_elastic:
+    env: GGML_OPENCL_ELASTIC
+    default: 0           # 0=关 (零侵入), 1=开 per-tensor cl_mem 弹性流式
+    type: bool
+
+# ── 预算与模式 ───────────────────────────────────────────
+budget:
+  budget_csv:
+    env: GGML_ELASTIC_BUDGET_CSV
+    default: ""          # 空=不限预算 (不 evict). 指向 CSV trace 文件
+    type: path
+    note: |
+      CSV 格式 header 决定时间单位:
+        t_ms,B_MB   → 时间列毫秒 (loader ÷1000 转秒)
+        t_sec,B_MB  → 时间列秒
+      无 header 默认按 ms。列1=时间, 列2=该时刻总预算(MB)。
+  dynamic:
+    env: GGML_ELASTIC_DYNAMIC
+    default: 0           # 0=static, 1=dynamic
+    type: bool
+    note: |
+      static : target = (min(B(t)) - kv - misc), lazy_init 时算一次, 全程不变。
+      dynamic: target = (B(t) - kv - misc + extras), 每次 graph_compute 实时跟 trace。
+      dynamic 优势仅在 budget 时变时体现; 恒定 budget 下与 static 等价。
+  kv_mb:
+    env: GGML_ELASTIC_KV_MB
+    default: 128         # 从预算里给 KV cache 预留的 MB
+    type: int
+  misc_mb:
+    env: GGML_ELASTIC_MISC_MB
+    default: 256         # 从预算里给 compute/激活预留的 MB
+    type: int
+    note: target = budget - kv_mb - misc_mb。设 kv=misc=0 可让 target=budget。
+
+# ── 驱逐策略 ─────────────────────────────────────────────
+eviction:
+  policy:
+    env: GGML_ELASTIC_EVICT_POLICY
+    default: mru         # mru | lru
+    type: enum
+    note: |
+      mru (默认): 踢最近用过的。LLM decode round-robin 下最优 —
+                  刚用的 weight 要等一整圈才再用, evict 它不造成 miss。
+      lru: 踢最久没用的。cache<model 时近 100% miss (每 token 重读整个模型), 仅调试用。
+  evict_wait:
+    env: GGML_ELASTIC_EVICT_WAIT
+    default: 0           # 0=不等(默认), 1=evict 前插 marker 等 queue drain
+    type: bool
+    note: |
+      默认不等: MRU + decode 每 token sampling 读 logits 会隐式 drain 整个 graph,
+      下个 token evict 时 victim 的 kernel 必已完成, 等待是纯 overhead。
+      无 sampling barrier 的场景 (纯 prompt batch / 调试) 可设 1 保守等待。
+  evict_interval:
+    env: GGML_ELASTIC_EVICT_INTERVAL
+    default: 8           # 每 N 个 op 检查一次字节预算 (节流), 不是每 op 都查
+    type: int
+
+# ── 预取 (prefetch) ──────────────────────────────────────
+prefetch:
+  cpu_prefetch_lookahead:
+    env: GGML_ELASTIC_PREFETCH
+    default: 0           # N>0: 对后 N 个 node 的 src 发 posix_madvise WILLNEED
+    type: int
+  gpu_prefetch_lookahead:
+    env: GGML_ELASTIC_GPU_PREFETCH
+    default: 0           # N>0: 对后 N 个 node 提前 clEnqueueWriteBuffer 到 GPU
+    type: int
+  gpu_prefetch_inflight_mb:
+    env: GGML_ELASTIC_GPU_PREFETCH_INFLIGHT_MB
+    default: 0           # GPU prefetch 在途字节上限 (MB), 0=不限
+    type: int
+  soa_prefetch:
+    env: GGML_ELASTIC_SOA_PREFETCH
+    default: 1           # 量化 SOA tensor 是否走 prefetch reload_fn。1=开, 0=关
+    type: bool
+
+# ── 异步传输 (xfer queue) ────────────────────────────────
+async_xfer:
+  async_xfer:
+    env: GGML_ELASTIC_ASYNC_XFER
+    default: 0           # 0=单队列同步上传(Adreno 上实测更快), 1=独立 xfer_queue 异步
+    type: bool
+  xfer_extra:
+    env: GGML_ELASTIC_XFER_EXTRA
+    default: 0           # 额外 xfer queue 数 (0..4), round-robin 派发求 DMA 并行
+    type: int
+  dual_xfer:
+    env: GGML_ELASTIC_DUAL_XFER
+    default: 0           # 双 xfer queue 实验开关
+    type: bool
+  reload_on_xfer:
+    env: GGML_ELASTIC_RELOAD_ON_XFER
+    default: 0           # 1=SOA convert/transpose 也跑 xfer_queue, 不挤 compute_queue
+    type: bool
+
+# ── cl_mem retain pool ───────────────────────────────────
+retain_pool:
+  retain:
+    env: GGML_ELASTIC_CL_RETAIN
+    default: 0           # 1=evict 不真释放 cl_mem, 按 size 入池复用 (省 driver alloc)
+    type: bool
+  retain_mb:
+    env: GGML_ELASTIC_CL_RETAIN_MB
+    default: 0           # pool 字节上限 MB; 0=不限; "auto"=按 max_block 自算
+    type: int|auto
+  retain_counts_budget:
+    env: GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET
+    default: 0           # 1=pool 占用算进预算 (working_set+pool ≤ target, 严格合规)
+    type: bool
+
+# ── 权重 pin (常驻不踢) ──────────────────────────────────
+pinning:
+  pin_suffixes:
+    env: GGML_ELASTIC_PIN
+    default: "norm,k,v"  # 按 tensor name 后缀 pin (常驻). 小而频繁的张量
+    type: csv
+  embed_outside_budget:
+    env: GGML_ELASTIC_EMBED_OUTSIDE_BUDGET
+    default: 0           # 1=token_embd 永驻且其字节加进 extra (不占常规预算)
+    type: bool
+
+# ── 磁盘 IO ──────────────────────────────────────────────
+io:
+  direct_io:
+    env: GGML_ELASTIC_DIRECT_IO
+    default: 0           # 1=reload 走 O_DIRECT pread (绕 page cache, 模拟真 disk 成本)
+    type: bool
+    note: |
+      非 SOA (f16 等) 与 SOA 量化路径均支持 (ggml-opencl)。
+      绕过 page cache → 每次 reload 真打盘, 用于 model>RAM 的 disk-bound 实验。
+  uring:
+    env: GGML_ELASTIC_URING
+    default: 0           # 1=CPU-elastic 用 io_uring 多 chunk lookahead 异步读
+    type: bool
+  chunk_size:
+    env: GGML_ELASTIC_CHUNK_SIZE
+    default: 0           # CPU-elastic worker thread chunk 大小; 0=关 chunked path
+    type: int
+  use_host_ptr:
+    env: GGML_ELASTIC_USE_HOST_PTR
+    default: 0           # 1=cl_mem 用 CL_MEM_USE_HOST_PTR 绑 mmap (Adreno UMA 零拷贝实验)
+    type: bool
+    note: 与 direct_io 互斥; direct_io 开时此项被忽略。
+  no_madvise:
+    env: GGML_ELASTIC_NO_MADVISE
+    default: 0           # 1=CPU-elastic evict 跳过 madvise(DONTNEED), 只 mark (调试)
+    type: bool
+  no_transpose:
+    env: GGML_ELASTIC_NO_TRANSPOSE
+    default: 0           # 1=SOA reload 跳过 transpose kernel (调试)
+    type: bool
+
+# ── 指标 / 调试 ──────────────────────────────────────────
+metrics:
+  metrics_jsonl:
+    env: GGML_ELASTIC_METRICS_JSONL
+    default: ""          # 路径: 每 decode step 写一行 JSONL (t,B_t_mb,resident_bytes,...)
+    type: path
+  profile:
+    env: GGML_ELASTIC_PROFILE
+    default: 0           # 1=按 tensor/op 聚合三段计时 (io / compute / overhead)
+    type: bool
+  timing:
+    env: GGML_ELASTIC_TIMING
+    default: 0           # 1=打印 reload host-issue / GPU 时间细分
+    type: bool
+  debug:
+    env: GGML_ELASTIC_DEBUG
+    default: 0
+    type: bool
+  debug_reload:
+    env: GGML_ELASTIC_DEBUG_RELOAD
+    default: 0           # 1=打印前几次 reload 的字节对比 (correctness 调试)
+    type: bool

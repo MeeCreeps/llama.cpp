@@ -1,0 +1,14 @@
+# preset: dynamic
+# 动态预算 — target 实时跟随 B(t) trace。MRU 驱逐。
+# 高预算窗口模型常驻省 reload, 低预算窗口退化到 static 水平。
+# 等价命令:
+#   GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_DYNAMIC=1 \
+#   GGML_ELASTIC_BUDGET_CSV=<trace.csv> \
+#   ./llama-cli ...
+
+GGML_OPENCL_ELASTIC: 1
+GGML_ELASTIC_DYNAMIC: 1          # 跟随 B(t)
+GGML_ELASTIC_BUDGET_CSV: ./trace.csv
+GGML_ELASTIC_EVICT_POLICY: mru
+GGML_ELASTIC_EVICT_WAIT: 0
+GGML_ELASTIC_METRICS_JSONL: ./metrics.jsonl   # 建议开, 验证 B_t_mb 真随 trace 变

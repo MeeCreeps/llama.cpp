@@ -1,0 +1,17 @@
+# preset: disk_bound_benchmark
+# model > RAM 的真 disk-bound 实验 — 每次 reload 走 O_DIRECT pread (绕 page cache),
+# 把磁盘成本暴露出来, 数据不受 page cache 命中波动干扰。配合 memory eater 制造压力。
+# 等价命令:
+#   GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_DYNAMIC=1 GGML_ELASTIC_DIRECT_IO=1 \
+#   GGML_ELASTIC_BUDGET_CSV=<trace.csv> \
+#   ./llama-cli ...
+
+GGML_OPENCL_ELASTIC: 1
+GGML_ELASTIC_DYNAMIC: 1
+GGML_ELASTIC_DIRECT_IO: 1        # O_DIRECT, 绕 page cache
+GGML_ELASTIC_BUDGET_CSV: ./trace.csv
+GGML_ELASTIC_EVICT_POLICY: mru
+GGML_ELASTIC_EVICT_WAIT: 0
+GGML_ELASTIC_KV_MB: 0            # 让 target = budget (干净的 budget sweep)
+GGML_ELASTIC_MISC_MB: 0
+GGML_ELASTIC_METRICS_JSONL: ./metrics.jsonl
