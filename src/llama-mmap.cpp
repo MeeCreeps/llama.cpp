@@ -756,6 +756,49 @@ int64_t llama_budget_query(void) {
     }
     return fn ? fn(ud) : -1;
 }
+
+// === Budget target hook (scheduler 的 "留多少" 维度) ===
+namespace {
+std::mutex                g_budget_target_mtx;
+llama_budget_target_fn_t  g_budget_target_fn = nullptr;
+void *                    g_budget_target_ud = nullptr;
+}
+void llama_budget_target_register(llama_budget_target_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_budget_target_mtx);
+    g_budget_target_fn = fn;
+    g_budget_target_ud = user_data;
+}
+bool llama_budget_target_active(void) {
+    std::lock_guard<std::mutex> lk(g_budget_target_mtx);
+    return g_budget_target_fn != nullptr;
+}
+size_t llama_budget_target_query(int64_t b_t_mb, int64_t m_floor_mb, size_t kv_bytes, size_t misc_bytes) {
+    llama_budget_target_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_budget_target_mtx);
+        fn = g_budget_target_fn;
+        ud = g_budget_target_ud;
+    }
+    return fn ? fn(b_t_mb, m_floor_mb, kv_bytes, misc_bytes, ud) : SIZE_MAX;
+}
+
+// === Victim selector hook (scheduler 的 "踢哪个" 维度) ===
+namespace {
+std::mutex         g_victim_mtx;
+llama_victim_fn_t  g_victim_fn = nullptr;
+void *             g_victim_ud = nullptr;
+}
+void llama_victim_register(llama_victim_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_victim_mtx);
+    g_victim_fn = fn;
+    g_victim_ud = user_data;
+}
+llama_victim_fn_t llama_victim_query(void ** out_user_data) {
+    std::lock_guard<std::mutex> lk(g_victim_mtx);
+    if (out_user_data) *out_user_data = g_victim_ud;
+    return g_victim_fn;
+}
 void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_res_providers.emplace_back(fn, user_data);

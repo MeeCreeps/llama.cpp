@@ -134,3 +134,24 @@ void * llama_weight_host_ptr_query (const char * name);
 typedef int64_t (*llama_budget_fn_t)(void * user_data);
 void    llama_budget_register(llama_budget_fn_t fn, void * user_data);
 int64_t llama_budget_query(void);   // 返回当前预算 MB; 无 provider 或无效返 -1
+
+// === Budget target hook (统一 scheduler 的 "留多少" 维度) ===
+// scheduler 决定"这一刻 GPU 上留多少字节 weight"。 给当前预算 b_t_mb + trace 最低
+// m_floor_mb + kv/misc 扣除, 返回 target 字节。 elastic backend 算驱逐目标时调它:
+//   static builtin  → 忽略 b_t_mb, 用 m_floor_mb (恒定保守);
+//   dynamic builtin → 用 b_t_mb (随 trace 变)。
+// llama_set_scheduler_v2 注册; 没注册时 backend 用自己的 static/dynamic 旧逻辑。
+// 单 slot。 SIZE_MAX 哨兵 = 没注册。 runtime 库通过这个解耦, 不依赖 llama.h。
+typedef size_t (*llama_budget_target_fn_t)(int64_t b_t_mb, int64_t m_floor_mb,
+                                           size_t kv_bytes, size_t misc_bytes, void * user_data);
+void   llama_budget_target_register(llama_budget_target_fn_t fn, void * user_data);
+bool   llama_budget_target_active(void);   // 有 scheduler 注册了吗
+size_t llama_budget_target_query(int64_t b_t_mb, int64_t m_floor_mb, size_t kv_bytes, size_t misc_bytes);
+
+// === Victim selector hook (统一 scheduler 的 "踢哪个" 维度) ===
+// scheduler 决定驱逐时踢哪个 block。 签名跟 weight_buffer_manager::victim_fn 一致,
+// 但用 void* 避免 llama-mmap 依赖 runtime header。 backend 在 init 时把注册的指针
+// 灌进 wbm.victim_fn。 单 slot。 nullptr = 没注册 (用内置 MRU/LRU)。
+typedef int (*llama_victim_fn_t)(const void * wbm, int exclude_idx, void * user_data);
+void              llama_victim_register(llama_victim_fn_t fn, void * user_data);
+llama_victim_fn_t llama_victim_query(void ** out_user_data);  // 返回注册的 fn (没有返 nullptr)
