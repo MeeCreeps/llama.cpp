@@ -3097,6 +3097,18 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
         return;
     }
+    // GGML_ELASTIC_DIRECT_IO=1: 非 SOA reload 也走 O_DIRECT pread (绕 page cache,
+    // 模拟 model>RAM 真 disk 成本). 注入函数指针, 让 runtime 层不直接依赖 libllama.
+    // (SOA 量化路径在 reload_fn 里另有自己的 direct 逻辑.)
+    if (const char *d = std::getenv("GGML_ELASTIC_DIRECT_IO"); d && *d && *d != '0') {
+        s->octx.direct_read_fn = [](const void *host_ptr, void *dst, size_t nbytes) -> int {
+            auto reg = llama_mmap_registry_find(host_ptr);
+            if (reg.filename.empty()) return -1;
+            size_t file_offset = (const char *)host_ptr - (const char *)reg.base;
+            return llama_pread_direct(reg.filename.c_str(), dst, file_offset, nbytes);
+        };
+        GGML_LOG_INFO("ggml_opencl elastic: 非 SOA reload 启用 O_DIRECT (DIRECT_IO=1)\n");
+    }
     if (const char *r = std::getenv("GGML_ELASTIC_CL_RETAIN"); r && *r && *r != '0') {
         s->octx.retain_cl_mem = true;
         // GGML_ELASTIC_CL_RETAIN_MB=N 设 pool 上限（MB）；"auto" 让 backend

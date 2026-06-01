@@ -84,6 +84,11 @@ struct wbm_opencl_ctx {
     cl_mem            soa_staging          = nullptr;
     size_t            soa_staging_capacity = 0;
     cl_event          soa_staging_last_use_ev = nullptr;
+
+    // O_DIRECT reload (非 SOA 路径). GGML_ELASTIC_DIRECT_IO=1 时由 ggml-opencl 注入:
+    // 给 host_ptr (mmap VA) 反查文件 + O_DIRECT pread 到 dst, 返 0 成功. runtime 层
+    // 不直接依赖 libllama, 通过函数指针解耦. nullptr = 走 mmap host_ptr (默认).
+    int (*direct_read_fn)(const void *host_ptr, void *dst, size_t nbytes) = nullptr;
 };
 
 void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
