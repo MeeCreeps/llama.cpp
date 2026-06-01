@@ -3035,11 +3035,15 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
-    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 lru）。LLM decode 是 round-robin
+    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 mru）。LLM decode 是 round-robin
     // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
-    // MRU 反而能让命中率随 cache/model 比例线性提升。
+    // MRU 反而能让命中率随 cache/model 比例线性提升。wbm.evict_mru 默认已 true，
+    // 这里只处理 env 显式切回 lru 调试。
     if (const char *p = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
-        if (std::string(p) == "mru") {
+        if (std::string(p) == "lru") {
+            s->wbm.evict_mru = false;
+            GGML_LOG_INFO("ggml_opencl elastic: 切回 LRU 驱逐策略 (调试)\n");
+        } else if (std::string(p) == "mru") {
             s->wbm.evict_mru = true;
             GGML_LOG_INFO("ggml_opencl elastic: 启用 MRU 驱逐策略\n");
         }
