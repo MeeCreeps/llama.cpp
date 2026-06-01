@@ -222,14 +222,21 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
 
     cl_mem buf = static_cast<cl_mem>(meta->backend_handle);
 
-    // in-order queue：插 1 个 marker 等 queue 跑完 prior kernel
-    cl_event marker = nullptr;
-    cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
-    if (merr == CL_SUCCESS && marker) {
-        clWaitForEvents(1, &marker);
-        clReleaseEvent(marker);
-    } else {
-        clFinish(octx->compute_queue);
+    // 默认不等 queue drain (MRU + 每 token sampling barrier 保证 victim 已 idle,
+    // 详见 wbmcl_evict_batch)。GGML_ELASTIC_EVICT_WAIT=1 恢复保守等待。
+    static const bool s_evict_wait = []() {
+        const char *e = std::getenv("GGML_ELASTIC_EVICT_WAIT");
+        return e && *e && *e != '0';
+    }();
+    if (s_evict_wait) {
+        cl_event marker = nullptr;
+        cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
+        if (merr == CL_SUCCESS && marker) {
+            clWaitForEvents(1, &marker);
+            clReleaseEvent(marker);
+        } else {
+            clFinish(octx->compute_queue);
+        }
     }
     // 兼容残留 last_use_event 引用
     if (meta->last_use_event) {
@@ -346,24 +353,33 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
 int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
     if (!octx || !octx->wbm || !victims || n_victims <= 0) return 0;
 
-    // in-order queue 顺序保证：在 queue 末尾插一个 marker，等它完成就等于等
-    // queue 上所有 prior kernel 完成（含最后一次用 victim 的 kernel）。
-    // 不需要 per-block 精细追踪——graph_compute 那边因此不再 stamp per-op
-    // marker，省 ~18k OpenCL API call / token。
-    cl_event marker = nullptr;
-    cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
-    if (merr == CL_SUCCESS && marker) {
-        cl_int werr = clWaitForEvents(1, &marker);
-        if (werr != CL_SUCCESS) {
-            std::fprintf(stderr, "[wbmcl] evict-marker clWaitForEvents 失败: %s (%d)\n",
-                         cl_err(werr), werr);
+    // evict 前是否等 queue drain。默认 *不等*：
+    //   MRU 策略下 victim = 上一个 graph 最近用过的 weight；而 decode 每个 token
+    //   结尾要 sampling，读 logits 会隐式 drain 整个 graph → 下个 token 的 hook
+    //   进来做 evict 时，上个 graph 的所有 kernel (含 victim 最后一次使用) 必已完成。
+    //   所以插 marker + clWaitForEvents 是纯 overhead。
+    //   GGML_ELASTIC_EVICT_WAIT=1 恢复保守等待 (无 sampling barrier 的场景 / 调试)。
+    static const bool s_evict_wait = []() {
+        const char *e = std::getenv("GGML_ELASTIC_EVICT_WAIT");
+        return e && *e && *e != '0';
+    }();
+    if (s_evict_wait) {
+        // in-order queue 顺序保证：queue 末尾插 marker，等它 = 等所有 prior kernel
+        // (含最后用 victim 的 kernel) 完成。
+        cl_event marker = nullptr;
+        cl_int merr = clEnqueueMarkerWithWaitList(octx->compute_queue, 0, nullptr, &marker);
+        if (merr == CL_SUCCESS && marker) {
+            cl_int werr = clWaitForEvents(1, &marker);
+            if (werr != CL_SUCCESS) {
+                std::fprintf(stderr, "[wbmcl] evict-marker clWaitForEvents 失败: %s (%d)\n",
+                             cl_err(werr), werr);
+            }
+            clReleaseEvent(marker);
+        } else {
+            std::fprintf(stderr, "[wbmcl] enqueueMarker 失败: %s (%d) —— 退回 clFinish\n",
+                         cl_err(merr), merr);
+            clFinish(octx->compute_queue);
         }
-        clReleaseEvent(marker);
-    } else {
-        // fallback：marker 插入失败就 clFinish 全队列（保守正确）
-        std::fprintf(stderr, "[wbmcl] enqueueMarker 失败: %s (%d) —— 退回 clFinish\n",
-                     cl_err(merr), merr);
-        clFinish(octx->compute_queue);
     }
 
     // 释放 cl_mem + mark_evicted
