@@ -736,6 +736,25 @@ namespace {
 std::mutex                                                       g_weight_res_mtx;
 std::vector<std::pair<llama_weight_residency_fn_t, void *>>      g_weight_res_providers;
 std::vector<std::pair<llama_weight_movement_fn_t,  void *>>      g_weight_mov_providers;
+// Budget provider: 单 slot (预算是全局值)。
+std::mutex                                                       g_budget_mtx;
+llama_budget_fn_t                                                g_budget_fn = nullptr;
+void *                                                           g_budget_ud = nullptr;
+}
+void llama_budget_register(llama_budget_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_budget_mtx);
+    g_budget_fn = fn;
+    g_budget_ud = user_data;
+}
+int64_t llama_budget_query(void) {
+    llama_budget_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_budget_mtx);
+        fn = g_budget_fn;
+        ud = g_budget_ud;
+    }
+    return fn ? fn(ud) : -1;
 }
 void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);

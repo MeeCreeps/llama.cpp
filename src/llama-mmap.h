@@ -125,3 +125,12 @@ int  llama_weight_movement_request(const char * name, bool evict);
 typedef void * (*llama_weight_host_ptr_fn_t)(const char * name, void * user_data);
 void llama_weight_host_ptr_register(llama_weight_host_ptr_fn_t fn, void * user_data);
 void * llama_weight_host_ptr_query (const char * name);
+
+// === Budget provider (统一 scheduler 的内存信号源) ===
+// elastic backend 若启用了 BudgetWatcher (GGML_ELASTIC_BUDGET_CSV), 注册一个返回
+// "当前预算 MB" 的函数。 llama_context 的 runtime scheduler 优先用它 (跟 elastic
+// evict target 同源, 可重现); 没注册时 fallback /proc/meminfo MemAvailable。
+// 单 slot (预算是全局值, 不 chain)。 返回 < 0 表示该 provider 当前无有效预算。
+typedef int64_t (*llama_budget_fn_t)(void * user_data);
+void    llama_budget_register(llama_budget_fn_t fn, void * user_data);
+int64_t llama_budget_query(void);   // 返回当前预算 MB; 无 provider 或无效返 -1

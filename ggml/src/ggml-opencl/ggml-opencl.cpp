@@ -2997,6 +2997,15 @@ static int opencl_sched_movement_request(const char *name, bool evict, void * /*
     return rc == 0 ? 0 : -4;
 }
 
+// Budget provider: 把 BudgetWatcher 当前预算 (MB) 暴露给 llama_context 的 runtime
+// scheduler, 让 scheduler 跟 elastic evict target 用同一个内存信号源 (而非 /proc/meminfo)。
+// bw 没启用时返 -1 → scheduler fallback /proc/meminfo。
+static int64_t opencl_sched_budget_query(void * /*ud*/) {
+    auto *s = ggml_opencl_elastic();
+    if (!s->bw_inited) return -1;
+    return (int64_t) elastic::budget_watcher_get(&s->bw);
+}
+
 static void opencl_sched_register_once() {
     auto *s = ggml_opencl_elastic();
     if (s->sched_registered) return;
@@ -3004,6 +3013,7 @@ static void opencl_sched_register_once() {
     llama_weight_residency_register(opencl_sched_residency_query, nullptr);
     llama_weight_movement_register (opencl_sched_movement_request, nullptr);
     llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
+    llama_budget_register          (opencl_sched_budget_query,    nullptr);
 }
 
 // 提取 tensor 名后缀用于 profile 聚合：blk.<N>.<X>.weight → X

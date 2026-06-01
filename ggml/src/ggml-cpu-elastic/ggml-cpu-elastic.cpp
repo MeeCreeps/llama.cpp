@@ -156,6 +156,14 @@ void * elastic_sched_host_ptr_query(const char *name, void * /*ud*/) {
     return bm ? bm->host_ptr : nullptr;
 }
 
+// Budget provider: BudgetWatcher 当前预算 (MB) → llama_context scheduler 同源信号。
+// bw 没启用返 -1 → scheduler fallback /proc/meminfo。
+int64_t elastic_sched_budget_query(void * /*ud*/) {
+    auto *s = get_state();
+    if (!s->bw_inited) return -1;
+    return (int64_t) elastic::budget_watcher_get(&s->bw);
+}
+
 void elastic_sched_register_once() {
     auto *s = get_state();
     if (s->sched_registered) return;
@@ -163,6 +171,7 @@ void elastic_sched_register_once() {
     llama_weight_residency_register(elastic_sched_residency_query, nullptr);
     llama_weight_movement_register (elastic_sched_movement_request, nullptr);
     llama_weight_host_ptr_register (elastic_sched_host_ptr_query, nullptr);
+    llama_budget_register          (elastic_sched_budget_query,    nullptr);
 }
 
 // pinned 策略 / EMBED_OUTSIDE_BUDGET

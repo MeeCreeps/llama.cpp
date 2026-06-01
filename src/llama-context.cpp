@@ -777,7 +777,13 @@ void llama_context::maybe_run_scheduler() {
     if (scheduler_fn == nullptr) {
         return;
     }
-    const int64_t cur = (int64_t) read_mem_available_mb();
+    // 内存信号源: 优先用 elastic backend 注册的 BudgetWatcher 预算 (跟 evict target
+    // 同源, 可重现; GGML_ELASTIC_BUDGET_CSV 一套 trace 同时驱动 evict 与 scheduler)。
+    // 没注册 (没开 elastic / 没 CSV) 时 fallback /proc/meminfo MemAvailable (真实部署)。
+    int64_t cur = llama_budget_query();
+    if (cur < 0) {
+        cur = (int64_t) read_mem_available_mb();
+    }
     const int64_t prev = last_mem_avail_mb;
     const int64_t delta = (prev < 0) ? 0 : (cur - prev);
 
