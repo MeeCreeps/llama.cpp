@@ -100,6 +100,12 @@ int budget_watcher_load_csv(budget_watcher *bw, const char *csv_path) {
 
     bw->schedule.clear();
 
+    // 时间列单位换算成秒. CSV header 决定: "t_ms" → ÷1000, "t_sec"/"time_sec" → ×1.
+    // 历史上所有 trace CSV 都是 t_ms (0,100,...,60000), 但 schedule + 线程查询用秒,
+    // 不换算的话 t_sec(0~30) 永远落在头两行之间 → budget 冻在第一个值 (老 bug).
+    // 无 header 时默认按 ms (现存 CSV 全是 ms), 避免再踩冻结坑.
+    double time_scale = 0.001;
+
     std::string line;
     bool first_data_line = true;
     size_t line_no       = 0;
@@ -123,7 +129,12 @@ int budget_watcher_load_csv(budget_watcher *bw, const char *csv_path) {
         double ts = 0.0, bmb = 0.0;
         if (!try_parse_double(col0, ts) || !try_parse_double(col1, bmb)) {
             if (first_data_line) {
-                // 首行不能解析当作 header 跳过
+                // 首行不能解析当作 header 跳过. 顺便看时间列单位: 含 "sec" 用秒,
+                // 含 "ms" 用毫秒. ("t_ms" 命中 ms; "t_sec"/"time_sec" 命中 sec)
+                std::string h = col0;
+                for (auto &c : h) c = (char)tolower((unsigned char)c);
+                if (h.find("sec") != std::string::npos)      time_scale = 1.0;
+                else if (h.find("ms") != std::string::npos)  time_scale = 0.001;
                 first_data_line = false;
                 continue;
             }
@@ -133,7 +144,7 @@ int budget_watcher_load_csv(budget_watcher *bw, const char *csv_path) {
         }
         first_data_line = false;
         if (bmb < 0.0) bmb = 0.0;
-        bw->schedule.emplace_back(ts, static_cast<size_t>(bmb + 0.5));
+        bw->schedule.emplace_back(ts * time_scale, static_cast<size_t>(bmb + 0.5));
     }
 
     if (bw->schedule.empty()) {
