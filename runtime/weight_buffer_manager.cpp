@@ -119,6 +119,14 @@ void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned) {
 int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
     if (!wbm) return -1;
     int victim = -1;
+    if (wbm->victim_fn) {
+        victim = wbm->victim_fn(wbm, exclude_idx, wbm->victim_ud);
+        if (victim >= 0) {
+            const block_meta &bv = wbm->blocks[victim];
+            if (!bv.resident || bv.is_pinned || victim == exclude_idx) victim = -1;
+        }
+        return victim;
+    }
     if (wbm->evict_mru) {
         // MRU：选 last_used_token 最大（刚被访问过的）
         uint64_t newest = 0;
@@ -164,16 +172,27 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
     size_t simulated_bytes = wbm->resident_bytes;
     std::vector<bool> picked(wbm->blocks.size(), false);
     int n_picked = 0;
+    // 本轮选中的 victim 临时置 resident=false, 防 victim_fn / 内置策略重复选中
+    // (它们都以 !resident 为过滤条件); 函数末尾恢复, 真正的 mark_evicted 由调用方做。
+    std::vector<int> hidden;
     while (simulated_bytes > target_bytes) {
         int victim = -1;
-        if (wbm->evict_mru) {
+        if (wbm->victim_fn) {
+            // 注入的 pick_victim hook (桥接到用户 scheduler)。 看 wbm 当前 resident
+            // 候选 (已 picked 的本轮被置 resident=false, 不会被选)。
+            victim = wbm->victim_fn(wbm, exclude_idx, wbm->victim_ud);
+            // 防御: hook 返回非候选 (pinned/exclude/非 resident) 时丢弃, 退出
+            if (victim >= 0) {
+                const block_meta &bv = wbm->blocks[victim];
+                if (!bv.resident || bv.is_pinned || victim == exclude_idx) victim = -1;
+            }
+        } else if (wbm->evict_mru) {
             uint64_t newest = 0;
             bool found = false;
             for (const auto &b : wbm->blocks) {
                 if (!b.resident)               continue;
                 if (b.is_pinned)               continue;
                 if (b.block_idx == exclude_idx) continue;
-                if (picked[b.block_idx])        continue;
                 if (!found || b.last_used_token > newest) {
                     newest = b.last_used_token;
                     victim = b.block_idx;
@@ -186,7 +205,6 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
                 if (!b.resident)               continue;
                 if (b.is_pinned)               continue;
                 if (b.block_idx == exclude_idx) continue;
-                if (picked[b.block_idx])        continue;
                 if (b.last_used_token < oldest) {
                     oldest = b.last_used_token;
                     victim = b.block_idx;
@@ -195,10 +213,13 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
         }
         if (victim < 0) break;
         picked[victim] = true;
+        wbm->blocks[victim].resident = false;   // 临时隐藏 (末尾恢复)
+        hidden.push_back(victim);
         simulated_bytes -= wbm->blocks[victim].byte_size;
         out_victims->push_back(victim);
         ++n_picked;
     }
+    for (int v : hidden) wbm->blocks[v].resident = true;  // 恢复; mark_evicted 由调用方做
     return n_picked;
 }
 

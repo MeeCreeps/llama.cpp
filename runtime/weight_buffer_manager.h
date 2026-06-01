@@ -49,6 +49,14 @@ struct weight_buffer_manager {
     // → cache<model 时近 100% miss。实测 MRU 显著优于 LRU，故设为默认。
     // 调试时可经 GGML_ELASTIC_EVICT_POLICY=lru 切回。
     bool evict_mru = true;
+
+    // 可插拔的 victim 选择 (统一 scheduler 的 pick_victim hook 落点)。
+    // nullptr = 用内置 MRU/LRU (上面的 evict_mru 决定)。 非空时 evict 路径改调它:
+    // 给定当前 wbm + exclude_idx, 返回要踢的 block_idx (-1 = 没有可踢的)。
+    // 由 llama-context 注入 (内部桥接到用户 scheduler 的 pick_victim);
+    // runtime 库不依赖 llama, 只持函数指针。 详见 docs/elastic/unified_scheduler_design.md。
+    int  (*victim_fn)(const weight_buffer_manager *wbm, int exclude_idx, void *ud) = nullptr;
+    void *victim_ud = nullptr;
 };
 
 // 初始化：分配 n_blocks 个空槽位（block_idx = 0..n_blocks-1）。
