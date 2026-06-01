@@ -43,10 +43,12 @@ struct weight_buffer_manager {
     int      n_resident;
     size_t   resident_bytes;
 
-    // 驱逐策略：默认 LRU（evict 最久没用），round-robin 访问模式下 MRU 反而
-    // 最优——刚用过的 weight 在完整 cycle 之前不会再被访问，所以 evict 它
-    // 不会造成 miss。LLM decode 是严格 round-robin → MRU 显著优于 LRU。
-    bool evict_mru = false;
+    // 驱逐策略：默认 MRU（evict 最近用过的）。LLM decode 是严格 round-robin
+    // 访问 layer 0..N-1，刚用过的 weight 要等一整个 cycle 才再被访问，所以
+    // evict 它不会造成 miss；反观 LRU evict "最久没用" 的恰好是马上要回头用的
+    // → cache<model 时近 100% miss。实测 MRU 显著优于 LRU，故设为默认。
+    // 调试时可经 GGML_ELASTIC_EVICT_POLICY=lru 切回。
+    bool evict_mru = true;
 };
 
 // 初始化：分配 n_blocks 个空槽位（block_idx = 0..n_blocks-1）。
