@@ -2979,11 +2979,15 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
-    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 lru）。LLM decode 是 round-robin
+    // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 mru）。LLM decode 是 round-robin
     // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
-    // MRU 反而能让命中率随 cache/model 比例线性提升。
+    // MRU 反而能让命中率随 cache/model 比例线性提升。wbm.evict_mru 默认已 true，
+    // 这里只处理 env 显式切回 lru 调试。
     if (const char *p = std::getenv("GGML_ELASTIC_EVICT_POLICY")) {
-        if (std::string(p) == "mru") {
+        if (std::string(p) == "lru") {
+            s->wbm.evict_mru = false;
+            GGML_LOG_INFO("ggml_opencl elastic: 切回 LRU 驱逐策略 (调试)\n");
+        } else if (std::string(p) == "mru") {
             s->wbm.evict_mru = true;
             GGML_LOG_INFO("ggml_opencl elastic: 启用 MRU 驱逐策略\n");
         }
@@ -3029,6 +3033,18 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
     if (elastic::wbmcl_init(&s->octx, &s->wbm, cl_ctx, queue, xfer_q) != 0) {
         GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
         return;
+    }
+    // GGML_ELASTIC_DIRECT_IO=1: 非 SOA reload 也走 O_DIRECT pread (绕 page cache,
+    // 模拟 model>RAM 真 disk 成本). 注入函数指针, 让 runtime 层不直接依赖 libllama.
+    // (SOA 量化路径在 reload_fn 里另有自己的 direct 逻辑, 见 ~line 4717.)
+    if (const char *d = std::getenv("GGML_ELASTIC_DIRECT_IO"); d && *d && *d != '0') {
+        s->octx.direct_read_fn = [](const void *host_ptr, void *dst, size_t nbytes) -> int {
+            auto reg = llama_mmap_registry_find(host_ptr);
+            if (reg.filename.empty()) return -1;
+            size_t file_offset = (const char *)host_ptr - (const char *)reg.base;
+            return llama_pread_direct(reg.filename.c_str(), dst, file_offset, nbytes);
+        };
+        GGML_LOG_INFO("ggml_opencl elastic: 非 SOA reload 启用 O_DIRECT (DIRECT_IO=1)\n");
     }
     if (const char *r = std::getenv("GGML_ELASTIC_CL_RETAIN"); r && *r && *r != '0') {
         s->octx.retain_cl_mem = true;

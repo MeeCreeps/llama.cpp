@@ -93,6 +93,11 @@ struct wbm_opencl_ctx {
 
     // SOA per-block 回调注册表. wbmcl_register_soa 加, prefetch 路径用 reload_fn.
     std::unordered_map<int, soa_callback_pair>              soa_per_idx;
+
+    // O_DIRECT reload (非 SOA 路径). GGML_ELASTIC_DIRECT_IO=1 时由 ggml-opencl 注入:
+    // 给 host_ptr (mmap VA) 反查文件 + O_DIRECT pread 到 dst, 返 0 成功. runtime 层
+    // 不直接依赖 libllama, 通过函数指针解耦. nullptr = 走 mmap host_ptr (默认).
+    int (*direct_read_fn)(const void *host_ptr, void *dst, size_t nbytes) = nullptr;
 };
 
 // 注册 SOA tensor 的 evict/reload 回调. idx 是 wbm 里的 block index.

@@ -49,6 +49,7 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->bytes_evicted_total  = 0;
     octx->n_creates            = 0;
     octx->n_releases           = 0;
+    octx->direct_read_fn       = nullptr;  // ggml-opencl lazy_init 按 env 注入
     return 0;
 }
 
@@ -79,6 +80,22 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         return -3;
     }
 
+    // DMA 源解析: 默认 mmap host_ptr (隐式 page fault 读盘)。 若注入了
+    // direct_read_fn (GGML_ELASTIC_DIRECT_IO=1), 先 O_DIRECT pread 到 thread_local
+    // scratch (绕 page cache, 模拟真 disk 成本), 再用 scratch 做 DMA 源。
+    const void *dma_src = meta->host_ptr;
+    bool use_direct = false;
+    if (octx->direct_read_fn) {
+        static thread_local std::vector<char> direct_scratch;
+        if (direct_scratch.size() < meta->byte_size) direct_scratch.resize(meta->byte_size);
+        if (octx->direct_read_fn(meta->host_ptr, direct_scratch.data(), meta->byte_size) == 0) {
+            dma_src    = direct_scratch.data();
+            use_direct = true;
+        } else {
+            std::fprintf(stderr, "[wbmcl] direct_read_fn 失败 idx=%d, fallback mmap\n", idx);
+        }
+    }
+
     cl_int err = CL_SUCCESS;
     // Retain 模式：从 size 池里拿一个同 size 的 cl_mem 复用，省 clCreateBuffer
     if (octx->retain_cl_mem) {
@@ -96,7 +113,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
             octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
             err = clEnqueueWriteBuffer(octx->compute_queue,
                                        cached, CL_TRUE,
-                                       0, meta->byte_size, meta->host_ptr,
+                                       0, meta->byte_size, dma_src,
                                        0, nullptr, nullptr);
             if (err != CL_SUCCESS) {
                 std::fprintf(stderr, "[wbmcl retain] enqueueWriteBuffer 失败 idx=%d: %s (%d)\n",
@@ -114,10 +131,13 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
     // 后备存储，省掉显式的 host→GPU memcpy。Adreno unified memory 下可能
     // 实现零拷贝；非 unified 架构（如桌面独显）driver 会自己做一次 copy，
     // 等价但多一次驱动开销。默认关。
-    static const bool s_use_host_ptr = []() {
+    static const bool s_use_host_ptr_env = []() {
         const char *e = std::getenv("GGML_ELASTIC_USE_HOST_PTR");
         return e && *e && *e != '0';
     }();
+    // direct 模式跟 USE_HOST_PTR 互斥: direct 要把 scratch 显式 DMA 上去,
+    // USE_HOST_PTR 是让 driver 直接绑 mmap 指针 (不会读 scratch)。direct 优先。
+    const bool s_use_host_ptr = s_use_host_ptr_env && !use_direct;
 
     cl_mem buf = nullptr;
     if (s_use_host_ptr) {
@@ -152,9 +172,11 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
             unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
             if (slot > 0) use_q = octx->xfer_extra[slot - 1];
         }
+        // direct 模式: dma_src 是复用的 thread_local scratch, 非阻塞写会在下次
+        // ensure_resident 覆盖 scratch 前来不及读完 → 用阻塞写保证 scratch 安全。
         cl_event write_ev = nullptr;
-        err = clEnqueueWriteBuffer(use_q, buf, CL_FALSE,
-                                   0, meta->byte_size, meta->host_ptr,
+        err = clEnqueueWriteBuffer(use_q, buf, use_direct ? CL_TRUE : CL_FALSE,
+                                   0, meta->byte_size, dma_src,
                                    0, nullptr, &write_ev);
         if (err != CL_SUCCESS) {
             std::fprintf(stderr, "[wbmcl] async clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
@@ -176,7 +198,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         // 同步路径：单队列阻塞写
         err = clEnqueueWriteBuffer(octx->compute_queue,
                                    buf, CL_TRUE /* 阻塞 */,
-                                   0, meta->byte_size, meta->host_ptr,
+                                   0, meta->byte_size, dma_src,
                                    0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
             std::fprintf(stderr, "[wbmcl] clEnqueueWriteBuffer 失败 block %d: %s (%d)\n",
