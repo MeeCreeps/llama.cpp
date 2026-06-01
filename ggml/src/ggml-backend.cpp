@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cstring>   // std::memcpy (elastic v6 host_ptr 路径用; gcc 下 <string.h> 不够)
 #include <vector>
 #include <unordered_map>
 #include <cstdint>

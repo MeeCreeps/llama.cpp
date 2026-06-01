@@ -2898,6 +2898,13 @@ struct ggml_opencl_elastic_state {
     // bw_inited 后在 lazy_init 里算一次。bw 没启用时为 0，等价于关闭 evict。
     size_t static_target_bytes = 0;
 
+    // Dynamic mode (GGML_ELASTIC_DYNAMIC=1): graph_compute 时实时算
+    // target = B(t)*MB - kv - misc + extra_target_bytes (跟 budget trace 走)。
+    // extra_target_bytes 单独累加 EMBED_OUTSIDE_BUDGET 等 extras, 跟 static 路径平行
+    // (static 路径把 extras 加进 static_target_bytes; dynamic 路径用 extra_target_bytes)。
+    bool   dynamic_target       = false;
+    size_t extra_target_bytes   = 0;
+
     // 流水线 prefetch：GGML_ELASTIC_PREFETCH=N 提前对后 N 个 node 的 src 发
     // async write。N=0 关闭。开启时 xfer_queue 自动建。
     int      prefetch_lookahead   = 0;
@@ -3165,10 +3172,15 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
             const size_t mfloor_bytes = s->bw.m_floor_mb * 1024 * 1024;
             const size_t kv_misc      = s->kv_bytes + s->misc_overhead;
             s->static_target_bytes    = mfloor_bytes > kv_misc ? mfloor_bytes - kv_misc : 0;
+            // Dynamic mode: GGML_ELASTIC_DYNAMIC=1 让 target 跟着 B(t) 实时变.
+            if (const char *d = std::getenv("GGML_ELASTIC_DYNAMIC"); d && *d && *d != '0') {
+                s->dynamic_target = true;
+            }
             GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher trace=%s 初始 B(t)=%zu MB "
-                          "M_floor=%zu MB → static_target=%zu MB (kv=%zu MB misc=%zu MB)\n",
+                          "M_floor=%zu MB → static_target=%zu MB mode=%s (kv=%zu MB misc=%zu MB)\n",
                           csv, elastic::budget_watcher_get(&s->bw), s->bw.m_floor_mb,
                           s->static_target_bytes / 1024 / 1024,
+                          s->dynamic_target ? "DYNAMIC" : "static",
                           s->kv_bytes / 1024 / 1024, s->misc_overhead / 1024 / 1024);
         } else {
             GGML_LOG_ERROR("ggml_opencl elastic: BudgetWatcher 加载失败: %s\n", csv);
@@ -3318,7 +3330,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                         const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
                         return e && *e && *e != '0';
                     }();
-                    size_t target = est->static_target_bytes;
+                    size_t target = est->dynamic_target
+                    ? (([&]{
+                          const size_t bt    = elastic::budget_watcher_get(&est->bw) * size_t(1024 * 1024);
+                          const size_t km    = est->kv_bytes + est->misc_overhead;
+                          const size_t base  = bt > km ? bt - km : 0;
+                          return base + est->extra_target_bytes;
+                      })())
+                    : est->static_target_bytes;
                     if (s_pool_counts_budget_pre && est->octx.cache_byte_limit > 0
                         && target > est->octx.cache_byte_limit) {
                         target -= est->octx.cache_byte_limit;
@@ -3444,7 +3463,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
                     return e && *e && *e != '0';
                 }();
-                size_t target = est->static_target_bytes;
+                size_t target = est->dynamic_target
+                    ? (([&]{
+                          const size_t bt    = elastic::budget_watcher_get(&est->bw) * size_t(1024 * 1024);
+                          const size_t km    = est->kv_bytes + est->misc_overhead;
+                          const size_t base  = bt > km ? bt - km : 0;
+                          return base + est->extra_target_bytes;
+                      })())
+                    : est->static_target_bytes;
                 if (s_pool_counts_budget && est->octx.cache_byte_limit > 0
                     && target > est->octx.cache_byte_limit) {
                     target -= est->octx.cache_byte_limit;
@@ -4294,6 +4320,7 @@ static void ggml_opencl_elastic_register_soa(
     if (s_embed_out && ggml_opencl_tensor_suffix(tensor->name) == "token_embd") {
         elastic::wbm_set_pinned(&s->wbm, idx, true);
         s->static_target_bytes += nbytes;
+        s->extra_target_bytes  += nbytes;   // dynamic 路径用 (跟 static 平行累加)
     }
 }
 
@@ -5173,6 +5200,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (s_embed_out && suffix == "token_embd") {
                         elastic::wbm_set_pinned(&s->wbm, idx, true);
                         s->static_target_bytes += size;
+                        s->extra_target_bytes  += size;   // dynamic 路径用
                         GGML_LOG_INFO("ggml_opencl elastic: pin token_embd (%zu MB) outside budget → target=%zu MB\n",
                                       size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
                     }
