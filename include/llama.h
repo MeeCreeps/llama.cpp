@@ -977,6 +977,11 @@ extern "C" {
             struct llama_context * ctx,
             int                    mb);
 
+    // 强制下次 decode 重建 graph(丢弃 cached graph). 配合 LLAMA_KEEP_GRAPH_REUSE:
+    // 静态 op_schedule routing 平时复用 graph, plan band 切换(routing 变)时调用本函数
+    // 触发一次重建, 让新 routing 生效. 不调则 cached graph 保持旧 routing.
+    LLAMA_API void llama_graph_invalidate(struct llama_context * ctx);
+
     // Standalone query (no ctx needed) — reads /proc/meminfo MemAvailable in MB.
     LLAMA_API int64_t llama_runtime_mem_avail_mb(void);
 
@@ -1026,6 +1031,55 @@ extern "C" {
             struct llama_context *         ctx,
             llama_op_runtime_dispatch_fn   fn,
             void *                         user_data);
+
+    // === Elastic plan framework (Plan IR → Execute) ===
+    // 一个 plan 描述「在某内存预算下,一个 decode token 怎么执行」:每个 weight 在哪层
+    // (GPU/CPU/disk)、每个 op 谁算 + 是否跨后端迁移、搬运/变换 overlap 时间线。
+    // 详见 .wiki/elastic_memory/feature_elastic-plan-framework/IMPLEMENTATION.md。
+
+    struct llama_plan;  // opaque, 包装 elastic::ExecPlan
+
+    // 从 JSON 加载一个 plan。自动识别两种格式:
+    //   - make_plan.py 产出(routes/placement/schedule/resident_in_memory)
+    //   - native schema(weights/ops/timeline,llama_plan_save 导出的)
+    // 失败返回 NULL。
+    LLAMA_API struct llama_plan * llama_plan_load_json(const char * path);
+    LLAMA_API void                llama_plan_free(struct llama_plan * plan);
+    // 导出 native schema(调试/对照用)。返回 0 成功。
+    LLAMA_API int                 llama_plan_save_json(const struct llama_plan * plan, const char * path);
+    // 只读查询
+    LLAMA_API int64_t llama_plan_budget_mib(const struct llama_plan * plan);
+    LLAMA_API int     llama_plan_n_weights (const struct llama_plan * plan);
+    LLAMA_API int     llama_plan_n_ops     (const struct llama_plan * plan);
+
+    // ── DoD#1:直接喂一个 plan 让 ctx 按它执行 ──
+    // 立即 apply:residency reconcile(谁在 GPU)+ op routing(谁算)+ 迁移意图 + 重建 graph。
+    // 返回 0 成功,<0 失败。ctx 不接管 plan 生命周期(plan 须在使用期间存活)。
+    LLAMA_API int llama_elastic_apply_plan(
+            struct llama_context    * ctx,
+            const struct llama_plan * plan);
+
+    // ── DoD#2:开启 dynamic 模式,内存变化时自动换 plan ──
+    // provider_kind:
+    //   "table"    = 从 plans_dir(make_plan.py 的 plans/, 含 index.json)按 budget 查档
+    //   "callback" = 调用方随后用 llama_elastic_set_plan_provider 注册 fn
+    // 开启后每次 decode 前 sample 内存预算,档变 → 自动 apply 新 plan。返回 0 成功。
+    LLAMA_API int llama_elastic_enable(
+            struct llama_context * ctx,
+            const char           * provider_kind,
+            const char           * plans_dir);     // table 用,可 NULL
+    LLAMA_API void llama_elastic_disable(struct llama_context * ctx);
+
+    // callback provider:fn(budget_mib, user_data) 返回该预算下用的 plan(只读;ctx 不接管)。
+    typedef const struct llama_plan * (*llama_plan_provider_fn)(int64_t budget_mib, void * user_data);
+    LLAMA_API void llama_elastic_set_plan_provider(
+            struct llama_context   * ctx,
+            llama_plan_provider_fn   fn,
+            void                   * user_data);
+
+    // 调试/外部执行:拿当前预算(MB)下该用的 plan(只读)。需先 llama_elastic_enable。
+    LLAMA_API const struct llama_plan * llama_elastic_get_plan(
+            struct llama_context * ctx, int64_t budget_mib);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

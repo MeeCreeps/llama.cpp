@@ -7,6 +7,11 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+// elastic plan framework (Plan IR → Execute)
+#include "plan_ir.h"
+#include "plan_executor.h"
+#include "plan_provider.h"
+
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -433,6 +438,10 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
+    // 释放 elastic plan 只读句柄缓存(llama_plan_free 见本文件后段 C API)
+    for (auto & kv : elastic_plan_view_cache) {
+        llama_plan_free(kv.second);
+    }
 }
 
 void llama_context::synchronize() {
@@ -727,10 +736,20 @@ void llama_context::set_warmup(bool value) {
 void llama_context::set_op_schedule(llama_op_schedule_fn fn, void * user_data) {
     op_schedule_fn = fn;
     op_schedule_ud = user_data;
-    // Runtime op-backend decisions need fresh graph build each decode.
-    if (fn != nullptr && !graph_reuse_disable) {
+    // Runtime op-backend decisions need fresh graph build each decode —— 除非路由是【静态】
+    // (整段 band 内不变), 这时首次 build 已把 backend 固化进 cached graph, 后续复用即可,
+    // 省掉每 token 重建 split plan 的大开销(实测连续层路由 ~256ms/token 重建).
+    // LLAMA_KEEP_GRAPH_REUSE=1: 声明路由静态 → 保留 graph 复用. band 切换时需手动
+    // 触发一次 rebuild(置 graph_reuse_disable 临时true 或调 reset)。
+    static const bool keep_reuse = []() {
+        const char *e = std::getenv("LLAMA_KEEP_GRAPH_REUSE");
+        return e && *e && *e != '0';
+    }();
+    if (fn != nullptr && !graph_reuse_disable && !keep_reuse) {
         graph_reuse_disable = true;
         LLAMA_LOG_INFO("%s: op_schedule registered → graph_reuse_disable=1\n", __func__);
+    } else if (fn != nullptr && keep_reuse) {
+        LLAMA_LOG_INFO("%s: op_schedule registered, LLAMA_KEEP_GRAPH_REUSE=1 → 保留 graph 复用(静态路由)\n", __func__);
     }
 }
 
@@ -805,6 +824,103 @@ void llama_context::set_weight_pin(llama_weight_pin_fn fn, void * user_data) {
     weight_pin_ud = user_data;
     // 同时注册到全局让 elastic backends 能查 (跨 translation unit)
     llama_weight_pin_register((llama_weight_pin_fn_t)fn, user_data);
+}
+
+// ─────────────────── Elastic plan framework (Plan IR → Execute) ───────────────────
+
+int64_t llama_context::elastic_budget_mib() const {
+    // 跟 scheduler 同源:优先 BudgetWatcher,fallback /proc/meminfo MemAvailable。
+    int64_t cur = llama_budget_query();
+    if (cur < 0) cur = (int64_t) read_mem_available_mb();
+    return cur;
+}
+
+void llama_context::elastic_install_op_schedule() {
+    // 装一个读 elastic_route 的 op_schedule_fn:MUL_MAT 按 src[0] 的 weight 名查 route。
+    // (与 tools/main 的 plan 路由桥接同机制。)
+    op_schedule_fn = [](const struct ggml_tensor * node, const char * /*name*/,
+                        int /*layer*/, void * ud) -> int {
+        auto * self = (llama_context *) ud;
+        if (!node || node->op != GGML_OP_MUL_MAT) return -1;
+        if (!node->src[0]) return -1;
+        const char * w = node->src[0]->name;
+        if (!w || !*w) return -1;
+        auto it = self->elastic_route.find(w);
+        if (it == self->elastic_route.end()) return -1;
+        return it->second;
+    };
+    op_schedule_ud = this;
+}
+
+int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
+    if (!plan) return -1;
+
+    // backend id 约定(与 tools/main 一致):cpu = 最后一个,gpu = 第一个非 CPU。
+    if (elastic_cpu_id < 0) {
+        elastic_cpu_id = (int) backends.size() - 1;
+        for (size_t i = 0; i < backends.size(); i++) {
+            if (backends[i].get() != backend_cpu) { elastic_gpu_id = (int) i; break; }
+        }
+    }
+
+    // 懒建 executor + sinks(桥接到真实 WBM 全局 registry + route 表)。
+    // sinks 读 this->elastic_plan(每次 apply 更新),不捕获具体 plan。
+    if (!elastic_executor) {
+        elastic::ExecSinks sinks;
+        sinks.set_resident = [this](int wid, bool want) {
+            const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
+            if (!w) return;
+            // want=true → prefetch(搬进 GPU);want=false → evict。底层全局 registry。
+            llama_weight_movement_request(w->name.c_str(), /*evict=*/!want);
+        };
+        sinks.is_resident = [this](int wid) -> bool {
+            const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
+            if (!w) return false;
+            return llama_weight_residency_query(w->name.c_str());
+        };
+        sinks.set_op_backend = [this](int op_id, elastic::Backend be) {
+            const elastic::OpPlan * o = elastic_plan ? elastic_plan->op_by_id(op_id) : nullptr;
+            if (!o) return;
+            int bid = (be == elastic::Backend::GPU) ? elastic_gpu_id : elastic_cpu_id;
+            if (bid >= 0) elastic_route[o->name] = bid;
+        };
+        sinks.set_op_migrate = [](int, bool, elastic::Backend, elastic::Xform) {
+            // M5 接 ggml-backend per-op migration;M3 先记录意图(no-op)。
+        };
+        elastic_executor = std::make_unique<elastic::PlanExecutor>(std::move(sinks));
+    }
+
+    elastic_plan = plan;
+    elastic_route.clear();
+    elastic::ReconcileStats st = elastic_executor->apply(*plan);
+    elastic_install_op_schedule();
+    graph_invalidate();  // routing 变 → 丢弃 cached graph,下次 decode 重建
+
+    LLAMA_LOG_INFO("%s: applied plan budget=%lldMiB weights=%d ops=%d "
+                   "prefetch=%d evict=%d route=%d migrate=%d events=%d\n",
+                   __func__, (long long) plan->budget_mib,
+                   (int) plan->weights.size(), (int) plan->ops.size(),
+                   st.n_prefetch, st.n_evict, st.n_route_static, st.n_migrate,
+                   st.n_overlap_events);
+    return 0;
+}
+
+void llama_context::maybe_apply_plan() {
+    if (!elastic_enabled || !elastic_provider) return;
+    const int64_t B = elastic_budget_mib();
+    const elastic::ExecPlan * p = elastic_provider->get(B, 0, 0);
+    if (!p) return;
+    // 档没变 → 0 开销。判据:指针相同(table 同档同指针),或 budget 档相同
+    // (callback provider 按 exact budget 缓存,预算抖 1MB 也不同指针 → 用 budget_mib 兜底防抖)。
+    if (p == elastic_last_applied) return;
+    if (elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib) {
+        elastic_last_applied = p;  // 认作同档,只更新指针,不重 apply
+        return;
+    }
+    apply_exec_plan(p);
+    elastic_last_applied = p;
+    LLAMA_LOG_INFO("%s: budget=%lldMiB → switched to plan(budget_mib=%lld)\n",
+                   __func__, (long long) B, (long long) p->budget_mib);
 }
 
 int llama_context::n_backends() const { return (int)backends.size(); }
@@ -1084,6 +1200,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // delta ≥ threshold. Scheduler can mutate op_schedule_fn / call
     // llama_weight_request_prefetch/_evict to influence this decode + next.
     maybe_run_scheduler();
+
+    // Elastic plan online loop — dynamic 模式下,内存预算档变化时切到新 plan(DoD#2)。
+    maybe_apply_plan();
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2683,6 +2802,142 @@ void llama_set_op_runtime_dispatch(llama_context * ctx, llama_op_runtime_dispatc
 
 void llama_set_memory_watch_threshold(llama_context * ctx, int mb) {
     ctx->set_mem_watch_threshold(mb);
+}
+
+// ─────────────────── Elastic plan framework C API ───────────────────
+
+// opaque 句柄,拥有一份 ExecPlan。
+struct llama_plan {
+    elastic::ExecPlan p;
+};
+
+struct llama_plan * llama_plan_load_json(const char * path) {
+    if (!path) return nullptr;
+    auto * h = new llama_plan();
+    std::string err;
+    // 自动识别:native schema(有 "weights")优先;否则按 make_plan.py 格式加载。
+    // 先尝试 native;若结果 weights 为空,再尝试 make_plan。
+    bool ok = elastic::plan_from_json_file(path, h->p, &err);
+    if (!ok || h->p.weights.empty()) {
+        elastic::ExecPlan mp;
+        std::string err2;
+        if (elastic::plan_from_make_plan_file(path, mp, &err2) && !mp.weights.empty()) {
+            h->p = std::move(mp);
+            ok = true;
+        }
+    }
+    if (!ok || h->p.weights.empty()) {
+        LLAMA_LOG_ERROR("%s: load failed for %s (native: %s)\n", __func__, path, err.c_str());
+        delete h;
+        return nullptr;
+    }
+    LLAMA_LOG_INFO("%s: loaded %s — budget=%lldMiB weights=%d ops=%d timeline=%d\n",
+                   __func__, path, (long long) h->p.budget_mib,
+                   (int) h->p.weights.size(), (int) h->p.ops.size(),
+                   (int) h->p.timeline.size());
+    return h;
+}
+
+void llama_plan_free(struct llama_plan * plan) { delete plan; }
+
+int llama_plan_save_json(const struct llama_plan * plan, const char * path) {
+    if (!plan || !path) return -1;
+    return elastic::plan_to_json_file(plan->p, path) ? 0 : -1;
+}
+
+int64_t llama_plan_budget_mib(const struct llama_plan * plan) {
+    return plan ? plan->p.budget_mib : -1;
+}
+int llama_plan_n_weights(const struct llama_plan * plan) {
+    return plan ? (int) plan->p.weights.size() : -1;
+}
+int llama_plan_n_ops(const struct llama_plan * plan) {
+    return plan ? (int) plan->p.ops.size() : -1;
+}
+
+int llama_elastic_apply_plan(llama_context * ctx, const struct llama_plan * plan) {
+    if (!ctx || !plan) return -1;
+    return ctx->apply_exec_plan(&plan->p);
+}
+
+// ── 公开方法实现(需 llama_plan 完整类型,故放在 struct 定义之后)──
+
+int llama_context::elastic_enable(const char * provider_kind, const char * plans_dir) {
+    std::string kind = provider_kind ? provider_kind : "";
+    std::string err;
+    if (kind == "table") {
+        if (!plans_dir) {
+            LLAMA_LOG_ERROR("%s: table provider needs plans_dir\n", __func__);
+            return -1;
+        }
+        auto pp = elastic::PlanProvider::create_table(plans_dir, &err);
+        if (!pp) { LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str()); return -1; }
+        elastic_provider = std::move(pp);
+    } else if (kind == "callback") {
+        // provider 由 elastic_set_provider_fn 注入 fn;空壳查 fn 拷 plan 进缓存。
+        llama_context * self = this;
+        elastic_provider = elastic::PlanProvider::create_callback(
+            [self](int64_t budget, elastic::ExecPlan & out) -> bool {
+                if (!self->elastic_provider_fn) return false;
+                const llama_plan * h = self->elastic_provider_fn(budget, self->elastic_provider_ud);
+                if (!h) return false;
+                out = h->p;
+                return true;
+            });
+    } else {
+        LLAMA_LOG_ERROR("%s: unknown provider kind '%s'\n", __func__, kind.c_str());
+        return -1;
+    }
+    elastic_enabled = true;
+    elastic_last_applied = nullptr;
+    LLAMA_LOG_INFO("%s: elastic enabled (provider=%s)\n", __func__, kind.c_str());
+    return 0;
+}
+
+void llama_context::elastic_disable() { elastic_enabled = false; }
+
+void llama_context::elastic_set_provider_fn(llama_plan_provider_fn fn, void * user_data) {
+    elastic_provider_fn = fn;
+    elastic_provider_ud = user_data;
+}
+
+const struct llama_plan * llama_context::elastic_get_plan_view(int64_t budget_mib) {
+    if (!elastic_provider) return nullptr;
+    const elastic::ExecPlan * p = elastic_provider->get(budget_mib, 0, 0);
+    if (!p) return nullptr;
+    int64_t key = p->budget_mib;
+    auto it = elastic_plan_view_cache.find(key);
+    if (it == elastic_plan_view_cache.end()) {
+        auto * h = new llama_plan();
+        h->p = *p;
+        it = elastic_plan_view_cache.emplace(key, h).first;
+    }
+    return it->second;
+}
+
+int llama_elastic_enable(llama_context * ctx, const char * provider_kind, const char * plans_dir) {
+    if (!ctx || !provider_kind) return -1;
+    return ctx->elastic_enable(provider_kind, plans_dir);
+}
+
+void llama_elastic_disable(llama_context * ctx) {
+    if (ctx) ctx->elastic_disable();
+}
+
+void llama_elastic_set_plan_provider(llama_context * ctx, llama_plan_provider_fn fn, void * user_data) {
+    if (ctx) ctx->elastic_set_provider_fn(fn, user_data);
+}
+
+const struct llama_plan * llama_elastic_get_plan(llama_context * ctx, int64_t budget_mib) {
+    return ctx ? ctx->elastic_get_plan_view(budget_mib) : nullptr;
+}
+
+void llama_context::graph_invalidate() {
+    if (gf_res_prev) gf_res_prev->reset();
+}
+
+void llama_graph_invalidate(llama_context * ctx) {
+    if (ctx) ctx->graph_invalidate();
 }
 
 int64_t llama_runtime_mem_avail_mb(void) {

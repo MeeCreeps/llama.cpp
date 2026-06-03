@@ -131,9 +131,15 @@ add_library(llama
             models/wavtokenizer-dec.cpp
             models/xverse.cpp
             models/graph-context-mamba.cpp
+            # elastic plan framework (纯逻辑 Plan IR / Executor / Provider)
+            ../runtime/plan_ir.cpp
+            ../runtime/plan_executor.cpp
+            ../runtime/plan_provider.cpp
             )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../runtime)        # plan_ir.h 等
+target_include_directories(llama PRIVATE ../vendor)         # nlohmann/json.hpp (header-only)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

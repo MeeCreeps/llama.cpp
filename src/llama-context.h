@@ -9,7 +9,17 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
+// elastic plan framework (前向声明,完整类型在 llama-context.cpp include)
+namespace elastic {
+    struct ExecPlan;
+    class  PlanExecutor;
+    class  PlanProvider;
+}
 
 struct llama_model;
 class llama_batch_allocr;
@@ -84,6 +94,8 @@ struct llama_context {
     void set_weight_pin (llama_weight_pin_fn  fn, void * user_data);
     void set_scheduler  (llama_scheduler_fn   fn, void * user_data);
     void set_mem_watch_threshold(int mb);
+    // 强制下次 decode 重建 graph(routing 变, e.g. plan band 切换). 配 LLAMA_KEEP_GRAPH_REUSE.
+    void graph_invalidate();
     void set_op_runtime_dispatch(llama_op_runtime_dispatch_fn fn, void * user_data);
     int  n_backends() const;
     const char * backend_name(int i) const;
@@ -91,6 +103,13 @@ struct llama_context {
     // Fires the runtime scheduler if MemAvailable changed by ≥ threshold since last tick.
     // Called pre-decode. Updates last_mem_avail_mb + decode_step.
     void maybe_run_scheduler();
+
+    // ── Elastic plan framework 公开入口(C API 经由这些方法)──
+    int  apply_exec_plan(const elastic::ExecPlan * plan);    // DoD#1:apply 一个 plan
+    int  elastic_enable(const char * provider_kind, const char * plans_dir);  // DoD#2
+    void elastic_disable();
+    void elastic_set_provider_fn(llama_plan_provider_fn fn, void * user_data);
+    const struct llama_plan * elastic_get_plan_view(int64_t budget_mib);
 
     void set_adapter_lora(
             llama_adapter_lora * adapter,
@@ -306,6 +325,26 @@ private:
     // before each op compute. Plumbed via ggml_backend_sched_set_runtime_dispatch.
     llama_op_runtime_dispatch_fn op_runtime_dispatch_fn = nullptr;
     void *                       op_runtime_dispatch_ud = nullptr;
+
+    // ── Elastic plan framework (Plan IR → Execute) ──
+    // executor 把当前 plan 翻译成 residency/routing 动作;route 表喂给 op_schedule。
+    std::unique_ptr<elastic::PlanExecutor> elastic_executor;
+    std::unique_ptr<elastic::PlanProvider> elastic_provider;   // dynamic 模式
+    const elastic::ExecPlan * elastic_plan         = nullptr;  // 当前已 apply(不拥有)
+    const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
+    std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id
+    bool    elastic_enabled = false;                           // dynamic online loop 开关
+    int     elastic_cpu_id  = -1;                              // CPU backend index
+    int     elastic_gpu_id  = -1;                              // GPU backend index(-1=无)
+    llama_plan_provider_fn elastic_provider_fn = nullptr;      // callback provider
+    void *  elastic_provider_ud = nullptr;
+    // llama_elastic_get_plan 的只读句柄缓存(按 budget;析构时 llama_plan_free)
+    std::map<int64_t, struct llama_plan *> elastic_plan_view_cache;
+
+    // 内部 helpers(apply_exec_plan 在 public 区声明)
+    void elastic_install_op_schedule();                        // 安装读 elastic_route 的 op_schedule_fn
+    void maybe_apply_plan();                                   // online loop:档变换 plan
+    int64_t elastic_budget_mib() const;                        // 当前预算(BudgetWatcher/meminfo)
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
