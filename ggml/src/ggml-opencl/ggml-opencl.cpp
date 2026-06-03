@@ -3347,7 +3347,16 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 // 预先 evict：保证 reload 之后 resident_bytes <= target，避免
                 // "reload 一个 → resident 涨 → 下次周期 evict 之前违反预算" 的
                 // 短暂超额。spec §5 第 7 条要求每个 step 都满足合规。
-                if (est->bw_inited) {
+                // GGML_ELASTIC_NO_AUTO_EVICT=1: 关掉 backend 自己的预算驱逐, 让上层
+                // (plan framework) 做唯一 residency 权威。backend 仍 reload-on-use
+                // (ensure_resident), 只是不再按 budget 自动 evict —— 避免 plan 与 backend
+                // 两个驱逐者打架 (plan 把某 weight 留 GPU, backend 又按 trace min 把它 evict
+                // → GPU kernel 用到已释放 cl_mem 崩)。
+                static const bool s_no_auto_evict_pre = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_NO_AUTO_EVICT");
+                    return e && *e && *e != '0';
+                }();
+                if (est->bw_inited && !s_no_auto_evict_pre) {
                     static const bool s_pool_counts_budget_pre = []() {
                         const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
                         return e && *e && *e != '0';
@@ -3477,7 +3486,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
         if (elastic_active && est->bw_inited) {
             est->n_op_dispatched += 1;
-            if ((int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
+            static const bool s_no_auto_evict_periodic = []() {
+                const char *e = std::getenv("GGML_ELASTIC_NO_AUTO_EVICT");
+                return e && *e && *e != '0';
+            }();
+            if (!s_no_auto_evict_periodic &&
+                (int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
                 // Baseline 静态：target = M_floor - kv - misc。
                 // 若 GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET=1，把 pool cap 从 target
                 // 里扣掉，让 working_set + cached_bytes ≤ target，严格合规。
@@ -4348,6 +4362,11 @@ static void ggml_opencl_elastic_register_soa(
 
 // 公共 reload helper：pool 命中复用 parent / 否则 alloc。
 // 调用方负责后续 sub-buffer 创建 + convert kernel + mark_resident。
+// 诊断: 追踪 SOA pool 里的 parent buffer, 检测 double-evict (同一 buffer 被 push 两次
+// → 之后会被发给两个 resident tensor → 互相覆盖数据 → corruption)。
+static std::unordered_map<cl_mem, char> s_soa_pooled_parents;
+static uint64_t s_soa_double_evict = 0, s_soa_double_handout = 0;
+
 static cl_mem ggml_opencl_elastic_alloc_or_pool_parent(
         elastic::wbm_opencl_ctx *octx, cl_context cl_ctx, size_t nbytes) {
     if (octx->retain_cl_mem) {
@@ -4440,59 +4459,62 @@ static int ggml_opencl_run_q4_0_adreno_transpose(
     cl_int err = CL_SUCCESS;
     cl_context context = backend_ctx->context;
 
+    // === image / sub-buffer POOL (GGML_ELASTIC_IMG_POOL=1, 默认关) ===
+    // 目的: 消除每次 reload 的 clCreateImage/clCreateSubBuffer 创建开销(实测 host-side
+    // 15-37ms/call, 主导 reload 时间), 这样测出的是【layout 转换 kernel 的真实代价】而非
+    // 创建代价. qT/dT 是 fixed A_q/s_d_max 的 sub-buffer(按 size 复用); q/d input image
+    // 绑定轮转的 extra->q/d(按 cl_mem 复用). image width 由 M*K 对称决定 → gate/down 同
+    // size 可共用. 仅 K_tile_trans 启用 pool; 依赖 RETAIN_MB 足够大使 SOA pool 不在 run 内
+    // FIFO 释放 extra->q/d(否则 cached image 悬空). 默认关 → 行为与原来完全一致(零风险).
+    static const bool s_img_pool = []() {
+        const char *e = std::getenv("GGML_ELASTIC_IMG_POOL");
+        return e && *e && *e != '0';
+    }();
+    static std::unordered_map<size_t, cl_mem> s_qT_sub, s_dT_sub, s_qT_img, s_dT_img;
+    static std::unordered_map<cl_mem, cl_mem>  s_q_img, s_d_img;
+
     size_t q_size_bytes = (size_t)K * M / 8 * sizeof(float);
-    cl_buffer_region region;
-    region.origin = 0;
-    region.size   = q_size_bytes;
-    cl_mem qT_d = clCreateSubBuffer(backend_ctx->A_q_d_max, 0,
-                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-    if (err != CL_SUCCESS) return -1;
-    bool K_tile_trans = ((K / 32) % 4 == 0);
+    bool   K_tile_trans = ((K / 32) % 4 == 0);
     size_t d_size_bytes = (size_t)M * (K / 32) * 2;
-    region.origin = 0;
-    region.size   = d_size_bytes;
-    cl_mem dT_d = clCreateSubBuffer(backend_ctx->A_s_d_max, 0,
-                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d); return -2; }
+    const bool pool = s_img_pool && K_tile_trans;
 
     cl_image_format img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
     cl_image_desc img_desc_1d;
-    cl_mem q_d_image1D, d_d_image1D, qT_d_image1D, dT_d_image1D;
+    cl_mem qT_d = nullptr, dT_d = nullptr;
+    cl_mem q_d_image1D = nullptr, d_d_image1D = nullptr, qT_d_image1D = nullptr, dT_d_image1D = nullptr;
 
-    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc_1d.image_width = (size_t)M * K / 4 / 4;
-    img_desc_1d.buffer      = extra->q;
-    q_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -3; }
+    auto mk_sub = [&](cl_mem parent, size_t sz) -> cl_mem {
+        cl_buffer_region r; r.origin = 0; r.size = sz;
+        return clCreateSubBuffer(parent, 0, CL_BUFFER_CREATE_TYPE_REGION, &r, &err);
+    };
+    auto mk_img = [&](cl_mem buf, cl_image_format fmt, size_t width) -> cl_mem {
+        cl_image_desc d; memset(&d, 0, sizeof(d));
+        d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER; d.image_width = width; d.buffer = buf;
+        return clCreateImage(context, 0, &fmt, &d, NULL, &err);
+    };
 
-    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc_1d.image_width = (size_t)M * K / 4 / 4;
-    img_desc_1d.buffer      = qT_d;
-    qT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -4; }
+    // qT_d sub-buffer (A_q_d_max, region[0,q_size]) — pool 按 q_size 复用
+    if (pool && s_qT_sub.count(q_size_bytes)) qT_d = s_qT_sub[q_size_bytes];
+    else { qT_d = mk_sub(backend_ctx->A_q_d_max, q_size_bytes); if (err != CL_SUCCESS) return -1; if (pool) s_qT_sub[q_size_bytes] = qT_d; }
+    // dT_d sub-buffer (A_s_d_max, region[0,d_size]) — pool 按 d_size 复用
+    if (pool && s_dT_sub.count(d_size_bytes)) dT_d = s_dT_sub[d_size_bytes];
+    else { dT_d = mk_sub(backend_ctx->A_s_d_max, d_size_bytes); if (err != CL_SUCCESS) { if (!pool) clReleaseMemObject(qT_d); return -2; } if (pool) s_dT_sub[d_size_bytes] = dT_d; }
 
-    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-    if (K_tile_trans) {
-        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-        img_desc_1d.image_width = (size_t)M * K / 32 / 4;
-    } else {
-        img_fmt_1d = { CL_R, CL_HALF_FLOAT };
-        img_desc_1d.image_width = (size_t)M * K / 32;
-    }
-    img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc_1d.buffer     = extra->d;
-    d_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(qT_d_image1D); clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -5; }
-
-    img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
-    memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-    img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc_1d.image_width = (size_t)M * K / 32 / 4;
-    img_desc_1d.buffer      = dT_d;
-    dT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
-    if (err != CL_SUCCESS) { clReleaseMemObject(d_d_image1D); clReleaseMemObject(qT_d_image1D); clReleaseMemObject(q_d_image1D); clReleaseMemObject(qT_d); clReleaseMemObject(dT_d); return -6; }
+    // q_d_image1D ← extra->q (输入, 轮转 buffer) — pool 按 cl_mem 复用
+    if (pool && s_q_img.count(extra->q)) q_d_image1D = s_q_img[extra->q];
+    else { q_d_image1D = mk_img(extra->q, img_fmt_1d, (size_t)M * K / 4 / 4); if (err != CL_SUCCESS) { if (!pool){clReleaseMemObject(qT_d);clReleaseMemObject(dT_d);} return -3; } if (pool) s_q_img[extra->q] = q_d_image1D; }
+    // qT_d_image1D ← qT_d — pool 按 q_size 复用
+    if (pool && s_qT_img.count(q_size_bytes)) qT_d_image1D = s_qT_img[q_size_bytes];
+    else { qT_d_image1D = mk_img(qT_d, img_fmt_1d, (size_t)M * K / 4 / 4); if (err != CL_SUCCESS) { if (!pool){clReleaseMemObject(q_d_image1D);clReleaseMemObject(qT_d);clReleaseMemObject(dT_d);} return -4; } if (pool) s_qT_img[q_size_bytes] = qT_d_image1D; }
+    // d_d_image1D ← extra->d — pool 按 cl_mem 复用
+    cl_image_format fmt_d = K_tile_trans ? (cl_image_format){ CL_RGBA, CL_HALF_FLOAT } : (cl_image_format){ CL_R, CL_HALF_FLOAT };
+    size_t w_d_in = K_tile_trans ? (size_t)M * K / 32 / 4 : (size_t)M * K / 32;
+    if (pool && s_d_img.count(extra->d)) d_d_image1D = s_d_img[extra->d];
+    else { d_d_image1D = mk_img(extra->d, fmt_d, w_d_in); if (err != CL_SUCCESS) { if (!pool){clReleaseMemObject(qT_d_image1D);clReleaseMemObject(q_d_image1D);clReleaseMemObject(qT_d);clReleaseMemObject(dT_d);} return -5; } if (pool) s_d_img[extra->d] = d_d_image1D; }
+    // dT_d_image1D ← dT_d — pool 按 d_size 复用
+    if (pool && s_dT_img.count(d_size_bytes)) dT_d_image1D = s_dT_img[d_size_bytes];
+    else { dT_d_image1D = mk_img(dT_d, img_fmt_1d, (size_t)M * K / 32 / 4); if (err != CL_SUCCESS) { if (!pool){clReleaseMemObject(d_d_image1D);clReleaseMemObject(qT_d_image1D);clReleaseMemObject(q_d_image1D);clReleaseMemObject(qT_d);clReleaseMemObject(dT_d);} return -6; } if (pool) s_dT_img[d_size_bytes] = dT_d_image1D; }
+    (void)img_desc_1d;
 
     cl_event evt;
     // weights transpose
@@ -4536,12 +4558,15 @@ static int ggml_opencl_run_q4_0_adreno_transpose(
     clReleaseEvent(evt);
 
     // 异步路径下：release 只减引用，driver 等 queue 用完才真销毁，安全。
-    clReleaseMemObject(qT_d);
-    clReleaseMemObject(dT_d);
-    clReleaseMemObject(q_d_image1D);
-    clReleaseMemObject(d_d_image1D);
-    clReleaseMemObject(qT_d_image1D);
-    clReleaseMemObject(dT_d_image1D);
+    // pool 模式下这些对象缓存复用, 不释放(下次 reload 直接命中, 省 clCreateImage/SubBuffer).
+    if (!pool) {
+        clReleaseMemObject(qT_d);
+        clReleaseMemObject(dT_d);
+        clReleaseMemObject(q_d_image1D);
+        clReleaseMemObject(d_d_image1D);
+        clReleaseMemObject(qT_d_image1D);
+        clReleaseMemObject(dT_d_image1D);
+    }
     return 0;
 }
 
@@ -4748,6 +4773,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     e.parent = cap_extra->parent_buffer;
                     e.d      = cap_extra->d;
                     e.q      = cap_extra->q;
+                    // double-evict 检测: 该 parent 已在 pool 里? (= bug: 它仍被某 resident
+                    // tensor 使用却被当成可复用) → 跳过 push 避免 double-handout。
+                    if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
+                        s_soa_double_evict++;
+                        std::fprintf(stderr, "[soa-pool] DOUBLE-EVICT parent=%p idx=%d (已在池中, 跳过)\n",
+                                     (void*)e.parent, idx);
+                        // 不重复入池; 但仍需 mark_evicted + 清 extra 指针
+                        cap_extra->parent_buffer = nullptr; cap_extra->d = nullptr; cap_extra->q = nullptr;
+                        elastic::wbm_mark_evicted(octx->wbm, idx);
+                        return 0;
+                    }
                     octx->soa_pool_by_size[nbytes].push_back(e);
                     octx->retain_order_sizes.push_back(nbytes);
                     octx->cached_bytes += nbytes;
@@ -4771,17 +4807,44 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 cl_int err = CL_SUCCESS;
                 cl_mem new_parent = nullptr;
                 bool soa_hit = false;
+                // 诊断: GGML_ELASTIC_POOL_SYNC=1 → reload 前 drain compute queue,
+                // 确保被复用 buffer 上任何 in-flight GPU op 已完成 (验证 use-after-evict race)。
+                static const bool s_pool_sync = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_POOL_SYNC");
+                    return e && *e && *e != '0';
+                }();
+                if (s_pool_sync) clFinish(cap_q);
+                // 诊断: GGML_ELASTIC_NO_SOA_HIT=1 → 跳过三件套(parent+q+d)复用,
+                // 只复用 parent(走 alloc_or_pool_parent)然后重建 fresh q/d sub-buffer。
+                // 用来 bisect: 若此时输出正确, 则 corruption 在 q/d 三件套复用本身。
+                static const bool s_no_soa_hit = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_NO_SOA_HIT");
+                    return e && *e && *e != '0';
+                }();
                 // 先查 SOA pool (parent + d + q 三件套都复用，省 4 个 sub-buffer 操作)
-                if (octx->retain_cl_mem) {
+                if (octx->retain_cl_mem && !s_no_soa_hit) {
                     auto it = octx->soa_pool_by_size.find(nbytes);
                     if (it != octx->soa_pool_by_size.end() && !it->second.empty()) {
                         auto e = it->second.back(); it->second.pop_back();
                         new_parent     = (cl_mem)e.parent;
-                        cap_extra->d   = (cl_mem)e.d;
-                        cap_extra->q   = (cl_mem)e.q;
-                        cap_extra->size_d = cap_size_d;
-                        cap_extra->size_q = cap_size_q;
-                        soa_hit = true;
+                        s_soa_pooled_parents.erase((cl_mem)e.parent);   // 出池
+                        // 诊断 GGML_ELASTIC_POOL_PARENT_ONLY=1: 只复用 parent,
+                        // 释放旧 q/d sub-buffer, 下面重建 fresh(隔离 sub-buffer 对象复用是否出错)。
+                        static const bool s_parent_only = []() {
+                            const char *e2 = std::getenv("GGML_ELASTIC_POOL_PARENT_ONLY");
+                            return e2 && *e2 && *e2 != '0';
+                        }();
+                        if (s_parent_only) {
+                            if (e.q) clReleaseMemObject((cl_mem)e.q);
+                            if (e.d) clReleaseMemObject((cl_mem)e.d);
+                            soa_hit = false;   // 走下面 !soa_hit 重建 fresh sub-buffer
+                        } else {
+                            cap_extra->d   = (cl_mem)e.d;
+                            cap_extra->q   = (cl_mem)e.q;
+                            cap_extra->size_d = cap_size_d;
+                            cap_extra->size_q = cap_size_q;
+                            soa_hit = true;
+                        }
                         // 从 FIFO 列表移除一个 == nbytes 的 entry
                         for (auto lit = octx->retain_order_sizes.rbegin();
                              lit != octx->retain_order_sizes.rend(); ++lit) {
@@ -4797,6 +4860,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 cap_extra->parent_buffer = new_parent;
                 if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
                     cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
+                }
+                // 诊断 GGML_ELASTIC_POOL_COHERE=1: 复用 parent 时 convert 前 clEnqueueFillBuffer
+                // 全写一遍, 逼 driver 重置该 cl_mem 残留的 image-aliasing 状态。
+                static const bool s_pool_cohere = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_POOL_COHERE");
+                    return e && *e && *e != '0';
+                }();
+                if (s_pool_cohere) {
+                    const cl_uint zero = 0;
+                    cl_event fev = nullptr;
+                    if (clEnqueueFillBuffer(cap_q, new_parent, &zero, sizeof(zero), 0, nbytes,
+                                            0, nullptr, &fev) == CL_SUCCESS && fev) {
+                        clWaitForEvents(1, &fev); clReleaseEvent(fev);
+                    }
                 }
                 cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
                 if (!staging) { return -2; }

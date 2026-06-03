@@ -12,12 +12,17 @@
 | M1 | Plan IR + JSON 加载(native + make_plan 格式) | ✅ | `test_plan_ir` 加载真实 197w/197op/305ev plan |
 | M2 | PlanExecutor apply(plan) 差量 reconcile | ✅ | `test_plan_executor`(fresh/replan/runtime/anchor) |
 | M4-prov | PlanProvider table/callback | ✅ | `test_plan_provider`(29 bands + 指针稳定) |
-| **M3 (DoD#1)** | **`llama_elastic_apply_plan` 喂 plan 执行** | ✅ | **E2E:apply→0 + decode 8 token 正确** |
-| **M4 (DoD#2)** | **online loop 内存变化换 plan** | ✅ | **E2E:enable(callback)+ 切 plan + decode 继续** |
-| M5 | D2b runtime dispatch 接线 + 迁移意图 | ✅(桌面) | hook 安装验证;decode 不回归 |
-| M5-迁移 | 真 CPU↔GPU 迁移 + layout 转换 | ⏳ 设备侧 | 需 Android + GPU |
+| **M3 (DoD#1)** | **`llama_elastic_apply_plan` 喂 plan 执行** | ✅ 桌面+**真机** | 桌面 E2E + **真机 Adreno:evict 111 + 输出正确** |
+| **M4 (DoD#2)** | **online loop 内存变化换 plan** | ✅ 桌面+**真机** | 桌面 E2E + **真机:5 band 切换 + 输出正确**(CHANGES_04) |
+| M5 | D2b runtime dispatch 接线 + 迁移意图 | ✅(桌面) | hook 安装验证;真机末档触发 migrate=16 |
+| M5-迁移 | 真 CPU↔GPU 迁移端到端正确性 | ⏳ 设备侧 | 需专门验证(DoD#2 主验 residency+routing) |
 | M6 | overlap 编排(timeline→异步 prefetch) | ⏳ 设备侧 | 需 opencl WBM |
-| M7 | trace 端到端 plan-driven vs static 实测 | ⏳ 设备侧 | 需真机 |
+| M7 | trace 端到端 plan-driven vs static 实测 | ⏳ 设备侧 | 框架已跑通,待出指标 |
+
+> **真机验证(2026-06-03,OnePlus 12 / Adreno 750)见 `CHANGES_04_device_verification.md`**。
+> DoD#1/#2 均在真 GPU + ggml-opencl-elastic 上跑通;过程中修了 3 个真机集成 bug
+> (graph_reuse / 双驱逐者冲突 / 外部 prefetch 不同步 tensor->extra)。
+> **集成范式:plan 控制「踢谁」,backend 控制「怎么 reload」。**
 
 ## 提交(3 个,master..HEAD)
 

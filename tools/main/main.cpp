@@ -15,6 +15,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <nlohmann/json.hpp>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -167,6 +171,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // ===== NEW: elastic plan framework (feature/elastic-plan-framework) =====
+    // 用统一的 Plan IR → Execute 框架(llama_elastic_*),区别于下面 LLAMA_PLAN_DIR 的旧手写 demo。
+    //   LLAMA_ELASTIC_APPLY=<plan.json>  : 加载一个 plan, llama_elastic_apply_plan (DoD#1)
+    //   LLAMA_ELASTIC_DIR=<plans_dir>    : llama_elastic_enable("table",dir), 内存变化 online 换 plan (DoD#2)
+    // 这两个 env 与 LLAMA_PLAN_DIR 互不影响(不同 env);设了新的就走新框架。
+    if (const char * ap = std::getenv("LLAMA_ELASTIC_APPLY")) {
+        llama_plan * plan = llama_plan_load_json(ap);
+        if (plan) {
+            int rc = llama_elastic_apply_plan(ctx, plan);
+            LOG_INF("[elastic-fw] apply_plan(%s) rc=%d budget=%lldMiB weights=%d ops=%d\n",
+                    ap, rc, (long long) llama_plan_budget_mib(plan),
+                    llama_plan_n_weights(plan), llama_plan_n_ops(plan));
+            // plan 须在推理期间存活;CLI 一次性进程,泄漏到退出即可。
+        } else {
+            LOG_ERR("[elastic-fw] failed to load plan %s\n", ap);
+        }
+    }
+    if (const char * ed = std::getenv("LLAMA_ELASTIC_DIR")) {
+        int rc = llama_elastic_enable(ctx, "table", ed);
+        LOG_INF("[elastic-fw] enable(table, %s) rc=%d\n", ed, rc);
+    }
+
     // ===== v8 demo: layer-partition via op_schedule (graph build time) =====
     // 比 op_runtime_dispatch 简单 — 走 ggml-sched 已有的 split mechanism 处理
     // cross-backend weight + activation, 不需要 v3-v6 的 runtime migration code.
@@ -179,6 +205,199 @@ int main(int argc, char ** argv) {
     // 决策也用 LP study (project_lp_oracle_findings): Belady+PF16 给出的"哪些 op
     // 该在哪 backend"的 oracle. 这里只演示 layer-cut, 真接 LP 时把 layer < N 改成
     // partition[op_name] 查表.
+    // ===== Plan scheduler: 加载离线 plan, 每次 budget 变化查表执行 =====
+    // LLAMA_PLAN_DIR=<dir> 指向 make_plan.py 生成的 plans/ (index.json + plan_*.json)。
+    // scheduler 每次内存 budget 变化时按 mem_avail_mb snap 到 band 切 current plan;
+    //   - op_schedule: mul_mat 按 src[0] 的 weight 名查 plan.routes -> backend
+    //   - weight_pin : 按 weight 名查 plan.resident_in_memory (常驻名单)
+    //   - 切 band 时 evict 不再常驻的 / prefetch 新常驻的
+    if (const char *pdir = std::getenv("LLAMA_PLAN_DIR")) {
+        using json = nlohmann::json;
+        struct PlanBand {
+            double budget_mib = 0;
+            int    ngl = 32;                                // partial-offload: 前 ngl 层 GPU, 其余 CPU
+            std::unordered_map<std::string, int> routes;   // weight 名 -> backend_id
+            std::unordered_set<std::string>      pins;      // 常驻 weight 名
+        };
+        struct PlanState {
+            std::vector<PlanBand> bands;                    // 按 budget 升序
+            std::atomic<int>      current{0};
+            int cpu_id = 0, gpu_id = -1;
+            bool force_gpu = false;
+            uint64_t n_fire = 0, n_switch = 0, n_op_hit = 0;
+            // ===== online residency-aware 模式 (LLAMA_ONLINE) =====
+            // offline 是 stateless 查表: budget 每次跌都按新 band 把溢出层路由 CPU
+            //   → 低 budget 期 token 跑 CPU(慢) + 回升时可能 reconvert。residency-blind。
+            // online 知道权重物理上还在 UMA(16GB,模型 4.6GB,瞬时 budget 抖动并没把
+            //   权重踢出),所以维持 high-water 常驻 ngl: budget 涨才升 GPU 层(必然
+            //   convert 一次);瞬时跌不动(sticky);只有【持续】跌 debounce 次才真降。
+            //   → 全程 GPU,避免 offline 的 CPU-fallback + reconvert churn。
+            bool online = false;
+            std::atomic<int> res_ngl{0};   // 当前常驻 GPU 层数 (high-water)
+            int debounce = 4;              // 连续跌多少次才真降 (吸收瞬时震荡)
+            int low_run = 0;               // 连续"目标<常驻"计数 (scheduler 单线程, 不需原子)
+        };
+        static PlanState ps;
+        ps.cpu_id = llama_n_backends(ctx) - 1;
+        ps.gpu_id = (llama_n_backends(ctx) > 1) ? 0 : -1;
+        ps.force_gpu = std::getenv("LLAMA_PLAN_FORCE_GPU") != nullptr;  // 诊断: 全 GPU 路由
+        ps.online    = std::getenv("LLAMA_ONLINE") != nullptr;
+        if (const char *d = std::getenv("LLAMA_ONLINE_DEBOUNCE")) ps.debounce = std::atoi(d);
+        std::string dir = pdir;
+        try {
+            std::ifstream idxf(dir + "/index.json");
+            json idx; idxf >> idx;
+            for (auto &it : idx["index"]) {
+                std::ifstream pf(dir + "/" + it["file"].get<std::string>());
+                if (!pf) continue;
+                json pj; pf >> pj;
+                PlanBand b;
+                b.budget_mib = pj["budget_mib"].get<double>();
+                b.ngl = pj.value("ngl", 32);   // partial-offload GPU 层数 (make_plan_q4 budget_to_ngl)
+                for (auto &kv : pj["routes"].items())
+                    b.routes[kv.key()] = (kv.value().get<std::string>() == "gpu") ? ps.gpu_id : ps.cpu_id;
+                for (auto &p : pj["resident_in_memory"])
+                    b.pins.insert(p["name"].get<std::string>());
+                ps.bands.push_back(std::move(b));
+            }
+            std::sort(ps.bands.begin(), ps.bands.end(),
+                      [](const PlanBand &a, const PlanBand &b) { return a.budget_mib < b.budget_mib; });
+            LOG_INF("[plan] loaded %zu bands from %s (cpu=%d gpu=%d)\n",
+                    ps.bands.size(), dir.c_str(), ps.cpu_id, ps.gpu_id);
+        } catch (const std::exception &e) {
+            LOG_ERR("[plan] load failed: %s\n", e.what());
+        }
+        if (!ps.bands.empty()) {
+            // route_op: 默认【不】注册 —— per-op 路由跟 elastic GPU 流式共存会 cl_mem
+            // 冲突崩溃 (clSetKernelArg -38, CL_INVALID_MEM_OBJECT). 选项1: 只用 pin/budget,
+            // op 全留 GPU. LLAMA_PLAN_ROUTE=1 才开 per-op 路由(实验, 需配 V8 host_ptr fix).
+            // LLAMA_PLAN_CONTIG=1 (推荐): 连续层分区路由 —— 当前 band 的前 ngl 层 → GPU,
+            // 其余层 → CPU(读 mmap 免 convert). 只 1 个 cross-backend 边界(避免 per-op
+            // 散路由的切换风暴, 每切换 ~38ms). 配 LLAMA_KEEP_GRAPH_REUSE=1 复用 graph,
+            // band 切换时 scheduler 调 llama_graph_invalidate 重建一次. 实测 @3500 503ms
+            // vs dynamic 984ms (no-retain, 输出正确).
+            if (std::getenv("LLAMA_PLAN_CONTIG")) {
+            llama_set_op_schedule(ctx, [](const struct ggml_tensor * /*node*/, const char * /*name*/,
+                                          int layer, void *ud) -> int {
+                auto *s = (PlanState *)ud;
+                if (layer < 0) return -1;                               // embd/head/output → 默认 GPU
+                if (s->force_gpu) { s->n_op_hit++; return s->gpu_id; }
+                s->n_op_hit++;
+                // online: 用 high-water res_ngl(sticky); offline: 用当前 band 的 ngl(stateless)
+                const int cur_ngl = s->online ? s->res_ngl.load()
+                                              : s->bands[s->current.load()].ngl;
+                return (layer < cur_ngl) ? s->gpu_id : s->cpu_id;      // 连续: 前 ngl 层 GPU
+            }, &ps);
+            } else if (std::getenv("LLAMA_PLAN_ROUTE")) {
+            // (旧)per-op 散路由: 按 weight 名查 plan.routes. 切换风暴慢 4015ms, 仅诊断.
+            llama_set_op_schedule(ctx, [](const struct ggml_tensor *node, const char * /*name*/,
+                                          int /*layer*/, void *ud) -> int {
+                auto *s = (PlanState *)ud;
+                if (!node || node->op != GGML_OP_MUL_MAT) return -1;
+                if (s->force_gpu) { s->n_op_hit++; return s->gpu_id; }   // 诊断: 全部 GPU
+                if (!node->src[0]) return -1;
+                const char *w = node->src[0]->name;
+                if (!w || !*w) return -1;
+                const PlanBand &b = s->bands[s->current.load()];
+                auto it = b.routes.find(w);
+                if (it == b.routes.end()) return -1;
+                s->n_op_hit++;
+                return it->second;
+            }, &ps);
+            }
+            // weight_pin: pin 住 GPU 常驻的 ngl 层 → elastic 不会因 budget 抖动把它们
+            // evict 重转(churn)。这是"静态 partial offload"的关键: GPU 层 convert 一次、
+            // 常驻; 溢出层走 CPU 读 mmap。CONTIG/online 按 layer<ngl pin(GPU 集);
+            // 否则回退 plan 名单。(LLAMA_PLAN_NOPIN=1 关掉做诊断, 会退化成 churn)
+            if (!std::getenv("LLAMA_PLAN_NOPIN")) {
+            const bool contig = std::getenv("LLAMA_PLAN_CONTIG") != nullptr;
+            if (contig || ps.online) {
+            llama_set_weight_pin(ctx, [](const char * /*name*/, int layer, size_t /*sz*/,
+                                         void *ud) -> bool {
+                auto *s = (PlanState *)ud;
+                if (layer < 0) return true;                         // embd/head/norm 常驻 GPU
+                const int ngl = s->online ? s->res_ngl.load()
+                                          : s->bands[s->current.load()].ngl;
+                return layer < ngl;                                 // GPU 路由的层 → pin 住
+            }, &ps);
+            } else {
+            llama_set_weight_pin(ctx, [](const char *name, int /*layer*/, size_t /*sz*/,
+                                         void *ud) -> bool {
+                auto *s = (PlanState *)ud;
+                return name && s->bands[s->current.load()].pins.count(name) > 0;
+            }, &ps);
+            }
+            }
+            // scheduler: 内存变化触发 -> snap band -> 切 plan -> evict/prefetch 差异
+            llama_set_scheduler(ctx, [](struct llama_context *c,
+                                        const struct llama_runtime_state *st, void *ud) {
+                auto *s = (PlanState *)ud;
+                s->n_fire++;
+                int idx = 0;   // 最大 budget <= 当前内存 的 band(保证驻留 <= budget)
+                for (int i = 0; i < (int)s->bands.size(); ++i)
+                    if (s->bands[i].budget_mib <= (double)st->mem_avail_mb) idx = i;
+                // ===== online residency-aware: sticky high-water ngl + debounce =====
+                if (s->online) {
+                    // residency-aware target: 直接按真实 footprint 算能放多少层
+                    // (offline 的 band.ngl 过度保留 headroom → 多路 CPU → 慢)。
+                    // 模型物理上能放进设备 RAM(16GB vs 模型 4.6GB), 故高 budget 时
+                    // 可全 GPU(32 层), 瞬时跌靠 high-water + debounce 骑过去, 不重路 CPU。
+                    static const int   ONL_NLAYER = []{ const char*e=getenv("LLAMA_ONLINE_NLAYER"); return e?atoi(e):32; }();
+                    static const double ONL_BASE  = []{ const char*e=getenv("LLAMA_ONLINE_BASE");   return e?atof(e):300.0; }();
+                    static const double ONL_PER   = []{ const char*e=getenv("LLAMA_ONLINE_PER");    return e?atof(e):117.0; }();
+                    int fit = (int)(((double)st->mem_avail_mb - ONL_BASE) / ONL_PER);
+                    if (fit < 0) fit = 0;
+                    if (fit > ONL_NLAYER) fit = ONL_NLAYER;
+                    const int target = fit;
+                    const int cur    = s->res_ngl.load();
+                    bool changed = false;
+                    if (target > cur) {                 // budget 涨 → 升 GPU 层(convert 一次)
+                        s->res_ngl.store(target); s->low_run = 0; changed = true;
+                    } else if (target < cur) {          // budget 跌 → 先不动, 攒 debounce
+                        if (++s->low_run >= s->debounce) {
+                            s->res_ngl.store(target); s->low_run = 0; changed = true;
+                        }
+                    } else { s->low_run = 0; }
+                    s->current.store(idx);
+                    if (changed) { s->n_switch++; llama_graph_invalidate(c); }
+                    LOG_INF("[online] fire#%llu step=%llu mem=%lld MB target_ngl=%d res_ngl=%d%s\n",
+                            (unsigned long long)s->n_fire, (unsigned long long)st->decode_step,
+                            (long long)st->mem_avail_mb, target, s->res_ngl.load(),
+                            changed ? " (MIGRATE)" : "");
+                    return;
+                }
+                int prev = s->current.load();
+                if (idx != prev) {
+                    s->n_switch++;
+                    s->current.store(idx);
+                    // band 变 → routing(ngl)变 → 强制重建 graph 一次(配 LLAMA_KEEP_GRAPH_REUSE
+                    // 平时复用; 不调则 cached graph 保持旧 band 的路由 → 错). 见 llama_graph_invalidate.
+                    llama_graph_invalidate(c);
+                    // 主动迁移默认【关】—— 一次 prefetch 整个 pin set(上百个 weight)会
+                    // 跟 elastic budget/pool 冲突崩. 让 elastic 按 budget+weight_pin 自然 reload.
+                    // LLAMA_PLAN_MOVE=1 才开(需限量/分批, 见选项3).
+                    if (std::getenv("LLAMA_PLAN_MOVE")) {
+                        const auto &nb = s->bands[idx];
+                        const auto &ob = s->bands[prev];
+                        for (const auto &w : ob.pins) if (!nb.pins.count(w)) llama_weight_request_evict(c, w.c_str());
+                        for (const auto &w : nb.pins) if (!ob.pins.count(w)) llama_weight_request_prefetch(c, w.c_str());
+                    }
+                    s->current.store(idx);
+                }
+                LOG_INF("[plan] fire#%llu step=%llu mem=%lld MB delta=%+lld -> band %.0f MiB%s\n",
+                        (unsigned long long)s->n_fire, (unsigned long long)st->decode_step,
+                        (long long)st->mem_avail_mb, (long long)st->mem_delta_mb,
+                        s->bands[idx].budget_mib, idx != prev ? " (SWITCH)" : "");
+            }, &ps);
+            std::atexit([]() {
+                LOG_INF("[plan] fires=%llu switches=%llu op_routed=%llu final_band=%.0f MiB\n",
+                        (unsigned long long)ps.n_fire, (unsigned long long)ps.n_switch,
+                        (unsigned long long)ps.n_op_hit,
+                        ps.bands.empty() ? 0.0 : ps.bands[ps.current.load()].budget_mib);
+            });
+        }
+    }
+
     if (const char *pv8 = std::getenv("LLAMA_V8_PARTITION_LAYER")) {
         struct v8_state {
             int partition_layer = 0;

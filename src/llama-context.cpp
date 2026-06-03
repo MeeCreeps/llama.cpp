@@ -897,8 +897,21 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
         sinks.set_resident = [this](int wid, bool want) {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
             if (!w) return;
-            // want=true → prefetch(搬进 GPU);want=false → evict。底层全局 registry。
-            llama_weight_movement_request(w->name.c_str(), /*evict=*/!want);
+            // 只做主动 EVICT;不主动 prefetch —— 让 backend 的 ensure_resident 在 graph_compute
+            // 按需 reload(它正确同步 tensor->extra->data_device;外部 prefetch 只换 WBM
+            // 的 cl_mem 不同步 tensor->extra → GPU kernel 用到旧/freed 指针崩,实测 §设备)。
+            // LLAMA_ELASTIC_ACTIVE_PREFETCH=1 可强制走主动 prefetch(诊断用)。
+            if (!want) {
+                llama_weight_movement_request(w->name.c_str(), /*evict=*/true);
+            } else {
+                static const bool active_prefetch = []() {
+                    const char * e = std::getenv("LLAMA_ELASTIC_ACTIVE_PREFETCH");
+                    return e && atoi(e) != 0;
+                }();
+                if (active_prefetch) {
+                    llama_weight_movement_request(w->name.c_str(), /*evict=*/false);
+                }
+            }
         };
         sinks.is_resident = [this](int wid) -> bool {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
@@ -940,7 +953,15 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     elastic_install_runtime_dispatch();
 
     elastic_install_op_schedule();
-    graph_invalidate();  // routing 变 → 丢弃 cached graph,下次 decode 重建
+    // routing + residency 变 → 必须重建 graph,否则复用的 cached graph 会引用已 evict 的
+    // cl_mem(设备侧 CL_INVALID_MEM_OBJECT 崩)。与 set_op_schedule 同策略:置
+    // graph_reuse_disable=true(每 decode 重建),除非 LLAMA_KEEP_GRAPH_REUSE 显式保留复用。
+    static const bool keep_reuse = []() {
+        const char * e = std::getenv("LLAMA_KEEP_GRAPH_REUSE");
+        return e && atoi(e) != 0;
+    }();
+    if (!keep_reuse) graph_reuse_disable = true;
+    graph_invalidate();  // 丢弃当前 cached graph,下次 decode 立即重建
 
     LLAMA_LOG_INFO("%s: applied plan budget=%lldMiB weights=%d ops=%d "
                    "prefetch=%d evict=%d route=%d migrate=%d events=%d\n",
