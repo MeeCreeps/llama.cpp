@@ -55,10 +55,12 @@ cmake -S . -B build-native -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_BUILD_TOOLS=OFF -DGGML_OPENCL=OFF -DLLAMA_CURL=OFF
 cmake --build build-native --target llama -j
 
-# 3. E2E(需标准 llama arch 模型,如 Llama-3.2-3B a.gguf)
+# 3. E2E(标准 llama arch 模型;in-tree 的 3B 即可,plans 就是给它标的)
 g++ -std=c++17 -O2 -I include -I ggml/include tests/elastic/test_plan_e2e.cpp \
     -L build-native/bin -lllama -lggml -lggml-base -Wl,-rpath,build-native/bin -o build-native/test_plan_e2e
-./build-native/test_plan_e2e <model.gguf> runtime/plan/plans/plan_4144MiB.json
+./build-native/test_plan_e2e models/llama-3.2-3b/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+    runtime/plan/plans/plan_4144MiB.json
+# 已验证可用模型:in-tree Q4_K_M 3B、F16 3B(a.gguf)。dllm/sdar 自定义 arch 不行。
 ```
 
 ## 用 API(三种用法)
