@@ -17,7 +17,7 @@
 | M5 | D2b runtime dispatch 接线 + 迁移意图 | ✅(桌面) | hook 安装验证;真机末档触发 migrate=16 |
 | M5-迁移 | 真 CPU↔GPU 迁移端到端正确性 | ⏳ 设备侧 | 需专门验证(DoD#2 主验 residency+routing) |
 | M6 | overlap 编排(timeline→异步 prefetch) | ⏳ 设备侧 | 需 opencl WBM |
-| M7 | trace 端到端 plan-driven vs static 实测 | ⏳ 设备侧 | 框架已跑通,待出指标 |
+| M7 | plan-driven 真机实测 | ✅ **真机** | **2800→7408 MiB = 19× 提速(4141→217 ms/tok);dynamic vs static-min ≈ 1.9×**(`.wiki/research/plan_driven_elastic_2026-06-03.md`) |
 
 > **真机验证(2026-06-03,OnePlus 12 / Adreno 750)见 `CHANGES_04_device_verification.md`**。
 > DoD#1/#2 均在真 GPU + ggml-opencl-elastic 上跑通;过程中修了 3 个真机集成 bug
