@@ -102,6 +102,26 @@ llama_elastic_enable(ctx, "callback", NULL);
 - M5 的真迁移仍 env 门控(`GGML_SCHED_RUNTIME_DISPATCH_MIGRATE`);逐 op 按 `elastic_migrate`
   自动开 = 设备侧收尾(改 ggml-backend.cpp,留真机一起调,避免盲改)。
 
+## M6 overlap 的精确阻塞点(已定位,留给下次)
+
+M7 显示低-budget 段实测比预测慢 2×,因为流式 reload **串行**(没和 compute overlap)。
+M6 overlap = prefetch-ahead(op N 算时预取 op N+k 的 weight),**必须走主动 prefetch**。
+但主动 prefetch 当前会崩,根因已精确定位:
+
+- backend **内部** reload(graph_compute 路径,`ggml-opencl.cpp:3406-3409`)同时握有
+  tensor(src)和 WBM block,所以能 `src_extra->data_device = bm->backend_handle` 把
+  tensor 的 extra 同步到新 cl_mem。
+- 我的**外部** prefetch(`opencl_sched_movement_request`,by name→wbm idx)调
+  `wbmcl_ensure_resident` 重 alloc 了 WBM 的 cl_mem,但**没有 tensor 指针**去同步
+  `extra->data_device` → GPU kernel 读到旧/freed 指针 → CL_INVALID_MEM_OBJECT 崩。
+
+**修复路径(清晰、scoped)**:给 WBM block 存 tensor extra 指针(或建 wbm-idx → extra 侧表,
+注册 weight 时填),外部 prefetch reload 后照 `3409` 同步 `extra->data_device`。修好后:
+主动 prefetch 可用 → 接 timeline anchor 的异步预取(per-engine overlap §5.5)→ 压低低-budget
+段、放大 dynamic 优势。**这是热路径 backend 改动,值得专门一轮带测试做,不盲改。**
+
+当前稳定范式(evict-only + backend reload-on-use)已正确,只是没 overlap。
+
 ## 建议的下一步(设备侧,按优先级)
 
 1. **M5 收尾**:让 ggml-backend per-op migration 读 `elastic_migrate`(取代 env),真机验证
