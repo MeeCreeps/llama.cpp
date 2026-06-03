@@ -332,7 +332,10 @@ private:
     std::unique_ptr<elastic::PlanProvider> elastic_provider;   // dynamic 模式
     const elastic::ExecPlan * elastic_plan         = nullptr;  // 当前已 apply(不拥有)
     const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
-    std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id
+    std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id (STATIC routing)
+    std::unordered_map<std::string, int> elastic_runtime_route;// weight 名 → backend_id (RUNTIME dispatch, M5)
+    // weight 名 → (migrate_from_backend, xform) — 跨后端迁移意图 (M5, 设备侧用)
+    std::unordered_map<std::string, std::pair<int,int>> elastic_migrate;
     bool    elastic_enabled = false;                           // dynamic online loop 开关
     int     elastic_cpu_id  = -1;                              // CPU backend index
     int     elastic_gpu_id  = -1;                              // GPU backend index(-1=无)
@@ -343,6 +346,7 @@ private:
 
     // 内部 helpers(apply_exec_plan 在 public 区声明)
     void elastic_install_op_schedule();                        // 安装读 elastic_route 的 op_schedule_fn
+    void elastic_install_runtime_dispatch();                   // M5:装 per-op runtime dispatch hook
     void maybe_apply_plan();                                   // online loop:档变换 plan
     int64_t elastic_budget_mib() const;                        // 当前预算(BudgetWatcher/meminfo)
 

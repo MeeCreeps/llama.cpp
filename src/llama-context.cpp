@@ -852,6 +852,33 @@ void llama_context::elastic_install_op_schedule() {
     op_schedule_ud = this;
 }
 
+void llama_context::elastic_install_runtime_dispatch() {
+    // M5(D2b-runtime):RUNTIME-dispatch op 在 compute 即将开始前查 plan 决定 backend,
+    // 并触发跨后端迁移(CPU↔GPU + layout 转换,设备侧由 ggml-backend migration pool 做)。
+    // 无 RUNTIME op → 卸掉 hook(STATIC plan 不付 per-op 单 op 执行代价)。
+    if (elastic_runtime_route.empty()) {
+        set_op_runtime_dispatch(nullptr, nullptr);
+        return;
+    }
+    // hook:按 op 的 src[0](weight)名查 runtime route。返回 -1 = 用 split 默认。
+    // 迁移由 ggml-backend 的 RUNTIME_DISPATCH_MIGRATE 通路处理(target ≠ split backend 时);
+    // elastic_migrate 记录的 xform 供设备侧成本模型/日志参考。
+    auto hook = [](const struct ggml_tensor * op, int default_backend_id,
+                   int /*n_backends*/, void * ud) -> int {
+        auto * self = (llama_context *) ud;
+        if (!op || op->op != GGML_OP_MUL_MAT) return default_backend_id;
+        if (!op->src[0]) return default_backend_id;
+        const char * w = op->src[0]->name;
+        if (!w || !*w) return default_backend_id;
+        auto it = self->elastic_runtime_route.find(w);
+        if (it == self->elastic_runtime_route.end()) return default_backend_id;
+        return it->second;
+    };
+    set_op_runtime_dispatch(hook, this);
+    LLAMA_LOG_INFO("%s: installed runtime dispatch for %d op(s), %d migrate\n",
+                   __func__, (int) elastic_runtime_route.size(), (int) elastic_migrate.size());
+}
+
 int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     if (!plan) return -1;
 
@@ -884,15 +911,34 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
             int bid = (be == elastic::Backend::GPU) ? elastic_gpu_id : elastic_cpu_id;
             if (bid >= 0) elastic_route[o->name] = bid;
         };
-        sinks.set_op_migrate = [](int, bool, elastic::Backend, elastic::Xform) {
-            // M5 接 ggml-backend per-op migration;M3 先记录意图(no-op)。
+        sinks.set_op_migrate = [this](int op_id, bool migrate, elastic::Backend from, elastic::Xform xf) {
+            // M5:记录跨后端迁移意图(name → from_backend, xform)。设备侧 runtime dispatch
+            // hook 据此对该 op 输入做 CPU↔GPU 迁移 + layout 转换。
+            const elastic::OpPlan * o = elastic_plan ? elastic_plan->op_by_id(op_id) : nullptr;
+            if (!o) return;
+            if (migrate) elastic_migrate[o->name] = { (int) from, (int) xf };
+            else         elastic_migrate.erase(o->name);
         };
         elastic_executor = std::make_unique<elastic::PlanExecutor>(std::move(sinks));
     }
 
     elastic_plan = plan;
     elastic_route.clear();
+    elastic_runtime_route.clear();
+    elastic_migrate.clear();
     elastic::ReconcileStats st = elastic_executor->apply(*plan);
+
+    // RUNTIME-dispatch op:executor 不灌 static route,改由 op_runtime_dispatch hook
+    // 在 compute 时查表(D2b-runtime,M5)。这里收集 name → backend_id。
+    for (const auto & o : plan->ops) {
+        if (o.dispatch != elastic::Dispatch::RUNTIME) continue;
+        int bid = (o.compute_backend == elastic::Backend::GPU) ? elastic_gpu_id : elastic_cpu_id;
+        if (bid >= 0) elastic_runtime_route[o.name] = bid;
+    }
+    // 有 RUNTIME op → 装 per-op runtime dispatch hook(接已有 ggml_backend_sched
+    // runtime dispatch 通路)。无则不装(STATIC plan 0 开销,桌面 E2E 路径不受影响)。
+    elastic_install_runtime_dispatch();
+
     elastic_install_op_schedule();
     graph_invalidate();  // routing 变 → 丢弃 cached graph,下次 decode 重建
 
