@@ -18,6 +18,9 @@ set(_ELASTIC_SOURCES
     metrics_logger.cpp
     weight_buffer_manager.cpp
     weight_buffer_manager_cpu.cpp
+    plan_ir.cpp
+    plan_executor.cpp
+    plan_provider.cpp
 )
 
 # OpenCL 包装层只在 find_package 找到 OpenCL 时进静态库。
@@ -33,6 +36,8 @@ endif()
 
 add_library(elastic_runtime STATIC ${_ELASTIC_SOURCES})
 target_include_directories(elastic_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Plan IR / provider 用 vendor 的 header-only nlohmann json(repo 根 vendor/)。
+target_include_directories(elastic_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../vendor)
 target_link_libraries(elastic_runtime PUBLIC Threads::Threads)
 target_compile_options(elastic_runtime PRIVATE -Wall -Wextra -Wpedantic)
 
