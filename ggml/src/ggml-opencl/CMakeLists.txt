@@ -85,8 +85,9 @@ set(GGML_OPENCL_KERNELS
     diag_mask_inf
     div
     gelu
-    gemv_noshuffle_general
-    gemv_noshuffle
+    gemv_noshuffle_q4_0_f32
+    gemv_noshuffle_q4_0_f32_spec
+    gemv_noshuffle_q8_0_f32
     get_rows
     glu
     group_norm

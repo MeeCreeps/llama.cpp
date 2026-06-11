@@ -617,17 +617,19 @@ struct ggml_backend_opencl_context {
 
     // Gemm and Gemv related programs, kernels, etc
     cl_program program_CL_gemm;
-    cl_program program_CL_gemv_general;
-    cl_program program_CL_gemv_4096_1_11008;
-    cl_program program_CL_gemv_4096_1_4096;
-    cl_program program_CL_gemv_11008_1_4096;
-    cl_program program_CL_gemv_32000_1_4096;
+    cl_program program_gemv_noshuffle_q4_0_f32;
+    cl_program program_gemv_noshuffle_q4_0_f32_4096_1_11008;
+    cl_program program_gemv_noshuffle_q4_0_f32_4096_1_4096;
+    cl_program program_gemv_noshuffle_q4_0_f32_11008_1_4096;
+    cl_program program_gemv_noshuffle_q4_0_f32_32000_1_4096;
+    cl_program program_gemv_noshuffle_q8_0_f32;
     cl_kernel CL_mul_mat_Ab_Bi_8x4;
-    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
-    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008;
-    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096;
-    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
-    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_32000_1_4096;
+    cl_kernel kernel_gemv_noshuffle_q8_0_f32;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     void free() {
@@ -1886,7 +1888,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
-    // gemv_noshuffle_general
+    // gemv_noshuffle_q4_0_f32
     {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable "
@@ -1898,20 +1900,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src_CL_gemv_general {
-            #include "gemv_noshuffle_general.cl.h"
+            #include "gemv_noshuffle_q4_0_f32.cl.h"
         };
 #else
-        const std::string kernel_src_CL_gemv_general = read_file("gemv_noshuffle_general.cl");
+        const std::string kernel_src_CL_gemv_general = read_file("gemv_noshuffle_q4_0_f32.cl");
 #endif
 
-        backend_ctx->program_CL_gemv_general = build_program_from_source(
+        backend_ctx->program_gemv_noshuffle_q4_0_f32 = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
 
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general = clCreateKernel(backend_ctx->program_CL_gemv_general, "kernel_gemv_noshuffle", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
-    // gemv_noshuffle
+    // gemv_noshuffle_q4_0_f32_spec
     {
         // Gemv 2048, 16384
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
@@ -1926,15 +1928,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src_CL_gemv {
-            #include "gemv_noshuffle.cl.h"
+            #include "gemv_noshuffle_q4_0_f32_spec.cl.h"
         };
 #else
-        const std::string kernel_src_CL_gemv = read_file("gemv_noshuffle.cl");
+        const std::string kernel_src_CL_gemv = read_file("gemv_noshuffle_q4_0_f32_spec.cl");
 #endif
 
-        backend_ctx->program_CL_gemv_4096_1_4096 = build_program_from_source(
+        backend_ctx->program_gemv_noshuffle_q4_0_f32_4096_1_4096 = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096 = clCreateKernel(backend_ctx->program_CL_gemv_4096_1_4096, "kernel_gemv_noshuffle", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_4096 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32_4096_1_4096, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
 
         // Gemv 2048, 16384
@@ -1948,9 +1950,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
 
-        backend_ctx->program_CL_gemv_4096_1_11008 = build_program_from_source(
+        backend_ctx->program_gemv_noshuffle_q4_0_f32_4096_1_11008 = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008 = clCreateKernel(backend_ctx->program_CL_gemv_4096_1_11008, "kernel_gemv_noshuffle", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_11008 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32_4096_1_11008, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
 
         // Gemv 5504, 44032
@@ -1964,9 +1966,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
 
-        backend_ctx->program_CL_gemv_11008_1_4096 = build_program_from_source(
+        backend_ctx->program_gemv_noshuffle_q4_0_f32_11008_1_4096 = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096 = clCreateKernel(backend_ctx->program_CL_gemv_11008_1_4096, "kernel_gemv_noshuffle", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_11008_1_4096 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32_11008_1_4096, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
 
         // Gemv 16000, 128000
@@ -1981,9 +1983,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
 
-        backend_ctx->program_CL_gemv_32000_1_4096 = build_program_from_source(
+        backend_ctx->program_gemv_noshuffle_q4_0_f32_32000_1_4096 = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096 = clCreateKernel(backend_ctx->program_CL_gemv_32000_1_4096, "kernel_gemv_noshuffle", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32000_1_4096 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32_32000_1_4096, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // gemv_noshuffle_q8_0_f32
+    {
+        std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
+                                       " -cl-mad-enable "
+                                       " -DSIMDGROUP_WIDTH=" +
+                                       std::to_string(backend_ctx->adreno_wave_size);
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_CL_gemv_q8_0 {
+            #include "gemv_noshuffle_q8_0_f32.cl.h"
+        };
+#else
+        const std::string kernel_src_CL_gemv_q8_0 = read_file("gemv_noshuffle_q8_0_f32.cl");
+#endif
+
+        backend_ctx->program_gemv_noshuffle_q8_0_f32 = build_program_from_source(
+            backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_q8_0.c_str(), CL_gemv_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q8_0_f32, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -8283,6 +8307,61 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     int padding;
     // <--------------------------------------------> //
 
+    // q8_0 x fp32 decode fast path
+    if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 && N == 1) {
+        img_fmt_1d = { CL_R, CL_UNSIGNED_INT32 };
+        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc_1d.image_width = M * K / 4;
+        img_desc_1d.buffer = extra0_q8_0->q;
+        A_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
+        CL_CHECK(status);
+
+        region.origin = offset1;
+        region.size = K * N * sizeof(float);
+        B_sub_buffer = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+        CL_CHECK(status);
+
+        img_fmt_1d = { CL_RGBA, CL_FLOAT };
+        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+        img_desc_1d.image_width = K * N / 4;
+        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc_1d.buffer = B_sub_buffer;
+        B_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
+        CL_CHECK(status);
+
+        kernel = backend_ctx->kernel_gemv_noshuffle_q8_0_f32;
+
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_image1d));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &B_image1d));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+
+        const size_t wavesize = backend_ctx->adreno_wave_size;
+        const size_t n_simdgroup = 16;
+        size_t local_work_size[3] = { wavesize, n_simdgroup, 1 };
+        size_t global_work_size[3] = { (size_t) CEIL_DIV(M, wavesize) * wavesize, n_simdgroup, 1 };
+
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        CL_CHECK(clReleaseMemObject(A_image1d));
+        CL_CHECK(clReleaseMemObject(B_sub_buffer));
+        CL_CHECK(clReleaseMemObject(B_image1d));
+
+        return;
+    }
+
     // q4_0 x fp32
     if(src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32) {
         // TODO: remove duplicate definitions of image description + format -- move to top
@@ -8309,18 +8388,20 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // <--------------------------------------------> //
 
 
-        // create a sub_buffer for B
-        // <--------------------------------------------> //
-        region.origin = (extra1->offset);
-        region.size = K * N * sizeof(float);
-        B_sub_buffer = clCreateSubBuffer(
-            extra1->data_device,
-            0,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &status);
-        CL_CHECK(status);
-        // <--------------------------------------------> //
+        if (N != 1) {
+            // create a sub_buffer for B
+            // <--------------------------------------------> //
+            region.origin = offset1;
+            region.size = K * N * sizeof(float);
+            B_sub_buffer = clCreateSubBuffer(
+                extra1->data_device,
+                0,
+                CL_BUFFER_CREATE_TYPE_REGION,
+                &region,
+                &status);
+            CL_CHECK(status);
+            // <--------------------------------------------> //
+        }
 
         // transpose activation for Skyler's gemm
         if (N != 1) {
@@ -8411,39 +8492,20 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             };
 
             backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_size_t, local_size_t, dst);
-        } else {
-            // no need to transpose B in other cases
-            // create an image for B from sub_buffer
-            // <--------------------------------------------> //
-            img_fmt_1d = {CL_RGBA, CL_FLOAT};
-
-            memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-            img_desc_1d.image_width = K * N / 4;
-            img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-            img_desc_1d.buffer = B_sub_buffer;
-            B_image1d = clCreateImage(
-                context,
-                CL_MEM_READ_ONLY,
-                &img_fmt_1d,
-                &img_desc_1d,
-                NULL,
-                &status);
-            CL_CHECK(status);
-            // <--------------------------------------------> //
         }
 
         // choose gemm or gemv kernel
         // <--------------------------------------------> //
         if (N == 1) {
-            kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
+            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32;
             if (M == 4096 && K == 4096) {
-                kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096;
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
             } else if (M == 4096 && K == 11008) {
-                kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008;
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
             } else if (M == 11008 && K == 4096) {
-                kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
             } else if (M == 32000 && K == 4096) {
-                kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32000_1_4096;
             }
         } else {
             kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4;
@@ -8457,10 +8519,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         if (N == 1) {
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &A_image1d));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &extra0_q4_0->d));
-            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &B_image1d));
-            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &extra1->offset));
+            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &offset1));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &extrad->offset));
+            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &offsetd));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne00));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne01));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne02));
@@ -8538,8 +8600,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // deallocate sub buffers and images
         // <--------------------------------------------> //
         CL_CHECK(clReleaseMemObject(A_image1d));
-        CL_CHECK(clReleaseMemObject(B_sub_buffer));
-        CL_CHECK(clReleaseMemObject(B_image1d));
+        if (B_sub_buffer != nullptr) {
+            CL_CHECK(clReleaseMemObject(B_sub_buffer));
+        }
+        if (B_image1d != nullptr) {
+            CL_CHECK(clReleaseMemObject(B_image1d));
+        }
 
         if (N != 1) {
             CL_CHECK(clReleaseMemObject(B_d));
