@@ -1186,6 +1186,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     load_arch_hparams(ml);
 
     pimpl->n_bytes = ml.n_bytes;
+    ftype_model = ml.ftype;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
 
@@ -1655,6 +1656,10 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+enum llama_ftype llama_model::ftype() const {
+    return ftype_model;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

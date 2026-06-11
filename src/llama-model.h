@@ -595,6 +595,7 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+    enum llama_ftype ftype_model = LLAMA_FTYPE_GUESSED;
 
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
@@ -611,6 +612,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    enum llama_ftype ftype() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

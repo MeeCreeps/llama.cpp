@@ -83,6 +83,48 @@ static inline size_t hex_round_up(size_t n, size_t m) {
     return m * ((n + m - 1) / m);
 }
 
+struct hex_repack_scratch {
+    void * pd = nullptr;
+    void * rp = nullptr;
+    size_t pd_size = 0;
+    size_t rp_size = 0;
+
+    ~hex_repack_scratch() {
+        if (pd) {
+            ggml_aligned_free(pd, pd_size);
+        }
+        if (rp) {
+            ggml_aligned_free(rp, rp_size);
+        }
+    }
+
+    void get(size_t need_pd, size_t need_rp, void ** out_pd, void ** out_rp) {
+        if (need_pd > pd_size) {
+            if (pd) {
+                ggml_aligned_free(pd, pd_size);
+            }
+            pd = ggml_aligned_malloc(need_pd);
+            GGML_ASSERT(pd != NULL);
+            pd_size = need_pd;
+        }
+        if (need_rp > rp_size) {
+            if (rp) {
+                ggml_aligned_free(rp, rp_size);
+            }
+            rp = ggml_aligned_malloc(need_rp);
+            GGML_ASSERT(rp != NULL);
+            rp_size = need_rp;
+        }
+        *out_pd = pd;
+        *out_rp = rp;
+    }
+};
+
+static void hex_get_repack_scratch(size_t row_size_pd, size_t row_size_rp, void ** buf_pd, void ** buf_rp) {
+    static thread_local hex_repack_scratch scratch;
+    scratch.get(row_size_pd, row_size_rp, buf_pd, buf_rp);
+}
+
 static const char * status_to_str(uint32_t status) {
     switch (status) {
         case HTP_STATUS_OK:
@@ -563,11 +605,9 @@ static void repack_q4_0_q4x4x2(ggml_tensor * t, const void * data, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q4_0-q4x4x2 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -603,8 +643,6 @@ static void repack_q4_0_q4x4x2(ggml_tensor * t, const void * data, size_t size) 
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 // repack q4x4x2 tensor into q4_0 data
@@ -623,11 +661,9 @@ static void repack_q4x4x2_q4_0(void * data, const ggml_tensor * t, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q4x4x2-q4_0 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -658,8 +694,6 @@ static void repack_q4x4x2_q4_0(void * data, const ggml_tensor * t, size_t size) 
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 static void unpack_q4_1_quants(uint8_t * qs, const block_q4_1 * x, unsigned int bi) {
@@ -812,11 +846,9 @@ static void repack_q4_1_q4x4x2(ggml_tensor * t, const void * data, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q4_1-q4x4x2 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -843,8 +875,6 @@ static void repack_q4_1_q4x4x2(ggml_tensor * t, const void * data, size_t size) 
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 static void repack_q4x4x2_q4_1(void * data, const ggml_tensor * t, size_t size) {
@@ -860,11 +890,9 @@ static void repack_q4x4x2_q4_1(void * data, const ggml_tensor * t, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q4x4x2-q4_1 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -891,8 +919,6 @@ static void repack_q4x4x2_q4_1(void * data, const ggml_tensor * t, size_t size) 
         memcpy(dst, buf_pd, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 // ======== Q8x4x2 ====================
@@ -1122,11 +1148,9 @@ static void repack_q8_0_q8x4x2(ggml_tensor * t, const void * data, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q8_0-q8x4x2 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -1162,8 +1186,6 @@ static void repack_q8_0_q8x4x2(ggml_tensor * t, const void * data, size_t size) 
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 // repack q8x4x2 tensor into q8_0 data
@@ -1182,11 +1204,9 @@ static void repack_q8x4x2_q8_0(void * data, const ggml_tensor * t, size_t size) 
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-q8x4x2-q8_0 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data, size,
                 t->ne[0], nrows, row_size);
@@ -1217,8 +1237,6 @@ static void repack_q8x4x2_q8_0(void * data, const ggml_tensor * t, size_t size) 
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 // ======== MXFP4x4x2 ====================
@@ -1484,11 +1502,9 @@ static void repack_mxfp4_mxfp4x4x2(ggml_tensor * t, const void * data, size_t si
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-mxfp4-mxfp4x4x2 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data,
                 size, t->ne[0], nrows, row_size);
@@ -1524,8 +1540,6 @@ static void repack_mxfp4_mxfp4x4x2(ggml_tensor * t, const void * data, size_t si
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 // repack mxfp4x4x2 tensor into mxfp4 data
@@ -1544,11 +1558,9 @@ static void repack_mxfp4x4x2_mxfp4(void * data, const ggml_tensor * t, size_t si
     const int64_t n_full_rows = n_bytes_to_copy / row_size;
     const size_t  n_rem_bytes = n_bytes_to_copy % row_size;
 
-    void * buf_pd = ggml_aligned_malloc(row_size_pd);
-    GGML_ASSERT(buf_pd != NULL);
-
-    void * buf_rp = ggml_aligned_malloc(row_size_rp);
-    GGML_ASSERT(buf_rp != NULL);
+    void * buf_pd = nullptr;
+    void * buf_rp = nullptr;
+    hex_get_repack_scratch(row_size_pd, row_size_rp, &buf_pd, &buf_rp);
 
     HEX_VERBOSE("ggml-hex: repack-mxfp4x4x2-mxfp4 %s : data %p size %zu dims %ldx%ld row-size %zu\n", t->name, data,
                 size, t->ne[0], nrows, row_size);
@@ -1579,8 +1591,6 @@ static void repack_mxfp4x4x2_mxfp4(void * data, const ggml_tensor * t, size_t si
         memcpy(dst, buf_rp, n_rem_bytes);
     }
 
-    ggml_aligned_free(buf_pd, row_size_pd);
-    ggml_aligned_free(buf_rp, row_size_rp);
 }
 
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -3802,6 +3812,7 @@ struct ggml_hexagon_registry {
     ~ggml_hexagon_registry();
 
     ggml_backend_device devices[GGML_HEXAGON_MAX_SESSIONS];
+    size_t n_devices = 0;
 };
 
 ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
@@ -3811,13 +3822,15 @@ ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
 
     // Create devices / sessions
     for (size_t i = 0; i < opt_ndev; i++) {
-        devices[i].iface = ggml_backend_hexagon_device_i;
-        devices[i].reg   = reg;
+        ggml_backend_device & device = devices[n_devices];
+        device.iface = ggml_backend_hexagon_device_i;
+        device.reg   = reg;
         try {
-            devices[i].context = new ggml_hexagon_session(i, &devices[i]);
+            device.context = new ggml_hexagon_session(i, &device);
+            n_devices++;
         } catch (const std::exception & exc) {
             GGML_LOG_ERROR("ggml-hex: failed to create device/session %zu\n", i);
-            devices[i].context = nullptr;
+            device.context = nullptr;
         }
     }
 }
@@ -3826,7 +3839,7 @@ ggml_hexagon_registry::~ggml_hexagon_registry() {
     GGML_LOG_INFO("ggml-hex: releasing registry\n");
 
     // Release devices / sessions
-    for (size_t i = 0; i < opt_ndev; i++) {
+    for (size_t i = 0; i < n_devices; i++) {
         auto sess = static_cast<ggml_hexagon_session *>(devices[i].context);
         delete sess;
     }
@@ -3838,14 +3851,14 @@ static const char * ggml_backend_hexagon_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_hexagon_reg_get_device_count(ggml_backend_reg_t reg) {
-    return opt_ndev;
-    GGML_UNUSED(reg);
+    auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
+    return hreg->n_devices;
 }
 
 static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
 
-    if (index >= opt_ndev || !hreg->devices[index].context) {
+    if (index >= hreg->n_devices || !hreg->devices[index].context) {
         return nullptr;
     }
 

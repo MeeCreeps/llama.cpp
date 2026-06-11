@@ -8,115 +8,117 @@
 #endif
 
 #define QK8_0 32
-#define N_SIMDGROUP 4
+#define N_SIMDGROUP 16
 
 #define dequantizeBlockAccum_ns_sgbroadcast_1(total_sums, bits8, scale, y) \
     float shared_y; \
     char elem; \
+    float block_sum = 0.0f; \
                                              \
     shared_y = sub_group_broadcast(y.s0, 0); \
     elem = (char)(bits8.s0 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s1, 0); \
     elem = (char)((bits8.s0 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s2, 0); \
     elem = (char)((bits8.s0 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s3, 0); \
     elem = (char)((bits8.s0 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s4, 0); \
     elem = (char)(bits8.s1 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s5, 0); \
     elem = (char)((bits8.s1 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s6, 0); \
     elem = (char)((bits8.s1 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s7, 0); \
     elem = (char)((bits8.s1 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s0, 1); \
     elem = (char)(bits8.s2 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s1, 1); \
     elem = (char)((bits8.s2 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s2, 1); \
     elem = (char)((bits8.s2 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s3, 1); \
     elem = (char)((bits8.s2 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s4, 1); \
     elem = (char)(bits8.s3 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s5, 1); \
     elem = (char)((bits8.s3 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s6, 1); \
     elem = (char)((bits8.s3 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s7, 1); \
     elem = (char)((bits8.s3 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s0, 2); \
     elem = (char)(bits8.s4 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s1, 2); \
     elem = (char)((bits8.s4 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s2, 2); \
     elem = (char)((bits8.s4 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s3, 2); \
     elem = (char)((bits8.s4 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s4, 2); \
     elem = (char)(bits8.s5 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s5, 2); \
     elem = (char)((bits8.s5 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s6, 2); \
     elem = (char)((bits8.s5 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s7, 2); \
     elem = (char)((bits8.s5 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s0, 3); \
     elem = (char)(bits8.s6 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s1, 3); \
     elem = (char)((bits8.s6 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s2, 3); \
     elem = (char)((bits8.s6 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s3, 3); \
     elem = (char)((bits8.s6 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
                                              \
     shared_y = sub_group_broadcast(y.s4, 3); \
     elem = (char)(bits8.s7 & 0x000000FF); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s5, 3); \
     elem = (char)((bits8.s7 & 0x0000FF00) >> 8); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s6, 3); \
     elem = (char)((bits8.s7 & 0x00FF0000) >> 16); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
     shared_y = sub_group_broadcast(y.s7, 3); \
     elem = (char)((bits8.s7 & 0xFF000000) >> 24); \
-    total_sums += convert_int(elem) * scale * shared_y; \
+    block_sum += convert_int(elem) * shared_y; \
+    total_sums += block_sum * scale; \
 
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
@@ -145,8 +147,15 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
     uint K = ne00;
     uint M = ne01;
 
-    uint LINE_STRIDE_A = M;
-    uint BLOCK_STRIDE_A = 8 * M;   // 32 / 4 = 8
+#ifndef LINE_STRIDE_A
+#define LINE_STRIDE_A M
+#endif
+#ifndef BLOCK_STRIDE_A
+#define BLOCK_STRIDE_A (8 * M)
+#endif
+#ifndef K_BLOCKS
+#define K_BLOCKS (K / QK8_0)
+#endif
 
     __private uint8     regA;
     __private half      regS;
@@ -156,7 +165,7 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
 
     // loop along K in block granularity, skip 4 blocks every iter
     #pragma unroll 1 /* tell compiler not to unroll */
-    for (uint k = groupId; k < (K / QK8_0); k += N_SIMDGROUP) {
+    for (uint k = groupId; k < K_BLOCKS; k += N_SIMDGROUP) {
         regS = src0_d[gid + k * LINE_STRIDE_A]; // each fiber loads scale of one rows
         // first 4 fibers in each wave load 8 B values to its private scope
         if (slid < 4) {
@@ -177,15 +186,16 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
         dequantizeBlockAccum_ns_sgbroadcast_1(totalSum, regA, regS, regB);
     }
 
-    // reduction in local memory, assumes #wave=4
-    __local float reduceLM[SIMDGROUP_WIDTH * 3];
-    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
-    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
-    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    __local float reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (groupId > 0) {
+        reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = totalSum;
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+    if (groupId == 0) {
+        for (uint i = 0; i < N_SIMDGROUP - 1; ++i) {
+            totalSum += reduceLM[SIMDGROUP_WIDTH * i + slid];
+        }
+    }
 
     // 1 outputs per fiber in wave 0
     if (groupId == 0) {

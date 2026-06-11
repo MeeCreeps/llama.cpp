@@ -1,5 +1,4 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
-
 #define ACC_TYPE float
 #define ACC_TYPE4 float4
 #define Q_DATA_TYPE4 float4
@@ -13,7 +12,7 @@
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
-#define Q1_WG_SIZE 64
+#define Q1_WG_SIZE 32
 
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
@@ -334,6 +333,8 @@ __kernel void flash_attn_f32_f16_q1(
         }
     }
 
+    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
     __local ACC_TYPE local_l[Q1_WG_SIZE];
     __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
     local_l[tid] = l_i;
@@ -343,9 +344,6 @@ __kernel void flash_attn_f32_f16_q1(
         if (tid < s) local_l[tid] += local_l[tid + s];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-
-    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
-    global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
     ACC_TYPE l_final = local_l[0];
 
     if (sinks_ptr != NULL) {

@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3423,6 +3424,20 @@ llama_context * llama_init_from_model(
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
+        }
+    }
+
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        const bool has_opencl_device = std::any_of(model->devices.begin(), model->devices.end(), [](const llama_device & dev) {
+                const char * name = ggml_backend_dev_name(dev.dev);
+                return name != nullptr && strcmp(name, "GPUOpenCL") == 0;
+            });
+
+        const llama_ftype model_ftype = (llama_ftype) (model->ftype() & ~LLAMA_FTYPE_GUESSED);
+
+        if (has_opencl_device && model_ftype == LLAMA_FTYPE_MOSTLY_Q4_0) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn by default for Q4_0 on OpenCL\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         }
     }
 
