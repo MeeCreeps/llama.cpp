@@ -87,13 +87,14 @@ causal-quantize-Q8_0: QUANTIZED_TYPE = Q8_0
 causal-quantize-Q8_0: causal-quantize-model
 
 causal-quantize-Q4_0: QUANTIZED_TYPE = Q4_0
+causal-quantize-Q4_0: TOKEN_EMBD_TYPE = Q4_0
+causal-quantize-Q4_0: OUTPUT_TYPE = Q4_0
 causal-quantize-Q4_0: causal-quantize-model
 
-# For Quantization Aware Trained (QAT) models in Q4_0 we explicitly set the
-# token embedding and output types to Q8_0 instead of the default Q6_K.
+# Keep Q4_0 conversion homogeneous so runtime paths do not pull in Q6_K kernels.
 causal-quantize-qat-Q4_0: QUANTIZED_TYPE = Q4_0
-causal-quantize-qat-Q4_0: TOKEN_EMBD_TYPE = Q8_0
-causal-quantize-qat-Q4_0: OUTPUT_TYPE = Q8_0
+causal-quantize-qat-Q4_0: TOKEN_EMBD_TYPE = Q4_0
+causal-quantize-qat-Q4_0: OUTPUT_TYPE = Q4_0
 causal-quantize-qat-Q4_0: causal-quantize-model
 
 causal-quantize-model:
@@ -166,13 +167,14 @@ embedding-quantize-Q8_0: QUANTIZED_TYPE = Q8_0
 embedding-quantize-Q8_0: embedding-quantize-model
 
 embedding-quantize-Q4_0: QUANTIZED_TYPE = Q4_0
+embedding-quantize-Q4_0: TOKEN_EMBD_TYPE = Q4_0
+embedding-quantize-Q4_0: OUTPUT_TYPE = Q4_0
 embedding-quantize-Q4_0: embedding-quantize-model
 
-# For Quantization Aware Trained (QAT) models in Q4_0 we explicitly set the
-# token embedding and output types to Q8_0 instead of the default Q6_K.
+# Keep Q4_0 conversion homogeneous so runtime paths do not pull in Q6_K kernels.
 embedding-quantize-qat-Q4_0: QUANTIZED_TYPE = Q4_0
-embedding-quantize-qat-Q4_0: TOKEN_EMBD_TYPE = Q8_0
-embedding-quantize-qat-Q4_0: OUTPUT_TYPE = Q8_0
+embedding-quantize-qat-Q4_0: TOKEN_EMBD_TYPE = Q4_0
+embedding-quantize-qat-Q4_0: OUTPUT_TYPE = Q4_0
 embedding-quantize-qat-Q4_0: embedding-quantize-model
 
 embedding-quantize-model:
@@ -227,4 +229,3 @@ hf-add-model-to-collection:
 .PHONY: clean
 clean:
 	@${RM} -rf data .converted_embedding_model.txt .converted_model.txt .embedding_model_name.txt .model_name.txt
-

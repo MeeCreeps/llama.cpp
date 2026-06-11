@@ -8051,7 +8051,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
 
     if (n_q == 1) {
-        const size_t wg_size = 64;
+        const size_t wg_size = 32;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);

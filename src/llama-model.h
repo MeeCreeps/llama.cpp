@@ -468,6 +468,7 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+    enum llama_ftype ftype_model = LLAMA_FTYPE_GUESSED;
 
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();
@@ -486,6 +487,7 @@ struct llama_model {
     size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;
+    enum llama_ftype ftype() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

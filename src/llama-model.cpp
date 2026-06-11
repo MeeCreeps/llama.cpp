@@ -466,6 +466,7 @@ llama_model::~llama_model() {}
 void llama_model::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
+    ftype_model = ml.ftype;
 }
 
 void llama_model::load_arch(llama_model_loader & ml) {
@@ -6466,6 +6467,10 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+enum llama_ftype llama_model::ftype() const {
+    return ftype_model;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

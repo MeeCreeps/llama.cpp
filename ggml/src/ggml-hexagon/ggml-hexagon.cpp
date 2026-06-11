@@ -3666,6 +3666,7 @@ struct ggml_hexagon_registry {
     ~ggml_hexagon_registry();
 
     ggml_backend_device devices[GGML_HEXAGON_MAX_SESSIONS];
+    size_t n_devices = 0;
 };
 
 ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
@@ -3688,13 +3689,15 @@ ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
 
     // Create devices / sessions
     for (size_t i = 0; i < opt_ndev; i++) {
-        devices[i].iface   = ggml_backend_hexagon_device_i;
-        devices[i].reg     = reg;
+        ggml_backend_device & device = devices[n_devices];
+        device.iface = ggml_backend_hexagon_device_i;
+        device.reg   = reg;
         try {
-            devices[i].context = new ggml_hexagon_session(i, &devices[i]);
-        } catch (std::exception const &exc) {
+            device.context = new ggml_hexagon_session(i, &device);
+            n_devices++;
+        } catch (const std::exception & exc) {
             GGML_LOG_ERROR("ggml-hex: failed to create device/session %zu\n", i);
-            devices[i].context = nullptr;
+            device.context = nullptr;
         }
     }
 }
@@ -3703,7 +3706,7 @@ ggml_hexagon_registry::~ggml_hexagon_registry() {
     GGML_LOG_INFO("ggml-hex: releasing registry\n");
 
     // Release devices / sessions
-    for (size_t i = 0; i < opt_ndev; i++) {
+    for (size_t i = 0; i < n_devices; i++) {
         auto sess = static_cast<ggml_hexagon_session *>(devices[i].context);
         delete sess;
     }
@@ -3715,14 +3718,14 @@ static const char * ggml_backend_hexagon_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_hexagon_reg_get_device_count(ggml_backend_reg_t reg) {
-    return opt_ndev;
-    GGML_UNUSED(reg);
+    auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
+    return hreg->n_devices;
 }
 
 static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
 
-    if (index >= opt_ndev || !hreg->devices[index].context) {
+    if (index >= hreg->n_devices || !hreg->devices[index].context) {
         return nullptr;
     }
 

@@ -12,6 +12,7 @@
 #include "plan_executor.h"
 #include "plan_provider.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -2743,6 +2744,20 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        const bool has_opencl_device = std::any_of(model->devices.begin(), model->devices.end(), [](ggml_backend_dev_t dev) {
+                const char * name = ggml_backend_dev_name(dev);
+                return name != nullptr && strcmp(name, "GPUOpenCL") == 0;
+            });
+
+        const llama_ftype model_ftype = (llama_ftype) (model->ftype() & ~LLAMA_FTYPE_GUESSED);
+
+        if (has_opencl_device && model_ftype == LLAMA_FTYPE_MOSTLY_Q4_0) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn by default for Q4_0 on OpenCL\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
     }
 
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {

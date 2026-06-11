@@ -11,7 +11,7 @@
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
-#define Q1_WG_SIZE 64
+#define Q1_WG_SIZE 32
 
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
