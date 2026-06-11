@@ -117,6 +117,42 @@ kernel void kernel_convert_block_q4_0_noshuffle(
     }
 }
 
+kernel void kernel_convert_block_q4_0_noshuffle_transpose(
+    global struct block_q4_0 * src0,
+    global ushort * dst_q,
+    global half   * dst_d,
+    uint ne00,
+    uint ne01
+) {
+    const uint m  = get_global_id(0);
+    const uint kb = get_global_id(1);
+    if (m >= ne01) {
+        return;
+    }
+
+    const uint blocks_per_row = ne00 / QK4_0;
+    global struct block_q4_0 * b = src0 + m * blocks_per_row + kb;
+
+    dst_d[kb * ne01 + m] = b->d;
+
+    for (int i = 0; i < QK4_0 / 4; i += 2) {
+        uchar x0 = b->qs[2*i + 0];
+        uchar x1 = b->qs[2*i + 1];
+        uchar y0 = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        uchar y1 = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+
+        uchar x2 = b->qs[2*i + 2];
+        uchar x3 = b->qs[2*i + 3];
+        uchar y2 = convert_uchar(x2 & 0x0F) | convert_uchar((x3 & 0x0F) << 4);
+        uchar y3 = convert_uchar((x2 & 0xF0) >> 4) | convert_uchar(x3 & 0xF0);
+
+        const uint c0 = kb * (QK4_0 / 4) + (uint) i / 2;
+        const uint c1 = c0 + QK4_0 / 8;
+        dst_q[c0 * ne01 + m] = ((ushort) y0) | (((ushort) y2) << 8);
+        dst_q[c1 * ne01 + m] = ((ushort) y1) | (((ushort) y3) << 8);
+    }
+}
+
 //------------------------------------------------------------------------------
 // block_mxfp4
 //------------------------------------------------------------------------------
@@ -225,6 +261,34 @@ kernel void kernel_convert_block_q8_0(
 
     for (int i = 0; i < QK8_0; ++i) {
         q[i] = b->qs[i];
+    }
+}
+
+kernel void kernel_convert_block_q8_0_transpose(
+    global block_q8_0 * src0,
+    global uint      * dst_q,
+    global half      * dst_d,
+    uint ne00,
+    uint ne01
+) {
+    const uint m  = get_global_id(0);
+    const uint kb = get_global_id(1);
+    if (m >= ne01) {
+        return;
+    }
+
+    const uint blocks_per_row = ne00 / QK8_0;
+    global block_q8_0 * b = src0 + m * blocks_per_row + kb;
+
+    dst_d[kb * ne01 + m] = b->d;
+
+    for (int i = 0; i < QK8_0 / 4; ++i) {
+        const uint off = 4 * i;
+        const uint v = ((uint) (uchar) b->qs[off + 0]) |
+            (((uint) (uchar) b->qs[off + 1]) << 8) |
+            (((uint) (uchar) b->qs[off + 2]) << 16) |
+            (((uint) (uchar) b->qs[off + 3]) << 24);
+        dst_q[(kb * (QK8_0 / 4) + (uint) i) * ne01 + m] = v;
     }
 }
 

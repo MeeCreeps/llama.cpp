@@ -44,6 +44,204 @@ kernel void kernel_transpose_16_4x1(
     write_imageh(output, i * rows + j, (half4)(temp0, temp1, temp2, temp3));
 }
 
+// Transpose treating each element as 8-bit using buffer
+kernel void kernel_transpose_8_buf(
+    global const uchar * input,
+    global uchar * output,
+    const int ldi,
+    const int ldo
+) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    output[x*ldo + y] = input[y*ldi + x];
+}
+
+// Transpose treating each element as 16-bit using buffer
+kernel void kernel_transpose_16_buf(
+    global const ushort * input,
+    global ushort * output,
+    const int ldi,
+    const int ldo
+) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    output[x*ldo + y] = input[y*ldi + x];
+}
+
+// Transpose treating each element as 32-bit using buffer
+kernel void kernel_transpose_32_buf(
+    global const uint * input,
+    global uint * output,
+    const int ldi,
+    const int ldo
+) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    output[x*ldo + y] = input[y*ldi + x];
+}
+
+#define TRANSPOSE_TILE 16
+#define TRANSPOSE_TILE32 32
+
+// Tiled 8-bit buffer transpose. Uses local memory to make both global reads and
+// global writes contiguous within a workgroup.
+kernel void kernel_transpose_8_buf_tiled(
+    global const uchar * input,
+    global uchar * output,
+    const int ldi,
+    const int ldo
+) {
+    local uchar tile[TRANSPOSE_TILE][TRANSPOSE_TILE + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
+// Tiled 16-bit buffer transpose. Uses local memory to make both global reads and
+// global writes contiguous within a workgroup.
+kernel void kernel_transpose_16_buf_tiled(
+    global const ushort * input,
+    global ushort * output,
+    const int ldi,
+    const int ldo
+) {
+    local ushort tile[TRANSPOSE_TILE][TRANSPOSE_TILE + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
+// Tiled 32-bit buffer transpose. Uses local memory to make both global reads and
+// global writes contiguous within a workgroup.
+kernel void kernel_transpose_32_buf_tiled(
+    global const uint * input,
+    global uint * output,
+    const int ldi,
+    const int ldo
+) {
+    local uint tile[TRANSPOSE_TILE][TRANSPOSE_TILE + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
+kernel void kernel_transpose_8_buf_tiled32(
+    global const uchar * input,
+    global uchar * output,
+    const int ldi,
+    const int ldo
+) {
+    local uchar tile[TRANSPOSE_TILE32][TRANSPOSE_TILE32 + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE32 + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE32 + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE32 + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE32 + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
+kernel void kernel_transpose_16_buf_tiled32(
+    global const ushort * input,
+    global ushort * output,
+    const int ldi,
+    const int ldo
+) {
+    local ushort tile[TRANSPOSE_TILE32][TRANSPOSE_TILE32 + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE32 + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE32 + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE32 + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE32 + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
+kernel void kernel_transpose_32_buf_tiled32(
+    global const uint * input,
+    global uint * output,
+    const int ldi,
+    const int ldo
+) {
+    local uint tile[TRANSPOSE_TILE32][TRANSPOSE_TILE32 + 1];
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int x = get_group_id(0) * TRANSPOSE_TILE32 + lx;
+    const int y = get_group_id(1) * TRANSPOSE_TILE32 + ly;
+
+    if (x < ldi && y < ldo) {
+        tile[ly][lx] = input[y * ldi + x];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int tx = get_group_id(0) * TRANSPOSE_TILE32 + ly;
+    const int ty = get_group_id(1) * TRANSPOSE_TILE32 + lx;
+    if (tx < ldi && ty < ldo) {
+        output[tx * ldo + ty] = tile[lx][ly];
+    }
+}
+
 // 32-bit transpose, loading/storing a 4x4 tile of elements
 kernel void kernel_transpose_32(
     __read_only image1d_buffer_t input,
