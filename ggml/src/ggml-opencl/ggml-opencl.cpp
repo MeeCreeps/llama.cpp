@@ -810,6 +810,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_transpose_8_buf;
     cl_kernel kernel_transpose_16_buf;
     cl_kernel kernel_transpose_32_buf;
+    cl_kernel kernel_transpose_8_buf_tiled;
+    cl_kernel kernel_transpose_16_buf_tiled;
+    cl_kernel kernel_transpose_32_buf_tiled;
+    cl_kernel kernel_transpose_8_buf_tiled32;
+    cl_kernel kernel_transpose_16_buf_tiled32;
+    cl_kernel kernel_transpose_32_buf_tiled32;
     cl_kernel kernel_transpose_16_4x1;
 
     // Gemm and Gemv related programs, kernels, etc
@@ -2901,6 +2907,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_transpose_8_buf  = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_8_buf", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_16_buf = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_buf", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_32_buf = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_buf", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_8_buf_tiled  = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_8_buf_tiled", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_16_buf_tiled = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_buf_tiled", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_32_buf_tiled = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_buf_tiled", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_8_buf_tiled32  = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_8_buf_tiled32", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_16_buf_tiled32 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_buf_tiled32", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_32_buf_tiled32 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_buf_tiled32", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_16_4x1 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_4x1", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -2929,6 +2941,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+
     }
 
     // gemv_noshuffle
@@ -4163,6 +4176,8 @@ static void transpose_2d(
     cl_kernel kernel,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
+    bool tiled,
+    cl_int tile_size,
     bool blocking = true
 ) {
     static ggml_cl_buffer buf;
@@ -4187,7 +4202,13 @@ static void transpose_2d(
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &rows));
 
     size_t local_size[3] = {64, 1, 1};
-    size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};;
+    size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};
+    if (tiled) {
+        local_size[0] = (size_t) tile_size;
+        local_size[1] = (size_t) tile_size;
+        global_size[0] = (size_t) GGML_PAD(stride, tile_size);
+        global_size[1] = (size_t) GGML_PAD(rows, tile_size);
+    }
     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
         global_size, local_size, 0, NULL, NULL));
 
@@ -4202,14 +4223,19 @@ static void transpose_2d(
     CL_CHECK(clReleaseMemObject(trans));
 }
 
+static bool transpose_2d_prefer_32x32(cl_int stride, cl_int rows) {
+    return rows % 1024 == 0 || stride >= 2048;
+}
+
 static void transpose_2d_as_8b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
     bool blocking = true
 ) {
-    transpose_2d(backend_ctx, backend_ctx->kernel_transpose_8_buf,
-        src, dst, size, stride, rows, blocking);
+    const bool use_32x32 = transpose_2d_prefer_32x32(stride, rows);
+    transpose_2d(backend_ctx, use_32x32 ? backend_ctx->kernel_transpose_8_buf_tiled32 : backend_ctx->kernel_transpose_8_buf_tiled,
+        src, dst, size, stride, rows, true, use_32x32 ? 32 : 16, blocking);
 }
 
 static void transpose_2d_as_16b(
@@ -4218,8 +4244,9 @@ static void transpose_2d_as_16b(
     cl_int stride, cl_int rows,
     bool blocking = true
 ) {
-    transpose_2d(backend_ctx, backend_ctx->kernel_transpose_16_buf,
-        src, dst, size, stride, rows, blocking);
+    const bool use_32x32 = transpose_2d_prefer_32x32(stride, rows);
+    transpose_2d(backend_ctx, use_32x32 ? backend_ctx->kernel_transpose_16_buf_tiled32 : backend_ctx->kernel_transpose_16_buf_tiled,
+        src, dst, size, stride, rows, true, use_32x32 ? 32 : 16, blocking);
 }
 
 static void transpose_2d_as_32b(
@@ -4228,8 +4255,9 @@ static void transpose_2d_as_32b(
     cl_int stride, cl_int rows,
     bool blocking = true
 ) {
-    transpose_2d(backend_ctx, backend_ctx->kernel_transpose_32_buf,
-        src, dst, size, stride, rows, blocking);
+    const bool use_32x32 = transpose_2d_prefer_32x32(stride, rows);
+    transpose_2d(backend_ctx, use_32x32 ? backend_ctx->kernel_transpose_32_buf_tiled32 : backend_ctx->kernel_transpose_32_buf_tiled,
+        src, dst, size, stride, rows, true, use_32x32 ? 32 : 16, blocking);
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
