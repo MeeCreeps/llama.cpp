@@ -5345,6 +5345,30 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         bctx->wbm_idx_per_slot[extra->ctx_slot] = idx;
                     }
 
+                    // Q5_K/Q6_K currently use the raw GGUF block layout in the
+                    // OpenCL matmul path. Register a reload callback anyway so
+                    // explicit elastic plans can drive them through the same
+                    // LOAD -> DMA -> TRANSFORM callback sequence as SOA weights.
+                    // The callback does not run an AOS->SOA kernel; it reloads
+                    // the raw cl_mem and refreshes the elastic buffer slot.
+                    if (tensor->type == GGML_TYPE_Q5_K || tensor->type == GGML_TYPE_Q6_K) {
+                        elastic::wbm_opencl_ctx * octx = &s->octx;
+                        ggml_tensor_extra_cl * cap_extra = extra;
+                        ggml_backend_buffer_t cap_buffer = buffer;
+                        auto reload_fn = [octx, cap_extra, cap_buffer]() -> int {
+                            const int ridx = cap_extra->wbm_idx;
+                            int rc = elastic::wbmcl_ensure_resident(octx, ridx);
+                            if (rc != 0) return rc;
+                            cl_mem buf = elastic::wbmcl_get_buffer(octx, ridx);
+                            if (buf) {
+                                cap_extra->data_device = buf;
+                                ggml_opencl_elastic_update_ctx_slot(cap_buffer, cap_extra->ctx_slot, buf);
+                            }
+                            return 0;
+                        };
+                        elastic::wbmcl_register_soa(&s->octx, idx, nullptr, std::move(reload_fn));
+                    }
+
                     // Pin 小但常访问的 tensor：norm（4 KB 量级、每 op 必用）+ GQA
                     // 的 attn_k/v（每层 2 MB）。按 tensor 名后缀决定。
                     // GGML_ELASTIC_PIN=norm,k,v,q（默认 norm,k,v；写空串关闭；
