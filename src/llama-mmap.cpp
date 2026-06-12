@@ -737,6 +737,7 @@ std::mutex                                                       g_weight_res_mt
 std::vector<std::pair<llama_weight_residency_fn_t, void *>>      g_weight_res_providers;
 std::vector<std::pair<llama_weight_movement_fn_t,  void *>>      g_weight_mov_providers;
 std::vector<std::pair<llama_weight_stage_fn_t,     void *>>      g_weight_stage_providers;
+std::vector<std::pair<llama_weight_transform_fn_t, void *>>      g_weight_transform_providers;
 // Budget provider: 单 slot (预算是全局值)。
 std::mutex                                                       g_budget_mtx;
 llama_budget_fn_t                                                g_budget_fn = nullptr;
@@ -812,6 +813,10 @@ void llama_weight_stage_register(llama_weight_stage_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_stage_providers.emplace_back(fn, user_data);
 }
+void llama_weight_transform_register(llama_weight_transform_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_transform_providers.emplace_back(fn, user_data);
+}
 bool llama_weight_residency_query(const char * name) {
     std::vector<std::pair<llama_weight_residency_fn_t, void *>> snap;
     {
@@ -845,6 +850,20 @@ int llama_weight_stage_request(const char * name, const char * stage) {
     for (auto & p : snap) {
         if (!p.first) continue;
         int rc = p.first(name, stage, p.second);
+        if (rc != -2) return rc;
+    }
+    return -2;
+}
+int llama_weight_transform_request(const char * name, llama_weight_transform_kind kind) {
+    if (kind == LLAMA_WEIGHT_TRANSFORM_NONE) return 0;
+    std::vector<std::pair<llama_weight_transform_fn_t, void *>> snap;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        snap = g_weight_transform_providers;
+    }
+    for (auto & p : snap) {
+        if (!p.first) continue;
+        int rc = p.first(name, kind, p.second);
         if (rc != -2) return rc;
     }
     return -2;

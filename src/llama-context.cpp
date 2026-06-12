@@ -938,9 +938,20 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
             if (!w) return;
             llama_weight_stage_request(w->name.c_str(), stage);
         };
+        auto transform_request = [this](const elastic::PlanEvent & ev) {
+            const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(ev.weight_id) : nullptr;
+            if (!w) return;
+            llama_weight_transform_kind kind = LLAMA_WEIGHT_TRANSFORM_NONE;
+            switch (w->xform) {
+                case elastic::Xform::GPU_CONVERT: kind = LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT; break;
+                case elastic::Xform::CPU_REPACK:  kind = LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;  break;
+                case elastic::Xform::NONE:        kind = LLAMA_WEIGHT_TRANSFORM_NONE;        break;
+            }
+            llama_weight_transform_request(w->name.c_str(), kind);
+        };
         sinks.enqueue_load  = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "load"); };
         sinks.enqueue_dma   = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "dma"); };
-        sinks.enqueue_xform = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "xform"); };
+        sinks.enqueue_transform = [transform_request](const elastic::PlanEvent & ev) { transform_request(ev); };
         elastic_executor = std::make_unique<elastic::PlanExecutor>(std::move(sinks));
     }
 

@@ -3037,10 +3037,22 @@ static int opencl_sched_stage_request(const char *name, const char *stage, void 
     if (strcmp(stage, "dma") == 0) {
         return elastic::wbmcl_dma_to_backend(&s->octx, idx);
     }
-    if (strcmp(stage, "xform") == 0) {
-        return elastic::wbmcl_transform_backend(&s->octx, idx);
-    }
     return -3;
+}
+
+static int opencl_sched_transform_request(const char *name, llama_weight_transform_kind kind, void * /*ud*/) {
+    if (!name) return -1;
+    if (kind == LLAMA_WEIGHT_TRANSFORM_NONE) return 0;
+    if (kind != LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT) return -2;
+    auto *s = ggml_opencl_elastic();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;
+        idx = it->second;
+    }
+    return elastic::wbmcl_transform_backend(&s->octx, idx);
 }
 
 // Budget provider: 把 BudgetWatcher 当前预算 (MB) 暴露给 llama_context 的 runtime
@@ -3059,6 +3071,7 @@ static void opencl_sched_register_once() {
     llama_weight_residency_register(opencl_sched_residency_query, nullptr);
     llama_weight_movement_register (opencl_sched_movement_request, nullptr);
     llama_weight_stage_register    (opencl_sched_stage_request,    nullptr);
+    llama_weight_transform_register(opencl_sched_transform_request, nullptr);
     llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
     llama_budget_register          (opencl_sched_budget_query,    nullptr);
 }

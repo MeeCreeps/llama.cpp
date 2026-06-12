@@ -82,7 +82,7 @@ ReconcileStats PlanExecutor::apply(const ExecPlan & plan) {
                 break;
             case EvKind::XFORM:
                 st.n_xform_events++;
-                if (sinks_.enqueue_xform) sinks_.enqueue_xform(e);
+                if (sinks_.enqueue_transform) sinks_.enqueue_transform(e);
                 break;
             case EvKind::PREFETCH:
             case EvKind::EVICT:

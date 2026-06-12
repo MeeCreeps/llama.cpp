@@ -49,7 +49,7 @@ struct MockBackend {
         s.enqueue_overlapped = [this](const PlanEvent &) { overlap_count++; };
         s.enqueue_load  = [this](const PlanEvent &) { load_count++; };
         s.enqueue_dma   = [this](const PlanEvent &) { dma_count++; };
-        s.enqueue_xform = [this](const PlanEvent &) { xform_count++; };
+        s.enqueue_transform = [this](const PlanEvent &) { xform_count++; };
         return s;
     }
 };
