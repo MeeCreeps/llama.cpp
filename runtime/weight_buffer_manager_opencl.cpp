@@ -26,6 +26,62 @@ const char *cl_err(cl_int e) {
     }
 }
 
+void host_staging_pool_trim(wbm_opencl_ctx *octx, size_t incoming) {
+    if (!octx || octx->host_staging_pool_limit == 0) return;
+    while (octx->host_staging_pool_bytes + incoming > octx->host_staging_pool_limit &&
+           !octx->host_staging_pool_order.empty()) {
+        size_t old_sz = octx->host_staging_pool_order.front();
+        octx->host_staging_pool_order.pop_front();
+        auto it = octx->host_staging_pool_by_size.find(old_sz);
+        if (it == octx->host_staging_pool_by_size.end() || it->second.empty()) continue;
+        it->second.pop_back();
+        octx->host_staging_pool_bytes -= std::min(octx->host_staging_pool_bytes, old_sz);
+    }
+}
+
+std::vector<char> host_staging_pool_take(wbm_opencl_ctx *octx, size_t nbytes) {
+    if (!octx || !octx->retain_host_staging) return std::vector<char>();
+    auto it = octx->host_staging_pool_by_size.find(nbytes);
+    if (it == octx->host_staging_pool_by_size.end() || it->second.empty()) {
+        return std::vector<char>();
+    }
+    std::vector<char> buf = std::move(it->second.back());
+    it->second.pop_back();
+    for (auto lit = octx->host_staging_pool_order.rbegin();
+         lit != octx->host_staging_pool_order.rend(); ++lit) {
+        if (*lit == nbytes) {
+            octx->host_staging_pool_order.erase(std::next(lit).base());
+            break;
+        }
+    }
+    octx->host_staging_pool_bytes -= std::min(octx->host_staging_pool_bytes, nbytes);
+    return buf;
+}
+
+void host_staging_pool_put(wbm_opencl_ctx *octx, std::vector<char> &&buf) {
+    if (!octx || !octx->retain_host_staging || buf.empty()) return;
+    const size_t nbytes = buf.size();
+    if (octx->host_staging_pool_limit > 0 && nbytes > octx->host_staging_pool_limit) {
+        return;
+    }
+    host_staging_pool_trim(octx, nbytes);
+    if (octx->host_staging_pool_limit > 0 &&
+        octx->host_staging_pool_bytes + nbytes > octx->host_staging_pool_limit) {
+        return;
+    }
+    octx->host_staging_pool_by_size[nbytes].push_back(std::move(buf));
+    octx->host_staging_pool_order.push_back(nbytes);
+    octx->host_staging_pool_bytes += nbytes;
+}
+
+void release_host_staging(wbm_opencl_ctx *octx, int idx) {
+    if (!octx) return;
+    auto it = octx->host_staging_by_idx.find(idx);
+    if (it == octx->host_staging_by_idx.end()) return;
+    host_staging_pool_put(octx, std::move(it->second));
+    octx->host_staging_by_idx.erase(it);
+}
+
 }  // namespace
 
 int wbmcl_init(wbm_opencl_ctx *octx,
@@ -51,7 +107,12 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->n_creates            = 0;
     octx->n_releases           = 0;
     octx->direct_read_fn       = nullptr;  // ggml-opencl lazy_init 按 env 注入
+    octx->retain_host_staging  = false;
+    octx->host_staging_pool_limit = 0;
+    octx->host_staging_pool_bytes = 0;
     octx->host_staging_by_idx.clear();
+    octx->host_staging_pool_by_size.clear();
+    octx->host_staging_pool_order.clear();
     octx->bytes_loaded_total   = 0;
     return 0;
 }
@@ -298,8 +359,15 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
     if (!meta) return -2;
     if (!meta->host_ptr || meta->byte_size == 0) return -3;
 
-    std::vector<char> & staging = octx->host_staging_by_idx[idx];
-    if (staging.size() < meta->byte_size) staging.resize(meta->byte_size);
+    auto & staging = octx->host_staging_by_idx[idx];
+    if (staging.size() < meta->byte_size) {
+        std::vector<char> pooled = host_staging_pool_take(octx, meta->byte_size);
+        if (!pooled.empty()) {
+            staging = std::move(pooled);
+        } else {
+            staging.resize(meta->byte_size);
+        }
+    }
 
     int rc = -1;
     if (octx->direct_read_fn) {
@@ -313,7 +381,14 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
 }
 
 int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
-    return wbmcl_ensure_resident(octx, idx);
+    if (octx && octx->soa_per_idx.find(idx) != octx->soa_per_idx.end()) {
+        return 0;
+    }
+    int rc = wbmcl_ensure_resident(octx, idx);
+    if (rc == 0) {
+        release_host_staging(octx, idx);
+    }
+    return rc;
 }
 
 int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
@@ -321,9 +396,15 @@ int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
     auto it = octx->soa_per_idx.find(idx);
     if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
         const block_meta *meta = wbm_get(octx->wbm, idx);
-        if (meta && meta->resident) return 0;
-        return it->second.reload_fn();
+        if (meta && meta->resident) {
+            release_host_staging(octx, idx);
+            return 0;
+        }
+        int rc = it->second.reload_fn();
+        if (rc == 0) release_host_staging(octx, idx);
+        return rc;
     }
+    release_host_staging(octx, idx);
     return 0;
 }
 
@@ -498,6 +579,10 @@ void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     octx->retained_buffers_by_size.clear();
     octx->retain_order_sizes.clear();
     octx->cached_bytes = 0;
+    octx->host_staging_by_idx.clear();
+    octx->host_staging_pool_by_size.clear();
+    octx->host_staging_pool_order.clear();
+    octx->host_staging_pool_bytes = 0;
     for (auto &b : octx->wbm->blocks) {
         // 清掉未消费的 in-flight prefetch（block 还没 resident 但已发 write）
         if (!b.resident && b.prefetch_event) {

@@ -92,7 +92,15 @@ struct wbm_opencl_ctx {
 
     // Plan-stage staging: LOAD 把 disk/mmap 内容拷到 host_staging_by_idx，
     // DMA/XFORM 可复用该 host staging，避免把 disk load 和 backend transform 混在一起。
+    //
+    // host staging pool: DMA 完成后可把 staging buffer 归还到按 size 分组的
+    // CPU pool，后续 LOAD 直接复用，避免内存预算变大时反复 malloc/free。
+    bool retain_host_staging = false;
+    size_t host_staging_pool_limit = 0; // 0 = 不限
+    size_t host_staging_pool_bytes = 0;
     std::unordered_map<int, std::vector<char>> host_staging_by_idx;
+    std::unordered_map<size_t, std::vector<std::vector<char>>> host_staging_pool_by_size;
+    std::list<size_t> host_staging_pool_order;
     size_t bytes_loaded_total = 0;
 };
 

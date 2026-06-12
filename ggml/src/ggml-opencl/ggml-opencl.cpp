@@ -3179,6 +3179,22 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         };
         GGML_LOG_INFO("ggml_opencl elastic: 非 SOA reload 启用 O_DIRECT (DIRECT_IO=1)\n");
     }
+    // Explicit LOAD stage host staging pool. LOAD allocates/reuses a CPU buffer,
+    // DMA consumes it, then the buffer returns to this size-based pool. This keeps
+    // memory-growth replans from repeatedly malloc/free-ing staging memory.
+    {
+        size_t host_pool_mb = 256;
+        if (const char *m = std::getenv("GGML_ELASTIC_HOST_STAGING_POOL_MB")) {
+            host_pool_mb = (size_t) atoll(m);
+        }
+        s->octx.retain_host_staging = host_pool_mb > 0;
+        s->octx.host_staging_pool_limit = host_pool_mb * 1024 * 1024;
+        if (s->octx.retain_host_staging) {
+            GGML_LOG_INFO("ggml_opencl elastic: host staging pool cap = %zu MB\n", host_pool_mb);
+        } else {
+            GGML_LOG_INFO("ggml_opencl elastic: host staging pool disabled\n");
+        }
+    }
     if (const char *r = std::getenv("GGML_ELASTIC_CL_RETAIN"); r && *r && *r != '0') {
         s->octx.retain_cl_mem = true;
         // GGML_ELASTIC_CL_RETAIN_MB=N 设 pool 上限（MB）；"auto" 让 backend
@@ -4952,7 +4968,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 }();
                 static thread_local std::vector<char> direct_scratch;
                 const void *src_for_dma = host_ptr;
-                if (s_direct_io) {
+                auto staged = octx->host_staging_by_idx.find(idx);
+                if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
+                    src_for_dma = staged->second.data();
+                } else if (s_direct_io) {
                     auto reg = llama_mmap_registry_find(host_ptr);
                     if (!reg.filename.empty()) {
                         size_t file_offset = (const char*)host_ptr - (const char*)reg.base;
@@ -5231,8 +5250,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 cl_event write_ev = nullptr;
                 cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
                 cl_event prev_use_ev = octx->soa_staging_last_use_ev;
+                const void *src_for_dma = host_ptr;
+                auto staged = octx->host_staging_by_idx.find(idx);
+                if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
+                    src_for_dma = staged->second.data();
+                }
                 err = clEnqueueWriteBuffer(xfer_q, staging, CL_FALSE,
-                                           0, nbytes, host_ptr,
+                                           0, nbytes, src_for_dma,
                                            prev_use_ev ? 1 : 0,
                                            prev_use_ev ? &prev_use_ev : nullptr,
                                            &write_ev);
