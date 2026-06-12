@@ -28,6 +28,9 @@ target_include_directories(${TARGET_NAME} PRIVATE
 # ignore-all 覆盖 (在 ld.lld 里后置 flag 胜出), runtime loader 解析.
 if (ANDROID)
     target_link_options(${TARGET_NAME} PRIVATE -Wl,--unresolved-symbols=ignore-all)
+    # NDK toolchains append -Wl,--no-undefined after target_link_options().
+    # Also pass this as a link item so it lands after the toolchain default.
+    target_link_libraries(${TARGET_NAME} PRIVATE -Wl,--unresolved-symbols=ignore-all)
 endif()
 
 

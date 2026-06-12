@@ -220,6 +220,9 @@ endif()
 # elastic v6 fallback. 让 runtime loader 解析跨 shared lib 符号.
 if (ANDROID)
     target_link_options(ggml-base PRIVATE -Wl,--unresolved-symbols=ignore-all)
+    # NDK toolchains append -Wl,--no-undefined after target_link_options().
+    # Also pass this as a link item so it lands after the toolchain default.
+    target_link_libraries(ggml-base PRIVATE -Wl,--unresolved-symbols=ignore-all)
 endif()
 
 add_library(ggml
