@@ -933,6 +933,14 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
             if (migrate) elastic_migrate[o->name] = { (int) from, (int) xf };
             else         elastic_migrate.erase(o->name);
         };
+        auto stage_request = [this](const elastic::PlanEvent & ev, const char * stage) {
+            const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(ev.weight_id) : nullptr;
+            if (!w) return;
+            llama_weight_stage_request(w->name.c_str(), stage);
+        };
+        sinks.enqueue_load  = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "load"); };
+        sinks.enqueue_dma   = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "dma"); };
+        sinks.enqueue_xform = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "xform"); };
         elastic_executor = std::make_unique<elastic::PlanExecutor>(std::move(sinks));
     }
 
@@ -965,11 +973,11 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     graph_invalidate();  // 丢弃当前 cached graph,下次 decode 立即重建
 
     LLAMA_LOG_INFO("%s: applied plan budget=%lldMiB weights=%d ops=%d "
-                   "prefetch=%d evict=%d route=%d migrate=%d events=%d\n",
+                   "prefetch=%d evict=%d route=%d migrate=%d events=%d load=%d dma=%d xform=%d\n",
                    __func__, (long long) plan->budget_mib,
                    (int) plan->weights.size(), (int) plan->ops.size(),
                    st.n_prefetch, st.n_evict, st.n_route_static, st.n_migrate,
-                   st.n_overlap_events);
+                   st.n_overlap_events, st.n_load_events, st.n_dma_events, st.n_xform_events);
     return 0;
 }
 

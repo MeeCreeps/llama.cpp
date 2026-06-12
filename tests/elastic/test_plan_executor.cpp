@@ -30,6 +30,9 @@ struct MockBackend {
     std::vector<std::pair<int, Backend>>     route_log;
     std::vector<int>                         migrate_log;    // 标了 migrate 的 op_id
     int                                      overlap_count = 0;
+    int                                      load_count = 0;
+    int                                      dma_count = 0;
+    int                                      xform_count = 0;
 
     ExecSinks make_sinks() {
         ExecSinks s;
@@ -44,6 +47,9 @@ struct MockBackend {
             if (mig) migrate_log.push_back(op_id);
         };
         s.enqueue_overlapped = [this](const PlanEvent &) { overlap_count++; };
+        s.enqueue_load  = [this](const PlanEvent &) { load_count++; };
+        s.enqueue_dma   = [this](const PlanEvent &) { dma_count++; };
+        s.enqueue_xform = [this](const PlanEvent &) { xform_count++; };
         return s;
     }
 };
@@ -73,10 +79,10 @@ static ExecPlan make_plan(int n_layers, int n_gpu) {
         // DISK weight 在 CPU 算 → 无迁移;若强制在 GPU 算才迁移。这里 DISK→CPU 算,不迁移。
         p.ops.push_back(o);
 
-        // 给 DISK weight 一个 prefetch 事件,anchor 到前一个 op
+        // 给 DISK weight 一个 load 事件,anchor 到前一个 op
         if (i >= n_gpu) {
             PlanEvent e;
-            e.kind = EvKind::PREFETCH; e.weight_id = i;
+            e.kind = EvKind::LOAD; e.weight_id = i;
             e.from_loc = Location::DISK; e.to_loc = Location::CPU; e.engine = Engine::DISK;
             e.anchor_op_id = (i > 0) ? i - 1 : 0;
             p.timeline.push_back(e);
@@ -97,6 +103,8 @@ static void test_fresh_apply() {
     CHECK(st.n_route_static == 10);
     CHECK(st.n_route_runtime == 0);
     CHECK(st.n_overlap_events == 6);
+    CHECK(st.n_load_events == 6);
+    CHECK(mb.load_count == 6);
     CHECK((int) mb.resident.size() == 4);
     CHECK(mb.resident.count(0) && mb.resident.count(3));
     CHECK(!mb.resident.count(4));
@@ -160,7 +168,7 @@ static void test_anchor_index() {
     auto & evs = ex.events_for_anchor(4);
     CHECK(evs.size() == 1);
     CHECK(evs[0]->weight_id == 5);
-    CHECK(evs[0]->kind == EvKind::PREFETCH);
+    CHECK(evs[0]->kind == EvKind::LOAD);
 
     // 没有事件 anchor 到 op 8 的 weight 9 → anchor 8
     CHECK(ex.events_for_anchor(8).size() == 1);

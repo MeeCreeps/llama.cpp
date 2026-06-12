@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 
 namespace elastic {
 
@@ -50,6 +51,8 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->n_creates            = 0;
     octx->n_releases           = 0;
     octx->direct_read_fn       = nullptr;  // ggml-opencl lazy_init 按 env 注入
+    octx->host_staging_by_idx.clear();
+    octx->bytes_loaded_total   = 0;
     return 0;
 }
 
@@ -80,12 +83,17 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         return -3;
     }
 
-    // DMA 源解析: 默认 mmap host_ptr (隐式 page fault 读盘)。 若注入了
+    // DMA 源解析: LOAD stage 已执行时优先用 host staging；否则默认 mmap host_ptr
+    // (隐式 page fault 读盘)。 若注入了
     // direct_read_fn (GGML_ELASTIC_DIRECT_IO=1), 先 O_DIRECT pread 到 thread_local
     // scratch (绕 page cache, 模拟真 disk 成本), 再用 scratch 做 DMA 源。
     const void *dma_src = meta->host_ptr;
     bool use_direct = false;
-    if (octx->direct_read_fn) {
+    auto staged = octx->host_staging_by_idx.find(idx);
+    if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= meta->byte_size) {
+        dma_src = staged->second.data();
+        use_direct = true; // staging lifetime is owned by octx, so async DMA is safe.
+    } else if (octx->direct_read_fn) {
         static thread_local std::vector<char> direct_scratch;
         if (direct_scratch.size() < meta->byte_size) direct_scratch.resize(meta->byte_size);
         if (octx->direct_read_fn(meta->host_ptr, direct_scratch.data(), meta->byte_size) == 0) {
@@ -282,6 +290,41 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
 int wbmcl_prefetch(wbm_opencl_ctx *octx, int idx) {
     // 首版同步：等价于 ensure_resident。
     return wbmcl_ensure_resident(octx, idx);
+}
+
+int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+    if (!meta->host_ptr || meta->byte_size == 0) return -3;
+
+    std::vector<char> & staging = octx->host_staging_by_idx[idx];
+    if (staging.size() < meta->byte_size) staging.resize(meta->byte_size);
+
+    int rc = -1;
+    if (octx->direct_read_fn) {
+        rc = octx->direct_read_fn(meta->host_ptr, staging.data(), meta->byte_size);
+    }
+    if (rc != 0) {
+        std::memcpy(staging.data(), meta->host_ptr, meta->byte_size);
+    }
+    octx->bytes_loaded_total += meta->byte_size;
+    return 0;
+}
+
+int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
+    return wbmcl_ensure_resident(octx, idx);
+}
+
+int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    auto it = octx->soa_per_idx.find(idx);
+    if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
+        const block_meta *meta = wbm_get(octx->wbm, idx);
+        if (meta && meta->resident) return 0;
+        return it->second.reload_fn();
+    }
+    return 0;
 }
 
 int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {

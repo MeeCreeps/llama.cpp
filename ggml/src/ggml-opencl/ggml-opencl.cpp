@@ -3021,6 +3021,28 @@ static int opencl_sched_movement_request(const char *name, bool evict, void * /*
     return rc == 0 ? 0 : -4;
 }
 
+static int opencl_sched_stage_request(const char *name, const char *stage, void * /*ud*/) {
+    if (!name || !stage) return -1;
+    auto *s = ggml_opencl_elastic();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;  // 让 chain 试下一个 provider
+        idx = it->second;
+    }
+    if (strcmp(stage, "load") == 0) {
+        return elastic::wbmcl_load_host(&s->octx, idx);
+    }
+    if (strcmp(stage, "dma") == 0) {
+        return elastic::wbmcl_dma_to_backend(&s->octx, idx);
+    }
+    if (strcmp(stage, "xform") == 0) {
+        return elastic::wbmcl_transform_backend(&s->octx, idx);
+    }
+    return -3;
+}
+
 // Budget provider: 把 BudgetWatcher 当前预算 (MB) 暴露给 llama_context 的 runtime
 // scheduler, 让 scheduler 跟 elastic evict target 用同一个内存信号源 (而非 /proc/meminfo)。
 // bw 没启用时返 -1 → scheduler fallback /proc/meminfo。
@@ -3036,6 +3058,7 @@ static void opencl_sched_register_once() {
     s->sched_registered = true;
     llama_weight_residency_register(opencl_sched_residency_query, nullptr);
     llama_weight_movement_register (opencl_sched_movement_request, nullptr);
+    llama_weight_stage_register    (opencl_sched_stage_request,    nullptr);
     llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
     llama_budget_register          (opencl_sched_budget_query,    nullptr);
 }

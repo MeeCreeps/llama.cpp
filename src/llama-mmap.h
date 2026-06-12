@@ -111,13 +111,17 @@ bool llama_weight_pin_query   (const char * name, int layer, size_t byte_size);
 typedef bool (*llama_weight_residency_fn_t)(const char * name, void * user_data);
 // evict=false → prefetch, evict=true → evict. Return 0 on enqueue OK, <0 fail.
 typedef int  (*llama_weight_movement_fn_t)(const char * name, bool evict, void * user_data);
+// 分阶段 movement: load = disk/mmap->host, dma = host->backend, xform = backend layout transform.
+typedef int  (*llama_weight_stage_fn_t)(const char * name, const char * stage, void * user_data);
 
 void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data);
 void llama_weight_movement_register (llama_weight_movement_fn_t  fn, void * user_data);
+void llama_weight_stage_register    (llama_weight_stage_fn_t     fn, void * user_data);
 
 // Public query/action used by llama_context.cpp.
 bool llama_weight_residency_query(const char * name);
 int  llama_weight_movement_request(const char * name, bool evict);
+int  llama_weight_stage_request   (const char * name, const char * stage);
 
 // === Weight host (mmap) pointer query ===
 // elastic backends register: 给 name → host_ptr 查询 (mmap 区指针).

@@ -44,7 +44,11 @@ enum class Xform { NONE = 0, CPU_REPACK = 1, GPU_CONVERT = 2 };
 enum class Dispatch { STATIC = 0, RUNTIME = 1 };
 
 // 时间线事件类型
-enum class EvKind { PREFETCH = 0, EVICT = 1, DMA = 2, XFORM = 3 };
+//   LOAD     : disk / mmap -> host staging, 不创建 backend layout
+//   DMA      : host staging -> backend raw/staging buffer
+//   XFORM    : backend/raw buffer -> compute layout (OpenCL SOA+transpose, CPU repack)
+//   PREFETCH : legacy combined event; executor/backend may implement as LOAD+DMA+XFORM
+enum class EvKind { LOAD = 0, PREFETCH = 1, EVICT = 2, DMA = 3, XFORM = 4 };
 
 // ── 放置:每个 weight 当前在哪 / 取用时的变换 ── (决策 D2a)
 struct WeightPlan {

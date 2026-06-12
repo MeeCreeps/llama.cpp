@@ -62,6 +62,7 @@ const char * to_string(Dispatch d) {
 }
 const char * to_string(EvKind k) {
     switch (k) {
+        case EvKind::LOAD:     return "load";
         case EvKind::PREFETCH: return "prefetch";
         case EvKind::EVICT:    return "evict";
         case EvKind::DMA:      return "dma";
@@ -106,6 +107,7 @@ Dispatch dispatch_from_string(const std::string & s) {
     return s == "runtime" ? Dispatch::RUNTIME : Dispatch::STATIC;
 }
 EvKind evkind_from_string(const std::string & s) {
+    if (s == "load")  return EvKind::LOAD;
     if (s == "evict") return EvKind::EVICT;
     if (s == "dma")   return EvKind::DMA;
     if (s == "xform") return EvKind::XFORM;
@@ -435,7 +437,7 @@ bool plan_from_make_plan_file(const std::string & path, ExecPlan & out, std::str
                 std::string nm = d.value("weight", std::string());
                 if (nm.empty()) continue;
                 PlanEvent e;
-                e.kind         = EvKind::PREFETCH;
+                e.kind         = EvKind::LOAD;
                 e.weight_id    = ensure_weight(nm);
                 e.from_loc     = Location::DISK;
                 e.to_loc       = Location::CPU;

@@ -89,6 +89,11 @@ struct wbm_opencl_ctx {
     // 给 host_ptr (mmap VA) 反查文件 + O_DIRECT pread 到 dst, 返 0 成功. runtime 层
     // 不直接依赖 libllama, 通过函数指针解耦. nullptr = 走 mmap host_ptr (默认).
     int (*direct_read_fn)(const void *host_ptr, void *dst, size_t nbytes) = nullptr;
+
+    // Plan-stage staging: LOAD 把 disk/mmap 内容拷到 host_staging_by_idx，
+    // DMA/XFORM 可复用该 host staging，避免把 disk load 和 backend transform 混在一起。
+    std::unordered_map<int, std::vector<char>> host_staging_by_idx;
+    size_t bytes_loaded_total = 0;
 };
 
 void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
@@ -118,6 +123,15 @@ int  wbmcl_evict(wbm_opencl_ctx *octx, int idx);
 
 // 异步 prefetch 占位：首版直接同步 ensure。后续做异步化时改这一个函数即可。
 int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
+
+// 分阶段 plan API:
+//   LOAD  : disk/mmap -> host staging
+//   DMA   : host staging -> backend buffer
+//   XFORM : backend/raw -> compute layout (SOA callback 或 generic no-op)
+// 旧 ensure_resident 仍是完整兼容路径。
+int  wbmcl_load_host(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx);
 
 // 真正的异步 prefetch：在 xfer_queue 上发非阻塞 clEnqueueWriteBuffer，把 write
 // 的 cl_event 存到 block_meta::prefetch_event。block 此时 backend_handle 已分配

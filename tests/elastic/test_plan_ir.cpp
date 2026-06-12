@@ -43,7 +43,7 @@ static void test_native_roundtrip() {
     o1.migrate = true; o1.migrate_from = Backend::CPU; o1.migrate_xform = Xform::GPU_CONVERT;
     p.ops = {o0, o1};
 
-    PlanEvent e0; e0.kind = EvKind::PREFETCH; e0.weight_id = 1; e0.from_loc = Location::DISK;
+    PlanEvent e0; e0.kind = EvKind::LOAD; e0.weight_id = 1; e0.from_loc = Location::DISK;
     e0.to_loc = Location::CPU; e0.engine = Engine::DISK; e0.anchor_op_id = 0;
     PlanEvent e1; e1.kind = EvKind::XFORM; e1.weight_id = 1; e1.from_loc = Location::GPU;
     e1.to_loc = Location::GPU; e1.engine = Engine::GPU; e1.anchor_op_id = 0;
@@ -77,6 +77,7 @@ static void test_native_roundtrip() {
     CHECK(q.ops[1].migrate_xform == Xform::GPU_CONVERT);
 
     CHECK(q.timeline[0].engine == Engine::DISK);
+    CHECK(q.timeline[0].kind == EvKind::LOAD);
     CHECK(q.timeline[1].engine == Engine::GPU);
     CHECK(q.timeline[1].kind == EvKind::XFORM);
 
@@ -127,9 +128,15 @@ static void test_make_plan_load(const char * path) {
         }
     }
     // timeline 事件的 weight_id / anchor 合法
+    bool saw_load = false;
+    bool saw_xform = false;
     for (const auto & e : p.timeline) {
         CHECK(e.weight_id >= 0 && e.weight_id < (int) p.weights.size());
+        saw_load  = saw_load  || e.kind == EvKind::LOAD;
+        saw_xform = saw_xform || e.kind == EvKind::XFORM;
     }
+    CHECK(saw_load);
+    CHECK(saw_xform);
     // round-trip native:加载后导出再加载,结构一致
     std::string s;
     CHECK(plan_to_json_string(p, s));

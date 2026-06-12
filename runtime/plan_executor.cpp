@@ -67,8 +67,27 @@ ReconcileStats PlanExecutor::apply(const ExecPlan & plan) {
 
     // 4) timeline (D3):已建 anchor 索引;若 sink 想立刻登记也下发一遍。
     st.n_overlap_events = (int) plan.timeline.size();
-    if (sinks_.enqueue_overlapped) {
-        for (const auto & e : plan.timeline) sinks_.enqueue_overlapped(e);
+    for (const auto & e : plan.timeline) {
+        if (sinks_.enqueue_overlapped) {
+            sinks_.enqueue_overlapped(e);
+        }
+        switch (e.kind) {
+            case EvKind::LOAD:
+                st.n_load_events++;
+                if (sinks_.enqueue_load) sinks_.enqueue_load(e);
+                break;
+            case EvKind::DMA:
+                st.n_dma_events++;
+                if (sinks_.enqueue_dma) sinks_.enqueue_dma(e);
+                break;
+            case EvKind::XFORM:
+                st.n_xform_events++;
+                if (sinks_.enqueue_xform) sinks_.enqueue_xform(e);
+                break;
+            case EvKind::PREFETCH:
+            case EvKind::EVICT:
+                break;
+        }
     }
 
     return st;

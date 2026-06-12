@@ -38,6 +38,12 @@ struct ExecSinks {
 
     // overlap(D3):把一个搬运/变换事件挂到某 op 的 compute 上并行。底层 = 异步 prefetch 入队。
     std::function<void(const PlanEvent & ev)>             enqueue_overlapped;
+
+    // 分阶段执行(D3):LOAD / DMA / XFORM 可分别落到 disk / dma / transform engine。
+    // 未设置时 executor 只记录 timeline；设置后 apply() 会按 plan.timeline 顺序下发。
+    std::function<void(const PlanEvent & ev)>             enqueue_load;
+    std::function<void(const PlanEvent & ev)>             enqueue_dma;
+    std::function<void(const PlanEvent & ev)>             enqueue_xform;
 };
 
 // apply 的统计(单测断言 + 日志用)
@@ -49,6 +55,9 @@ struct ReconcileStats {
     int n_route_runtime  = 0;  // 交给 runtime dispatch 的 op 数(apply 不灌)
     int n_migrate        = 0;  // 标了迁移的 op 数
     int n_overlap_events = 0;  // 记录的 timeline 事件数
+    int n_load_events    = 0;  // LOAD stage 数
+    int n_dma_events     = 0;  // DMA stage 数
+    int n_xform_events   = 0;  // XFORM stage 数
 };
 
 class PlanExecutor {
