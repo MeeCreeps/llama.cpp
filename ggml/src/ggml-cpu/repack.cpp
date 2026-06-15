@@ -15,6 +15,10 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <algorithm>
+#include <cstdlib>
+#include <thread>
+#include <vector>
 
 #include "repack.h"
 
@@ -23,6 +27,50 @@
 #endif
 
 #define UNUSED GGML_UNUSED
+
+static int ggml_cpu_repack_get_n_threads(int64_t n_groups, int64_t nblocks) {
+    const char * env = std::getenv("GGML_CPU_REPACK_THREADS");
+    if (env == nullptr) {
+        return 1;
+    }
+
+    const int requested = std::atoi(env);
+    if (requested <= 1 || n_groups <= 1) {
+        return 1;
+    }
+
+    const int64_t work_items = n_groups * nblocks;
+    if (work_items < 4096) {
+        return 1;
+    }
+
+    return std::max(1, (int) std::min<int64_t>(requested, n_groups));
+}
+
+template <typename F>
+static void ggml_cpu_repack_parallel_for(int64_t n_groups, int n_threads, const F & fn) {
+    if (n_threads <= 1) {
+        fn(0, n_groups);
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads - 1);
+
+    for (int ith = 1; ith < n_threads; ++ith) {
+        const int64_t begin = (n_groups * ith) / n_threads;
+        const int64_t end   = (n_groups * (ith + 1)) / n_threads;
+        workers.emplace_back([&, begin, end]() {
+            fn(begin, end);
+        });
+    }
+
+    fn(0, n_groups / n_threads);
+
+    for (std::thread & worker : workers) {
+        worker.join();
+    }
+}
 
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
@@ -1050,6 +1098,40 @@ static block_q4_0x4 make_block_q4_0x4(block_q4_0 * in, unsigned int blck_size_in
     return out;
 }
 
+static inline void pack_block_q4_0x4(block_q4_0x4 * GGML_RESTRICT out, const block_q4_0 * GGML_RESTRICT in, int64_t nblocks, int64_t x, unsigned int blck_size_interleave) {
+    const block_q4_0 * GGML_RESTRICT in0 = in + x;
+    const block_q4_0 * GGML_RESTRICT in1 = in0 + nblocks;
+    const block_q4_0 * GGML_RESTRICT in2 = in1 + nblocks;
+    const block_q4_0 * GGML_RESTRICT in3 = in2 + nblocks;
+
+    out->d[0] = in0->d;
+    out->d[1] = in1->d;
+    out->d[2] = in2->d;
+    out->d[3] = in3->d;
+
+    if (blck_size_interleave == 8) {
+        const uint64_t xor_mask = 0x8888888888888888ULL;
+        for (int off = 0, dst = 0; off < QK4_0 / 2; off += 8) {
+            uint64_t q;
+            memcpy(&q, &in0->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 8;
+            memcpy(&q, &in1->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 8;
+            memcpy(&q, &in2->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 8;
+            memcpy(&q, &in3->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 8;
+        }
+    } else if (blck_size_interleave == 4) {
+        const uint32_t xor_mask = 0x88888888U;
+        for (int off = 0, dst = 0; off < QK4_0 / 2; off += 4) {
+            uint32_t q;
+            memcpy(&q, &in0->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+            memcpy(&q, &in1->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+            memcpy(&q, &in2->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+            memcpy(&q, &in3->qs[off], sizeof(q)); q ^= xor_mask; memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+        }
+    } else {
+        GGML_ASSERT(false);
+    }
+}
+
 // interleave 8 block_q4_0s in blocks of blck_size_interleave
 // returns an interleaved block_q4_0x8
 // in the interleaved block_q4_0x8, place deltas for 8 block_q4_0 blocks
@@ -1076,6 +1158,37 @@ static block_q4_0x8 make_block_q4_0x8(block_q4_0 * in, unsigned int blck_size_in
     }
 
     return out;
+}
+
+static inline void pack_block_q4_0x8(block_q4_0x8 * GGML_RESTRICT out, const block_q4_0 * GGML_RESTRICT in, int64_t nblocks, int64_t x, unsigned int blck_size_interleave) {
+    GGML_ASSERT(blck_size_interleave == 8);
+
+    const block_q4_0 * GGML_RESTRICT rows[8] = {
+        in + x,
+        in + x + 1 * nblocks,
+        in + x + 2 * nblocks,
+        in + x + 3 * nblocks,
+        in + x + 4 * nblocks,
+        in + x + 5 * nblocks,
+        in + x + 6 * nblocks,
+        in + x + 7 * nblocks,
+    };
+
+    for (int i = 0; i < 8; ++i) {
+        out->d[i] = rows[i]->d;
+    }
+
+    const uint64_t xor_mask = 0x8888888888888888ULL;
+    int dst = 0;
+    for (int off = 0; off < QK4_0 / 2; off += 8) {
+        for (int i = 0; i < 8; ++i) {
+            uint64_t q;
+            memcpy(&q, &rows[i]->qs[off], sizeof(q));
+            q ^= xor_mask;
+            memcpy(&out->qs[dst], &q, sizeof(q));
+            dst += 8;
+        }
+    }
 }
 
 static block_q4_Kx8 make_block_q4_Kx8(block_q4_K * in, unsigned int blck_size_interleave) {
@@ -1205,7 +1318,6 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_0x4 * dst = (block_q4_0x4 *)t->data;
     const block_q4_0 * src = (const block_q4_0 *)data;
-    block_q4_0 dst_tmp[4];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK4_0;
 
@@ -1215,15 +1327,26 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
+    const int64_t n_groups = nrow / nrows_interleaved;
+    const int n_threads = ggml_cpu_repack_get_n_threads(n_groups, nblocks);
+    if (n_threads <= 1) {
+        for (int b = 0; b < nrow; b += nrows_interleaved) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_q4_0x4(dst++, src, nblocks, x, interleave_block);
             }
-            *dst++ = make_block_q4_0x4(dst_tmp, interleave_block);
+            src += nrows_interleaved * nblocks;
         }
-        src += nrows_interleaved * nblocks;
+        return 0;
     }
+    ggml_cpu_repack_parallel_for(n_groups, n_threads, [&](int64_t g0, int64_t g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            const block_q4_0 * src_g = src + g * nrows_interleaved * nblocks;
+            block_q4_0x4 * dst_g = dst + g * nblocks;
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_q4_0x4(&dst_g[x], src_g, nblocks, x, interleave_block);
+            }
+        }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
@@ -1297,7 +1420,6 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_0x8 * dst = (block_q4_0x8*)t->data;
     const block_q4_0 * src = (const block_q4_0*) data;
-    block_q4_0 dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK4_0;
 
@@ -1307,15 +1429,26 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
+    const int64_t n_groups = nrow / nrows_interleaved;
+    const int n_threads = ggml_cpu_repack_get_n_threads(n_groups, nblocks);
+    if (n_threads <= 1) {
+        for (int b = 0; b < nrow; b += nrows_interleaved) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_q4_0x8(dst++, src, nblocks, x, interleave_block);
             }
-            *dst++ = make_block_q4_0x8(dst_tmp, interleave_block);
+            src += nrows_interleaved * nblocks;
         }
-        src += nrows_interleaved * nblocks;
+        return 0;
     }
+    ggml_cpu_repack_parallel_for(n_groups, n_threads, [&](int64_t g0, int64_t g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            const block_q4_0 * src_g = src + g * nrows_interleaved * nblocks;
+            block_q4_0x8 * dst_g = dst + g * nblocks;
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_q4_0x8(&dst_g[x], src_g, nblocks, x, interleave_block);
+            }
+        }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
@@ -1356,14 +1489,34 @@ static block_iq4_nlx4 make_block_iq4_nlx4(block_iq4_nl * in, unsigned int blck_s
     return out;
 }
 
+static inline void pack_block_iq4_nlx4(block_iq4_nlx4 * GGML_RESTRICT out, const block_iq4_nl * GGML_RESTRICT in, int64_t nblocks, int64_t x, unsigned int blck_size_interleave) {
+    GGML_ASSERT(blck_size_interleave == 4);
+
+    const block_iq4_nl * GGML_RESTRICT in0 = in + x;
+    const block_iq4_nl * GGML_RESTRICT in1 = in0 + nblocks;
+    const block_iq4_nl * GGML_RESTRICT in2 = in1 + nblocks;
+    const block_iq4_nl * GGML_RESTRICT in3 = in2 + nblocks;
+
+    out->d[0] = in0->d;
+    out->d[1] = in1->d;
+    out->d[2] = in2->d;
+    out->d[3] = in3->d;
+
+    for (int off = 0, dst = 0; off < QK4_NL / 2; off += 4) {
+        uint32_t q;
+        memcpy(&q, &in0->qs[off], sizeof(q)); memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+        memcpy(&q, &in1->qs[off], sizeof(q)); memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+        memcpy(&q, &in2->qs[off], sizeof(q)); memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+        memcpy(&q, &in3->qs[off], sizeof(q)); memcpy(&out->qs[dst], &q, sizeof(q)); dst += 4;
+    }
+}
+
 static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_IQ4_NL);
     GGML_ASSERT(interleave_block == 4);
 
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
           block_iq4_nlx4 * dst = (      block_iq4_nlx4 *)t->data;
-
-    block_iq4_nl dst_tmp[4];
 
     int nrow = ggml_nrows(t);
     int nrows_interleaved = 4;
@@ -1375,15 +1528,26 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
+    const int64_t n_groups = nrow / nrows_interleaved;
+    const int n_threads = ggml_cpu_repack_get_n_threads(n_groups, nblocks);
+    if (n_threads <= 1) {
+        for (int b = 0; b < nrow; b += nrows_interleaved) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_iq4_nlx4(dst++, src, nblocks, x, interleave_block);
             }
-            *dst++ = make_block_iq4_nlx4(dst_tmp, interleave_block);
+            src += nrows_interleaved * nblocks;
         }
-        src += nrows_interleaved * nblocks;
+        return 0;
     }
+    ggml_cpu_repack_parallel_for(n_groups, n_threads, [&](int64_t g0, int64_t g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            const block_iq4_nl * src_g = src + g * nrows_interleaved * nblocks;
+            block_iq4_nlx4 * dst_g = dst + g * nblocks;
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_iq4_nlx4(&dst_g[x], src_g, nblocks, x, interleave_block);
+            }
+        }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
@@ -1413,14 +1577,41 @@ static block_iq4_nlx8 make_block_iq4_nlx8(block_iq4_nl * in, unsigned int blck_s
     return out;
 }
 
+static inline void pack_block_iq4_nlx8(block_iq4_nlx8 * GGML_RESTRICT out, const block_iq4_nl * GGML_RESTRICT in, int64_t nblocks, int64_t x, unsigned int blck_size_interleave) {
+    GGML_ASSERT(blck_size_interleave == 8);
+
+    const block_iq4_nl * GGML_RESTRICT rows[8] = {
+        in + x,
+        in + x + 1 * nblocks,
+        in + x + 2 * nblocks,
+        in + x + 3 * nblocks,
+        in + x + 4 * nblocks,
+        in + x + 5 * nblocks,
+        in + x + 6 * nblocks,
+        in + x + 7 * nblocks,
+    };
+
+    for (int i = 0; i < 8; ++i) {
+        out->d[i] = rows[i]->d;
+    }
+
+    int dst = 0;
+    for (int off = 0; off < QK4_NL / 2; off += 8) {
+        for (int i = 0; i < 8; ++i) {
+            uint64_t q;
+            memcpy(&q, &rows[i]->qs[off], sizeof(q));
+            memcpy(&out->qs[dst], &q, sizeof(q));
+            dst += 8;
+        }
+    }
+}
+
 static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_IQ4_NL);
     GGML_ASSERT(interleave_block == 8);
 
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
           block_iq4_nlx8 * dst = (      block_iq4_nlx8 *)t->data;
-
-    block_iq4_nl dst_tmp[8];
 
     int nrow = ggml_nrows(t);
     int nrows_interleaved = 8;
@@ -1432,15 +1623,26 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
+    const int64_t n_groups = nrow / nrows_interleaved;
+    const int n_threads = ggml_cpu_repack_get_n_threads(n_groups, nblocks);
+    if (n_threads <= 1) {
+        for (int b = 0; b < nrow; b += nrows_interleaved) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_iq4_nlx8(dst++, src, nblocks, x, interleave_block);
             }
-            *dst++ = make_block_iq4_nlx8(dst_tmp, interleave_block);
+            src += nrows_interleaved * nblocks;
         }
-        src += nrows_interleaved * nblocks;
+        return 0;
     }
+    ggml_cpu_repack_parallel_for(n_groups, n_threads, [&](int64_t g0, int64_t g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            const block_iq4_nl * src_g = src + g * nrows_interleaved * nblocks;
+            block_iq4_nlx8 * dst_g = dst + g * nblocks;
+            for (int64_t x = 0; x < nblocks; x++) {
+                pack_block_iq4_nlx8(&dst_g[x], src_g, nblocks, x, interleave_block);
+            }
+        }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
