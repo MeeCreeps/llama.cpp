@@ -26,6 +26,7 @@
 #include "weight_buffer_manager.h"
 #include "weight_buffer_manager_cpu.h"
 #include "budget_watcher.h"
+#include "elastic_profile_writer.h"
 // O_DIRECT path (跟 GPU 共用 src/llama-mmap registry + pread_direct)
 #include "../../../src/llama-mmap.h"
 #include "../../../src/llama-uring.h"
@@ -73,9 +74,23 @@ struct elastic_state {
     uint64_t n_evicts_total  = 0;
     size_t   bytes_reloaded_total = 0;
     size_t   bytes_evicted_total  = 0;
+    uint64_t direct_read_calls = 0;
+    uint64_t direct_read_ok    = 0;
+    uint64_t direct_read_fail  = 0;
+    uint64_t direct_read_us    = 0;
+    size_t   direct_read_bytes = 0;
+    uint64_t stage_load_calls  = 0;
+    uint64_t stage_load_ok     = 0;
+    uint64_t stage_load_us     = 0;
+    size_t   stage_load_bytes  = 0;
+    uint64_t stage_xform_calls = 0;
+    uint64_t stage_xform_ok    = 0;
+    uint64_t stage_xform_us    = 0;
+    size_t   stage_xform_bytes = 0;
 
-    // GGML_ELASTIC_PROFILE=1 时 graph_compute 累计三段时间
+    // GGML_ELASTIC_PROFILE=1 / GGML_ELASTIC_TIMING=1 时 graph_compute 累计三段时间
     bool     profile = false;
+    bool     profile_csv = false;
     double   profile_io_total_ms      = 0.0;  // ensure_node loop 总时间（含 memcpy reload）
     double   profile_compute_total_ms = 0.0;  // delegate compute 时间
     double   profile_overhead_total_ms = 0.0; // 其它（evict + bookkeeping）
@@ -86,7 +101,10 @@ struct elastic_state {
     // bctx_by_idx allows movement request to find the backend handle on demand.
     std::mutex                              sched_mtx;
     std::unordered_map<std::string, int>    name_to_wbm;
+    std::unordered_map<int, std::string>    wbm_to_name;
     std::unordered_map<int, elastic_buffer_ctx *> bctx_by_idx;
+    std::unordered_map<int, void *>         backend_handle_by_idx;
+    std::unordered_map<int, std::vector<uint8_t>> staged_raw_by_idx;
     bool                                    sched_registered = false;
 };
 
@@ -106,18 +124,74 @@ bool elastic_sched_residency_query(const char *name, void * /*ud*/) {
     return bm && bm->resident;
 }
 
+uint32_t elastic_sched_state_query(const char *name, void * /*ud*/) {
+    auto *s = get_state();
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto it = s->name_to_wbm.find(name ? name : "");
+    if (it == s->name_to_wbm.end()) return 0;
+    const int idx = it->second;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    uint32_t flags = 0;
+    if (bm && bm->host_ptr) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
+    if (bm && bm->resident) flags |= LLAMA_WEIGHT_STATE_CPU_COMPUTE_RESIDENT;
+    if (s->staged_raw_by_idx.find(idx) != s->staged_raw_by_idx.end()) {
+        flags |= LLAMA_WEIGHT_STATE_CPU_RAW_RESIDENT;
+    }
+    return flags;
+}
+
 // 接到 ensure_block_resident / evict_blocks 的同步路径. 在 graph_compute
 // 流之外被调用 (e.g. llama_decode 的 scheduler hook), 必须线程安全.
 // 这里直接调 sync 版本 — backend_handle 是 region+offset 永久指针, 安全.
 extern void ensure_block_resident(elastic_state *s, int wbm_idx, void *backend_handle);
 extern void evict_blocks(elastic_state *s, elastic_buffer_ctx *bctx,
                          const std::vector<int> &victims);
+void cpu_profile_record(const char *kind, const char *name, int idx,
+                        size_t bytes, double ms, int ok,
+                        const char *extra);
+
+int read_block_direct_or_mmap(elastic_state *s, const elastic::block_meta *bm, void *dst) {
+    if (!s || !bm || !bm->host_ptr || !dst) return -1;
+
+    static const bool s_direct_io = []() {
+        const char *e = std::getenv("GGML_ELASTIC_DIRECT_IO");
+        return !(e && *e == '0');
+    }();
+
+    bool used_direct = false;
+    if (s_direct_io) {
+        auto reg = llama_mmap_registry_find(bm->host_ptr);
+        if (!reg.filename.empty()) {
+            size_t file_offset = (const char *) bm->host_ptr - (const char *) reg.base;
+            auto t0 = std::chrono::steady_clock::now();
+            s->direct_read_calls++;
+            int rc = llama_pread_direct(reg.filename.c_str(), dst, file_offset, bm->byte_size);
+            auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+            s->direct_read_us += (uint64_t) dt;
+            if (rc == 0) {
+                used_direct = true;
+                s->direct_read_ok++;
+                s->direct_read_bytes += bm->byte_size;
+            } else {
+                s->direct_read_fail++;
+            }
+        } else {
+            s->direct_read_fail++;
+        }
+    }
+    if (!used_direct) {
+        std::memcpy(dst, bm->host_ptr, bm->byte_size);
+    }
+    return 0;
+}
 
 int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
     if (!name) return -1;
     auto *s = get_state();
     int idx = -1;
     elastic_buffer_ctx *bctx = nullptr;
+    void *fixed_handle = nullptr;
     {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
         auto it = s->name_to_wbm.find(name);
@@ -125,6 +199,8 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
         idx = it->second;
         auto bit = s->bctx_by_idx.find(idx);
         if (bit != s->bctx_by_idx.end()) bctx = bit->second;
+        auto hit = s->backend_handle_by_idx.find(idx);
+        if (hit != s->backend_handle_by_idx.end()) fixed_handle = hit->second;
     }
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     if (!bm) return -3;
@@ -137,8 +213,106 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     }
     // prefetch
     if (bm->resident) return 0;
-    if (!bm->backend_handle) return -5;
-    ensure_block_resident(s, idx, bm->backend_handle);
+    void *target = bm->backend_handle ? bm->backend_handle : fixed_handle;
+    if (!target) return -5;
+    ensure_block_resident(s, idx, target);
+    return 0;
+}
+
+int elastic_sched_stage_request(const char *name, const char *stage, void * /*ud*/) {
+    if (!name || !stage) return -1;
+    auto *s = get_state();
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;
+        idx = it->second;
+    }
+    if (std::strcmp(stage, "load") == 0) {
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+        if (!bm) return -3;
+        if (bm->resident) return 0;
+        auto t0 = std::chrono::steady_clock::now();
+        s->stage_load_calls++;
+        std::vector<uint8_t> staging(bm->byte_size);
+        int rc = read_block_direct_or_mmap(s, bm, staging.data());
+        auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        s->stage_load_us += (uint64_t) dt;
+        if (rc != 0) {
+            if (s->profile_csv) {
+                cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 0, "plan_stage");
+            }
+            return rc;
+        }
+        {
+            std::lock_guard<std::mutex> lk(s->sched_mtx);
+            s->staged_raw_by_idx[idx] = std::move(staging);
+        }
+        s->stage_load_ok++;
+        s->stage_load_bytes += bm->byte_size;
+        if (s->profile_csv) {
+            cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
+        }
+        return 0;
+    }
+    if (std::strcmp(stage, "transfer") == 0 || std::strcmp(stage, "dma") == 0) {
+        return 0;
+    }
+    return -3;
+}
+
+int elastic_sched_transform_request(const char *name, llama_weight_transform_kind kind, void * /*ud*/) {
+    if (!name) return -1;
+    if (kind != LLAMA_WEIGHT_TRANSFORM_CPU_REPACK) return -2;
+    auto *s = get_state();
+    int idx = -1;
+    void *fixed_handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->name_to_wbm.find(name);
+        if (it == s->name_to_wbm.end()) return -2;
+        idx = it->second;
+        auto hit = s->backend_handle_by_idx.find(idx);
+        if (hit != s->backend_handle_by_idx.end()) fixed_handle = hit->second;
+    }
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -3;
+    if (bm->resident) return 0;
+    void *target = bm->backend_handle ? bm->backend_handle : fixed_handle;
+    if (!target) return -4;
+
+    s->stage_xform_calls++;
+    auto t0 = std::chrono::steady_clock::now();
+    bool copied = false;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->staged_raw_by_idx.find(idx);
+        if (it != s->staged_raw_by_idx.end()) {
+            if (it->second.size() != bm->byte_size) return -5;
+            // CPU_Elastic currently computes with the generic CPU layout. Make the
+            // transform stage explicit as raw-staging -> CPU resident layout; real
+            // CPU_REPACK buffer types are intentionally not enabled for this backend.
+            std::memcpy(target, it->second.data(), bm->byte_size);
+            s->staged_raw_by_idx.erase(it);
+            copied = true;
+        }
+    }
+    if (!copied) {
+        read_block_direct_or_mmap(s, bm, target);
+    }
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    s->stage_xform_us += (uint64_t) dt;
+    s->stage_xform_ok++;
+    s->stage_xform_bytes += bm->byte_size;
+    s->n_reloads_total += 1;
+    s->bytes_reloaded_total += bm->byte_size;
+    elastic::wbm_mark_resident(&s->wbm, idx, target);
+    if (s->profile_csv) {
+        cpu_profile_record("XFORM", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
+    }
     return 0;
 }
 
@@ -169,7 +343,10 @@ void elastic_sched_register_once() {
     if (s->sched_registered) return;
     s->sched_registered = true;
     llama_weight_residency_register(elastic_sched_residency_query, nullptr);
+    llama_weight_state_register    (elastic_sched_state_query,     nullptr);
     llama_weight_movement_register (elastic_sched_movement_request, nullptr);
+    llama_weight_stage_register    (elastic_sched_stage_request,    nullptr);
+    llama_weight_transform_register(elastic_sched_transform_request, nullptr);
     llama_weight_host_ptr_register (elastic_sched_host_ptr_query, nullptr);
     llama_budget_register          (elastic_sched_budget_query,    nullptr);
 }
@@ -195,6 +372,43 @@ std::string tensor_suffix(const char *name) {
         s = s.substr(0, s.size() - 7);
     }
     return s;
+}
+
+const char * name_for_idx(elastic_state *s, int idx) {
+    if (!s) return "";
+    auto it = s->wbm_to_name.find(idx);
+    if (it == s->wbm_to_name.end()) return "";
+    return it->second.c_str();
+}
+
+void cpu_profile_record(const char *kind, const char *name, int idx,
+                        size_t bytes, double ms, int ok,
+                        const char *extra = "") {
+    if (!elastic::profile_enabled()) return;
+    elastic::profile_record rec;
+    rec.backend   = "CPU_Elastic";
+    rec.kind      = kind;
+    rec.name      = name ? name : "";
+    rec.weight_id = idx;
+    rec.bytes     = bytes;
+    rec.ms        = ms;
+    rec.ok        = ok;
+    rec.extra     = extra ? extra : "";
+    elastic::profile_write(rec);
+}
+
+void cpu_profile_compute_graph(const ggml_cgraph *cgraph, double ms, int ok) {
+    if (!elastic::profile_enabled()) return;
+    elastic::profile_record rec;
+    rec.backend = "CPU_Elastic";
+    rec.kind    = "COMPUTE_GRAPH";
+    rec.name    = "ggml_cgraph";
+    rec.op      = "GRAPH";
+    rec.op_id   = cgraph ? cgraph->n_nodes : -1;
+    rec.ms      = ms;
+    rec.ok      = ok;
+    rec.extra   = "delegate_cpu_graph";
+    elastic::profile_write(rec);
 }
 
 // ============================================================
@@ -240,28 +454,17 @@ void ensure_block_resident(elastic_state *s, int wbm_idx, void *backend_handle) 
     if (bm->resident) return;
     if (!bm->host_ptr || !backend_handle) return;
 
-    // GGML_ELASTIC_DIRECT_IO=1: 用 O_DIRECT pread 从 disk 真读 (绕 page cache),
-    // 模拟 model > RAM 场景的真实 IO 成本.
-    static const bool s_direct_io = []() {
-        const char *e = std::getenv("GGML_ELASTIC_DIRECT_IO");
-        return e && *e && *e != '0';
-    }();
-    bool used_direct = false;
-    if (s_direct_io) {
-        auto reg = llama_mmap_registry_find(bm->host_ptr);
-        if (!reg.filename.empty()) {
-            size_t file_offset = (const char*)bm->host_ptr - (const char*)reg.base;
-            int rc = llama_pread_direct(reg.filename.c_str(), backend_handle, file_offset, bm->byte_size);
-            if (rc == 0) used_direct = true;
-        }
-    }
-    if (!used_direct) {
-        // memcpy mmap → region 的 (backend_handle 已经是 region+offset 指针)
-        std::memcpy(backend_handle, bm->host_ptr, bm->byte_size);
-    }
+    auto t0 = std::chrono::steady_clock::now();
+    read_block_direct_or_mmap(s, bm, backend_handle);
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
     s->n_reloads_total += 1;
     s->bytes_reloaded_total += bm->byte_size;
     elastic::wbm_mark_resident(&s->wbm, wbm_idx, backend_handle);
+    if (s->profile_csv) {
+        cpu_profile_record("RELOAD_ENSURE", name_for_idx(s, wbm_idx), wbm_idx,
+                           bm->byte_size, dt / 1000.0, 1, "decode_ensure");
+    }
 }
 
 // evict 列表：madvise DONTNEED + mark_evicted
@@ -357,6 +560,10 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
             return;
         }
         s->wbm_inited = true;
+        s->profile_csv = elastic::profile_enabled();
+        if (s->profile_csv) {
+            GGML_LOG_INFO("elastic: GGML_ELASTIC_PROFILE_CSV enabled\n");
+        }
 
         // 读 env 配置
         if (const char *kv = std::getenv("GGML_ELASTIC_KV_MB")) {
@@ -387,7 +594,12 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 GGML_LOG_INFO("elastic: MRU policy (default)\n");
             }
         }
-        if (const char *p = std::getenv("GGML_ELASTIC_PROFILE"); p && *p && *p != '0') {
+        const bool profile_env = []() {
+            const char *p = std::getenv("GGML_ELASTIC_PROFILE");
+            const char *t = std::getenv("GGML_ELASTIC_TIMING");
+            return (p && *p && *p != '0') || (t && *t && *t != '0');
+        }();
+        if (profile_env) {
             s->profile = true;
             std::atexit([]() {
                 auto *st = get_state();
@@ -400,11 +612,14 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                             (st->profile_io_total_ms / 1000.0) : 0;
                 std::fprintf(stderr,
                     "\n=== CPU_Elastic profile dump (n_graph=%llu) ===\n"
-                    "  io_pt        : %.1f ms/graph (memcpy reload from mmap)\n"
+                    "  io_pt        : %.1f ms/graph (direct disk reload / fallback mmap)\n"
                     "  compute_pt   : %.1f ms/graph (delegate to ggml-cpu)\n"
                     "  bytes_pt     : %.1f MB/graph reloaded\n"
                     "  effective_bw : %.0f MB/s\n"
                     "  reload_count : %llu (%llu bytes total)\n"
+                    "  direct_read  : calls=%llu ok=%llu fail=%llu total=%.2f ms MB=%.1f MB/s=%.1f\n"
+                    "  stage_load   : calls=%llu ok=%llu total=%.2f ms MB=%.1f\n"
+                    "  stage_xform  : calls=%llu ok=%llu total=%.2f ms MB=%.1f\n"
                     "  evict_count  : %llu (%llu bytes total)\n"
                     "============================================\n",
                     (unsigned long long)st->profile_n_graph,
@@ -413,6 +628,20 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     bw,
                     (unsigned long long)st->n_reloads_total,
                     (unsigned long long)st->bytes_reloaded_total,
+                    (unsigned long long)st->direct_read_calls,
+                    (unsigned long long)st->direct_read_ok,
+                    (unsigned long long)st->direct_read_fail,
+                    st->direct_read_us / 1000.0,
+                    st->direct_read_bytes / 1024.0 / 1024.0,
+                    st->direct_read_us ? (st->direct_read_bytes / 1024.0 / 1024.0) / (st->direct_read_us / 1000000.0) : 0.0,
+                    (unsigned long long)st->stage_load_calls,
+                    (unsigned long long)st->stage_load_ok,
+                    st->stage_load_us / 1000.0,
+                    st->stage_load_bytes / 1024.0 / 1024.0,
+                    (unsigned long long)st->stage_xform_calls,
+                    (unsigned long long)st->stage_xform_ok,
+                    st->stage_xform_us / 1000.0,
+                    st->stage_xform_bytes / 1024.0 / 1024.0,
                     (unsigned long long)st->n_evicts_total,
                     (unsigned long long)st->bytes_evicted_total);
             });
@@ -448,7 +677,9 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
             {
                 std::lock_guard<std::mutex> lk(s->sched_mtx);
                 s->name_to_wbm[tensor->name] = idx;
+                s->wbm_to_name[idx] = tensor->name;
                 s->bctx_by_idx[idx] = bctx;
+                s->backend_handle_by_idx[idx] = tensor->data;
             }
             elastic_sched_register_once();
 
@@ -885,15 +1116,26 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     }
     // 3) 数据齐了 → delegate compute
     clk::time_point t_compute_start{};
-    if (s->profile) {
+    const bool csv_profile = s->profile_csv;
+    if (s->profile || csv_profile) {
         auto t_io_end = clk::now();
-        s->profile_io_total_ms += std::chrono::duration<double, std::milli>(t_io_end - t_io_start).count();
+        if (s->profile) {
+            s->profile_io_total_ms += std::chrono::duration<double, std::milli>(t_io_end - t_io_start).count();
+        }
         t_compute_start = t_io_end;
     }
     ggml_status st = bctx->cpu->iface.graph_compute(bctx->cpu, cgraph);
+    double compute_ms = 0.0;
     if (s->profile) {
         auto t_compute_end = clk::now();
-        s->profile_compute_total_ms += std::chrono::duration<double, std::milli>(t_compute_end - t_compute_start).count();
+        compute_ms = std::chrono::duration<double, std::milli>(t_compute_end - t_compute_start).count();
+        s->profile_compute_total_ms += compute_ms;
+    } else if (csv_profile) {
+        auto t_compute_end = clk::now();
+        compute_ms = std::chrono::duration<double, std::milli>(t_compute_end - t_compute_start).count();
+    }
+    if (csv_profile) {
+        cpu_profile_compute_graph(cgraph, compute_ms, st == GGML_STATUS_SUCCESS ? 1 : 0);
     }
 
     // 4) compute 完成后 evict 到 target（为下一次 graph_compute 腾位置）。

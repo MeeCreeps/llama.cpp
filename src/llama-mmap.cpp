@@ -735,8 +735,10 @@ bool llama_weight_pin_query(const char * name, int layer, size_t byte_size) {
 namespace {
 std::mutex                                                       g_weight_res_mtx;
 std::vector<std::pair<llama_weight_residency_fn_t, void *>>      g_weight_res_providers;
+std::vector<std::pair<llama_weight_state_fn_t,     void *>>      g_weight_state_providers;
 std::vector<std::pair<llama_weight_movement_fn_t,  void *>>      g_weight_mov_providers;
 std::vector<std::pair<llama_weight_stage_fn_t,     void *>>      g_weight_stage_providers;
+std::vector<std::pair<llama_weight_anchor_fn_t,    void *>>      g_weight_anchor_providers;
 std::vector<std::pair<llama_weight_transform_fn_t, void *>>      g_weight_transform_providers;
 // Budget provider: 单 slot (预算是全局值)。
 std::mutex                                                       g_budget_mtx;
@@ -805,6 +807,10 @@ void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_res_providers.emplace_back(fn, user_data);
 }
+void llama_weight_state_register(llama_weight_state_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_state_providers.emplace_back(fn, user_data);
+}
 void llama_weight_movement_register(llama_weight_movement_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_mov_providers.emplace_back(fn, user_data);
@@ -812,6 +818,10 @@ void llama_weight_movement_register(llama_weight_movement_fn_t fn, void * user_d
 void llama_weight_stage_register(llama_weight_stage_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_stage_providers.emplace_back(fn, user_data);
+}
+void llama_weight_anchor_register(llama_weight_anchor_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_anchor_providers.emplace_back(fn, user_data);
 }
 void llama_weight_transform_register(llama_weight_transform_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
@@ -827,6 +837,18 @@ bool llama_weight_residency_query(const char * name) {
         if (p.first && p.first(name, p.second)) return true;
     }
     return false;
+}
+uint32_t llama_weight_state_query(const char * name) {
+    std::vector<std::pair<llama_weight_state_fn_t, void *>> snap;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        snap = g_weight_state_providers;
+    }
+    uint32_t flags = 0;
+    for (auto & p : snap) {
+        if (p.first) flags |= p.first(name, p.second);
+    }
+    return flags;
 }
 int llama_weight_movement_request(const char * name, bool evict) {
     std::vector<std::pair<llama_weight_movement_fn_t, void *>> snap;
@@ -850,6 +872,19 @@ int llama_weight_stage_request(const char * name, const char * stage) {
     for (auto & p : snap) {
         if (!p.first) continue;
         int rc = p.first(name, stage, p.second);
+        if (rc != -2) return rc;
+    }
+    return -2;
+}
+int llama_weight_anchor_request(const char * anchor_name) {
+    std::vector<std::pair<llama_weight_anchor_fn_t, void *>> snap;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        snap = g_weight_anchor_providers;
+    }
+    for (auto & p : snap) {
+        if (!p.first) continue;
+        int rc = p.first(anchor_name, p.second);
         if (rc != -2) return rc;
     }
     return -2;

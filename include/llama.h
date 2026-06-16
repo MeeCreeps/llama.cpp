@@ -991,6 +991,26 @@ extern "C" {
             struct llama_context * ctx,
             const char *           tensor_name);
 
+    enum llama_elastic_weight_state_flags {
+        LLAMA_ELASTIC_WEIGHT_DISK_AVAILABLE       = 1u << 0,
+        LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT     = 1u << 1,
+        LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT = 1u << 2,
+        LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT     = 1u << 3,
+        LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT = 1u << 4,
+    };
+
+    struct llama_elastic_weight_state {
+        uint32_t flags;
+        void *   host_ptr;
+    };
+
+    // Finer-grained elastic residency query for online planners. The result is
+    // a merged view from all registered elastic backends.
+    LLAMA_API int llama_weight_get_state(
+            struct llama_context *             ctx,
+            const char *                       tensor_name,
+            struct llama_elastic_weight_state * out_state);
+
     // Async request: 把 tensor_name 在下次 ensure_phase 之前预 load 进 backend 缓冲.
     // 返 0 成功入队, <0 失败 (e.g. weight 不存在 / backend 不支持).
     LLAMA_API int llama_weight_request_prefetch(

@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 
 using namespace elastic;
@@ -147,8 +148,65 @@ static void test_make_plan_load(const char * path) {
     CHECK(q.timeline.size() == p.timeline.size());
 }
 
+static void test_make_plan_synth_gpu_stages() {
+    const char * path = "/tmp/elastic_make_plan_synth_gpu_stages.json";
+    {
+        std::ofstream f(path);
+        f << R"JSON({
+  "budget_mib": 1024,
+  "per_token_ms": 1.0,
+  "bottleneck": "disk",
+  "routes": {
+    "blk.0.attn_q.weight": "gpu",
+    "blk.0.attn_k.weight": "cpu"
+  },
+  "resident_in_memory": [],
+  "schedule": [
+    {
+      "compute": {"weight": "blk.0.attn_q.weight", "backend": "gpu"},
+      "disk_in": [
+        {"weight": "blk.0.attn_q.weight"},
+        {"weight": "blk.0.attn_k.weight"}
+      ]
+    }
+  ]
+})JSON";
+    }
+
+    ExecPlan p;
+    std::string err;
+    CHECK(plan_from_make_plan_file(path, p, &err));
+    if (!err.empty()) std::fprintf(stderr, "  synth decode err: %s\n", err.c_str());
+
+    int q_load = 0, q_transfer = 0, q_xform = 0;
+    int k_load = 0, k_transfer = 0, k_xform = 0;
+    const int qid = p.weight_id_of("blk.0.attn_q.weight");
+    const int kid = p.weight_id_of("blk.0.attn_k.weight");
+    CHECK(qid >= 0);
+    CHECK(kid >= 0);
+    for (const auto & e : p.timeline) {
+        if (e.weight_id == qid) {
+            q_load     += e.kind == EvKind::LOAD;
+            q_transfer += e.kind == EvKind::TRANSFER;
+            q_xform    += e.kind == EvKind::XFORM;
+        }
+        if (e.weight_id == kid) {
+            k_load     += e.kind == EvKind::LOAD;
+            k_transfer += e.kind == EvKind::TRANSFER;
+            k_xform    += e.kind == EvKind::XFORM;
+        }
+    }
+    CHECK(q_load == 1);
+    CHECK(q_transfer == 1);
+    CHECK(q_xform == 1);
+    CHECK(k_load == 1);
+    CHECK(k_transfer == 0);
+    CHECK(k_xform == 0);
+}
+
 int main(int argc, char ** argv) {
     test_native_roundtrip();
+    test_make_plan_synth_gpu_stages();
     // 可传一个真实 plan_*.json 路径;CMake 会传 runtime/plan/plans/plan_4144MiB.json
     test_make_plan_load(argc > 1 ? argv[1] : nullptr);
 

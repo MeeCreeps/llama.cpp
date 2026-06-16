@@ -97,7 +97,7 @@ static void usage(const char * argv0) {
         "\n"
         "options:\n"
         "  --type <all|q4_0|q4_1|q5_0|q5_1|q8_0|iq4_nl|q4_k|q5_k|q6_k|mxfp4>\n"
-        "  --mode <all|standard|dense|dense_adaptive|dense_tile32|dense_nocopy|dense_tile32_nocopy|dense_scalar|dense_tiled|dense_fused|dense_fused_wall|dense_fused_check|moe|transpose|transpose_tiled|transpose_check|transpose_check32>\n"
+        "  --mode <all|standard|dense|dense_adaptive|dense_tile32|dense_nocopy|dense_tile32_nocopy|dense_scalar|dense_tiled|dense_fused|dense_fused_wall|dense_fused_check|moe|transpose|transpose_tiled|transpose_check|transpose_check32|reload_chain_ab>\n"
         "       standard: AOS->SOA convert kernel only\n"
         "       dense:    Adreno-style convert/noshuffle + tiled transpose kernel + transpose copy\n"
         "       dense_adaptive: dense mode with the same 16x16/32x32 heuristic as the backend\n"
@@ -173,12 +173,14 @@ struct cl_ctx {
     cl_device_id device = nullptr;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
+    cl_command_queue xfer_queue = nullptr;
     cl_program cvt = nullptr;
     cl_program transpose = nullptr;
 
     ~cl_ctx() {
         if (transpose) clReleaseProgram(transpose);
         if (cvt) clReleaseProgram(cvt);
+        if (xfer_queue) clReleaseCommandQueue(xfer_queue);
         if (queue) clReleaseCommandQueue(queue);
         if (context) clReleaseContext(context);
     }
@@ -233,6 +235,12 @@ static cl_ctx init_opencl(const params & p) {
     c.queue = clCreateCommandQueueWithProperties(c.context, c.device, props, &err);
 #else
     c.queue = clCreateCommandQueue(c.context, c.device, CL_QUEUE_PROFILING_ENABLE, &err);
+#endif
+    CL_CHECK(err);
+#ifdef CL_VERSION_2_0
+    c.xfer_queue = clCreateCommandQueueWithProperties(c.context, c.device, props, &err);
+#else
+    c.xfer_queue = clCreateCommandQueue(c.context, c.device, CL_QUEUE_PROFILING_ENABLE, &err);
 #endif
     CL_CHECK(err);
 
@@ -861,6 +869,128 @@ static void enqueue_prepared_fused_no_profile(cl_command_queue q, prepared_fused
     CL_CHECK(clEnqueueNDRangeKernel(q, fcmd.kt.k, 3, nullptr, fcmd.gws, fcmd.lws, 0, nullptr, nullptr));
 }
 
+static std::vector<prepared_transpose> make_prepared_transposes(
+        cl_ctx & c, const std::string & type, int k_dim, int m_dim, bench_alloc & a, bool tiled);
+
+struct prepared_convert {
+    kernel kc;
+    size_t gws[3] = {};
+    size_t lws[3] = { 64, 1, 1 };
+
+    prepared_convert(cl_program prog, const std::string & type, int k_dim, int m_dim, bench_alloc & a) :
+        kc(prog, type == "q4_0" ? "kernel_convert_block_q4_0_noshuffle" : "kernel_convert_block_q8_0") {
+        if (type != "q4_0" && type != "q8_0") {
+            throw std::runtime_error("reload_chain_ab currently supports q4_0 and q8_0");
+        }
+        const uint64_t elems = uint64_t(k_dim) * uint64_t(m_dim);
+        set_arg(kc.k, 0, a.src.mem);
+        set_arg(kc.k, 1, a.q.mem);
+        set_arg(kc.k, 2, a.d.mem);
+        gws[0] = size_t(elems / 32);
+        gws[1] = 1;
+        gws[2] = 1;
+    }
+};
+
+static void enqueue_prepared_convert_no_profile(
+        cl_command_queue q,
+        prepared_convert & cmd,
+        cl_uint wait_n = 0,
+        const cl_event * wait = nullptr,
+        cl_event * out = nullptr) {
+    CL_CHECK(clEnqueueNDRangeKernel(q, cmd.kc.k, 3, nullptr, cmd.gws, cmd.lws, wait_n, wait, out));
+}
+
+struct reload_chain_sample {
+    double wall_ms = 0.0;
+};
+
+static reload_chain_sample run_reload_chain_once(
+        cl_ctx & c,
+        prepared_convert & conv,
+        std::vector<prepared_transpose> & transposes,
+        buffer & staging,
+        const std::vector<uint8_t> & input,
+        bool transform_on_xfer) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    cl_event write_ev = nullptr;
+    CL_CHECK(clEnqueueWriteBuffer(c.xfer_queue, staging.mem, CL_FALSE, 0, input.size(), input.data(), 0, nullptr, &write_ev));
+
+    if (transform_on_xfer) {
+        cl_event convert_ev = nullptr;
+        enqueue_prepared_convert_no_profile(c.xfer_queue, conv, 1, &write_ev, &convert_ev);
+        CL_CHECK(clReleaseEvent(write_ev));
+        CL_CHECK(clReleaseEvent(convert_ev));
+        for (prepared_transpose & tr : transposes) {
+            enqueue_prepared_transpose_no_profile(c.xfer_queue, tr);
+        }
+        cl_event final_ev = nullptr;
+        CL_CHECK(clEnqueueMarkerWithWaitList(c.xfer_queue, 0, nullptr, &final_ev));
+        CL_CHECK(clFlush(c.xfer_queue));
+        CL_CHECK(clEnqueueBarrierWithWaitList(c.queue, 1, &final_ev, nullptr));
+        CL_CHECK(clReleaseEvent(final_ev));
+    } else {
+        CL_CHECK(clFlush(c.xfer_queue));
+        CL_CHECK(clEnqueueBarrierWithWaitList(c.queue, 1, &write_ev, nullptr));
+        CL_CHECK(clReleaseEvent(write_ev));
+        enqueue_prepared_convert_no_profile(c.queue, conv);
+        for (prepared_transpose & tr : transposes) {
+            enqueue_prepared_transpose_no_profile(c.queue, tr);
+        }
+    }
+
+    CL_CHECK(clFinish(c.queue));
+    const auto t1 = std::chrono::steady_clock::now();
+    return { std::chrono::duration<double, std::milli>(t1 - t0).count() };
+}
+
+static void bench_reload_chain_ab(cl_ctx & c, const std::string & type, const params & p) {
+    if (type != "q4_0" && type != "q8_0") {
+        throw std::runtime_error("reload_chain_ab currently supports q4_0 and q8_0");
+    }
+    if (p.m % 64 != 0) {
+        throw std::runtime_error("reload_chain_ab requires --m multiple of 64");
+    }
+
+    bench_case bc = make_case(type, p.k, p.m, "dense");
+    const uint64_t nblk = uint64_t(p.k) * uint64_t(p.m) / bc.block;
+    const size_t src_bytes = nblk * bc.src_block_bytes;
+    bench_alloc old_alloc = allocate_case(c, bc, src_bytes);
+    bench_alloc new_alloc = allocate_case(c, bc, src_bytes);
+    std::vector<uint8_t> input = make_input(src_bytes);
+
+    prepared_convert old_conv(c.cvt, type, p.k, p.m, old_alloc);
+    prepared_convert new_conv(c.cvt, type, p.k, p.m, new_alloc);
+    std::vector<prepared_transpose> old_transposes = make_prepared_transposes(c, type, p.k, p.m, old_alloc, true);
+    std::vector<prepared_transpose> new_transposes = make_prepared_transposes(c, type, p.k, p.m, new_alloc, true);
+
+    for (int i = 0; i < p.warmup; ++i) {
+        (void) run_reload_chain_once(c, old_conv, old_transposes, old_alloc.src, input, false);
+        (void) run_reload_chain_once(c, new_conv, new_transposes, new_alloc.src, input, true);
+    }
+
+    std::vector<double> old_wall;
+    std::vector<double> new_wall;
+    old_wall.reserve(p.iters);
+    new_wall.reserve(p.iters);
+    for (int i = 0; i < p.iters; ++i) {
+        old_wall.push_back(run_reload_chain_once(c, old_conv, old_transposes, old_alloc.src, input, false).wall_ms);
+        new_wall.push_back(run_reload_chain_once(c, new_conv, new_transposes, new_alloc.src, input, true).wall_ms);
+    }
+
+    const stats so = calc_stats(old_wall);
+    const stats sn = calc_stats(new_wall);
+    const double ratio = sn.med / so.med;
+    const double gib = double(src_bytes) / 1024.0 / 1024.0 / 1024.0;
+    std::printf("%-7s %-15s K=%-6d M=%-6d src=%8.2f MiB repeats=%-4d "
+                "old_med=%8.3f ms old_avg=%8.3f ms new_med=%8.3f ms new_avg=%8.3f ms "
+                "new/old=%5.2fx old_GiB/s=%7.2f new_GiB/s=%7.2f\n",
+            type_name(type), "reload_chain_ab", p.k, p.m, double(src_bytes) / 1024.0 / 1024.0, p.iters,
+            so.med, so.avg, sn.med, sn.avg, ratio,
+            gib / (so.med / 1000.0), gib / (sn.med / 1000.0));
+}
+
 static void bench_dense_fused_wall(cl_ctx & c, const std::string & type, const params & p) {
     if (p.m % 64 != 0) {
         throw std::runtime_error("dense_fused_wall requires --m multiple of 64");
@@ -1256,6 +1386,10 @@ static void bench_one(cl_ctx & c, const std::string & type, const std::string & 
         bench_dense_fused_check(c, type, p);
         return;
     }
+    if (mode == "reload_chain_ab") {
+        bench_reload_chain_ab(c, type, p);
+        return;
+    }
 
     bench_case bc = make_case(type, p.k, p.m, mode);
     const uint64_t nblk = uint64_t(p.k) * uint64_t(p.m) / bc.block;
@@ -1314,7 +1448,7 @@ int main(int argc, char ** argv) {
         const std::vector<std::string> all_types = {
             "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "q4_k", "q5_k", "q6_k", "mxfp4",
         };
-        const std::vector<std::string> all_modes = { "standard", "dense", "dense_adaptive", "dense_tile32", "dense_nocopy", "dense_tile32_nocopy", "dense_scalar", "dense_fused", "dense_fused_wall", "dense_fused_check", "moe", "transpose", "transpose_tiled", "transpose_check", "transpose_check32" };
+        const std::vector<std::string> all_modes = { "standard", "dense", "dense_adaptive", "dense_tile32", "dense_nocopy", "dense_tile32_nocopy", "dense_scalar", "dense_fused", "dense_fused_wall", "dense_fused_check", "moe", "transpose", "transpose_tiled", "transpose_check", "transpose_check32", "reload_chain_ab" };
 
         std::vector<std::string> types = p.type == "all" ? all_types : std::vector<std::string>{ p.type };
         std::vector<std::string> modes = p.mode == "all" ? all_modes : std::vector<std::string>{ p.mode };

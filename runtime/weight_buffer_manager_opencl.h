@@ -20,8 +20,12 @@
 #endif
 #include <CL/cl.h>
 
+#include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <list>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -42,6 +46,40 @@ struct soa_pool_entry {
     void *parent = nullptr;
     void *d      = nullptr;
     void *q      = nullptr;
+};
+
+enum class wbmcl_device_event_kind {
+    TRANSFER_WRITE = 0,
+    XFORM_CONVERT  = 1,
+    XFORM_TRANSPOSE = 2,
+    XFORM_COPY      = 3,
+    COMPUTE_WAIT    = 4,
+};
+
+struct wbmcl_device_event_sample {
+    cl_event                  event = nullptr;
+    wbmcl_device_event_kind   kind  = wbmcl_device_event_kind::TRANSFER_WRITE;
+    size_t                    bytes = 0;
+};
+
+enum class wbmcl_stage_detail_kind {
+    SOA_POOL_LOOKUP = 0,
+    PARENT_ALLOC    = 1,
+    STAGING_ALLOC   = 2,
+    HOST_SRC        = 3,
+    WRITE_ENQUEUE   = 4,
+    SUBBUFFER       = 5,
+    BARRIER_ENQUEUE = 6,
+    CONVERT_ENQUEUE = 7,
+    TRANSPOSE_ENQUEUE = 8,
+    FINAL_WAIT_ENQUEUE = 9,
+    MARK_RESIDENT   = 10,
+};
+
+struct wbmcl_stage_detail_bucket {
+    uint64_t n = 0;
+    uint64_t us = 0;
+    size_t bytes = 0;
 };
 
 struct wbm_opencl_ctx {
@@ -65,7 +103,7 @@ struct wbm_opencl_ctx {
     // 真的合规 budget——而不是 indexed by idx 那种"每个 tensor 一份" ≈ 全 model。
     std::unordered_map<size_t, std::vector<void *>>            retained_buffers_by_size;
     std::list<size_t>                                          retain_order_sizes;  // FIFO 顺序，每个 entry = 一个 cl_mem 的 size
-    // 额外的 xfer queue 池：round-robin 派发，让多个 DMA 真并行
+    // 额外的 xfer queue 池：round-robin 派发，让多个 backend transfer 真并行
     // micro-bench (probe_overlap.cpp) 实测 2 queue 能 2× 吞吐，3+ 边际递减
     static constexpr int N_XFER_EXTRA = 4;
     cl_command_queue  xfer_extra[N_XFER_EXTRA];  // 0..n_xfer_extra-1 有效
@@ -85,15 +123,16 @@ struct wbm_opencl_ctx {
     size_t            soa_staging_capacity = 0;
     cl_event          soa_staging_last_use_ev = nullptr;
 
-    // O_DIRECT reload (非 SOA 路径). GGML_ELASTIC_DIRECT_IO=1 时由 ggml-opencl 注入:
+    // O_DIRECT reload (非 SOA 路径). 默认由 ggml-opencl 注入;
+    // GGML_ELASTIC_DIRECT_IO=0 时关闭:
     // 给 host_ptr (mmap VA) 反查文件 + O_DIRECT pread 到 dst, 返 0 成功. runtime 层
     // 不直接依赖 libllama, 通过函数指针解耦. nullptr = 走 mmap host_ptr (默认).
-    int (*direct_read_fn)(const void *host_ptr, void *dst, size_t nbytes) = nullptr;
+    std::function<int(const void *host_ptr, void *dst, size_t nbytes)> direct_read_fn;
 
     // Plan-stage staging: LOAD 把 disk/mmap 内容拷到 host_staging_by_idx，
-    // DMA/XFORM 可复用该 host staging，避免把 disk load 和 backend transform 混在一起。
+    // TRANSFER/XFORM 可复用该 host staging，避免把 disk load 和 backend transform 混在一起。
     //
-    // host staging pool: DMA 完成后可把 staging buffer 归还到按 size 分组的
+    // host staging pool: transfer 完成后可把 staging buffer 归还到按 size 分组的
     // CPU pool，后续 LOAD 直接复用，避免内存预算变大时反复 malloc/free。
     bool retain_host_staging = false;
     size_t host_staging_pool_limit = 0; // 0 = 不限
@@ -102,6 +141,42 @@ struct wbm_opencl_ctx {
     std::unordered_map<size_t, std::vector<std::vector<char>>> host_staging_pool_by_size;
     std::list<size_t> host_staging_pool_order;
     size_t bytes_loaded_total = 0;
+
+    uint64_t stage_load_calls = 0;
+    uint64_t stage_load_ok    = 0;
+    uint64_t stage_load_us    = 0;
+    size_t   stage_load_bytes = 0;
+    uint64_t direct_read_calls = 0;
+    uint64_t direct_read_ok    = 0;
+    uint64_t direct_read_fail  = 0;
+    uint64_t direct_read_us    = 0;
+    size_t   direct_read_bytes = 0;
+
+    uint64_t stage_transfer_calls = 0;
+    uint64_t stage_transfer_ok    = 0;
+    uint64_t stage_transfer_us    = 0;
+    size_t   stage_transfer_bytes = 0;
+
+    uint64_t stage_xform_calls = 0;
+    uint64_t stage_xform_ok    = 0;
+    uint64_t stage_xform_us    = 0;
+    size_t   stage_xform_bytes = 0;
+
+    uint64_t soa_pool_hit       = 0;
+    uint64_t soa_pool_miss      = 0;
+    uint64_t parent_pool_hit    = 0;
+    uint64_t parent_pool_miss   = 0;
+    uint64_t parent_create_calls = 0;
+    uint64_t parent_create_us    = 0;
+    size_t   parent_create_bytes = 0;
+
+    bool device_timing = false;
+    std::mutex device_timing_mtx;
+    std::vector<wbmcl_device_event_sample> device_events;
+
+    bool stage_detail = false;
+    std::mutex stage_detail_mtx;
+    wbmcl_stage_detail_bucket stage_detail_buckets[11];
 };
 
 void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
@@ -116,6 +191,17 @@ int  wbmcl_init(wbm_opencl_ctx *octx,
                 cl_context cl_ctx,
                 cl_command_queue compute_queue,
                 cl_command_queue xfer_queue);
+
+void wbmcl_record_device_event(wbm_opencl_ctx *octx,
+                               cl_event ev,
+                               wbmcl_device_event_kind kind,
+                               size_t bytes);
+void wbmcl_dump_device_timing(wbm_opencl_ctx *octx, FILE *out);
+void wbmcl_record_stage_detail(wbm_opencl_ctx *octx,
+                               wbmcl_stage_detail_kind kind,
+                               uint64_t us,
+                               size_t bytes);
+void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out);
 
 // 阻塞确保 block idx 驻留：
 //   - 已驻留 → no-op，返回 0
@@ -134,7 +220,7 @@ int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
 
 // 分阶段 plan API:
 //   LOAD  : disk/mmap -> host staging
-//   DMA   : host staging -> backend buffer
+//   TRANSFER : host staging -> backend buffer
 //   XFORM : backend/raw -> compute layout (SOA callback 或 generic no-op)
 // 旧 ensure_resident 仍是完整兼容路径。
 int  wbmcl_load_host(wbm_opencl_ctx *octx, int idx);

@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // elastic plan framework (前向声明,完整类型在 llama-context.cpp include)
@@ -334,6 +335,16 @@ private:
     const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
     std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id (STATIC routing)
     std::unordered_map<std::string, int> elastic_runtime_route;// weight 名 → backend_id (RUNTIME dispatch, M5)
+    std::unordered_map<std::string, int> elastic_anchor_op;    // anchor weight/op 名 → op_id
+    std::unordered_set<int>              elastic_anchor_fired; // 当前 plan 已触发过的 anchor op
+    uint64_t elastic_anchor_requests        = 0;               // backend 到达 weight anchor 的通知次数
+    uint64_t elastic_anchor_hits            = 0;               // 命中当前 plan anchor 的次数
+    uint64_t elastic_anchor_duplicates      = 0;               // 同一 anchor 重复通知次数
+    uint64_t elastic_anchor_events_fired    = 0;               // 实际下发的 timeline events 数
+    uint64_t elastic_anchor_load_events     = 0;
+    uint64_t elastic_anchor_transfer_events = 0;
+    uint64_t elastic_anchor_xform_events    = 0;
+    uint64_t elastic_anchor_stage_failures  = 0;               // provider 返回非 0 的 stage/xform 请求数
     // weight 名 → (migrate_from_backend, xform) — 跨后端迁移意图 (M5, 设备侧用)
     std::unordered_map<std::string, std::pair<int,int>> elastic_migrate;
     bool    elastic_enabled = false;                           // dynamic online loop 开关

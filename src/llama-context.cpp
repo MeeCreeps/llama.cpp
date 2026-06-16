@@ -13,6 +13,7 @@
 #include "plan_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -242,6 +243,17 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
+            if (backend_type != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    std::getenv("LLAMA_OPENCL_HOSTMAPPED_COMPUTE") != nullptr) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (host_buft && ggml_backend_supports_buft(backend.get(), host_buft)) {
+                    buft = host_buft;
+                    LLAMA_LOG_INFO("%s: using %s compute buffer for backend %s via LLAMA_OPENCL_HOSTMAPPED_COMPUTE\n",
+                            __func__, ggml_backend_buft_name(buft), ggml_backend_name(backend.get()));
+                }
+            }
+
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 auto * dev = model.devices[0];
@@ -438,6 +450,22 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (elastic_anchor_requests > 0) {
+        LLAMA_LOG_INFO("%s: elastic anchor summary: requests=%" PRIu64
+                       " hits=%" PRIu64 " duplicate=%" PRIu64
+                       " fired=%" PRIu64 " load=%" PRIu64
+                       " transfer=%" PRIu64 " xform=%" PRIu64
+                       " failures=%" PRIu64 "\n",
+                       __func__,
+                       elastic_anchor_requests,
+                       elastic_anchor_hits,
+                       elastic_anchor_duplicates,
+                       elastic_anchor_events_fired,
+                       elastic_anchor_load_events,
+                       elastic_anchor_transfer_events,
+                       elastic_anchor_xform_events,
+                       elastic_anchor_stage_failures);
+    }
     ggml_opt_free(opt_ctx);
     // 释放 elastic plan 只读句柄缓存(llama_plan_free 见本文件后段 C API)
     for (auto & kv : elastic_plan_view_cache) {
@@ -854,13 +882,35 @@ void llama_context::elastic_install_op_schedule() {
 }
 
 void llama_context::elastic_install_runtime_dispatch() {
-    // M5(D2b-runtime):RUNTIME-dispatch op 在 compute 即将开始前查 plan 决定 backend,
-    // 并触发跨后端迁移(CPU↔GPU + layout 转换,设备侧由 ggml-backend migration pool 做)。
-    // 无 RUNTIME op → 卸掉 hook(STATIC plan 不付 per-op 单 op 执行代价)。
-    if (elastic_runtime_route.empty()) {
+    if (!elastic_plan) {
+        if (sched) ggml_backend_sched_set_pre_op_callback(sched.get(), nullptr, nullptr);
         set_op_runtime_dispatch(nullptr, nullptr);
         return;
     }
+
+    // Stage anchor trigger: runs immediately before each op is submitted to the
+    // backend scheduler. It does not use eval_callback and does not synchronize.
+    struct PreOpAnchor {
+        static void call(const struct ggml_tensor * op, int /*backend_id*/, void * ud) {
+            auto * self = (llama_context *) ud;
+            if (!self || !op || op->op != GGML_OP_MUL_MAT || !op->src[0]) return;
+            const char * w = op->src[0]->name;
+            if (!w || !*w) return;
+            llama_weight_anchor_request(w);
+        }
+    };
+    if (sched) {
+        ggml_backend_sched_set_pre_op_callback(sched.get(), PreOpAnchor::call, this);
+    }
+
+    if (elastic_runtime_route.empty()) {
+        set_op_runtime_dispatch(nullptr, nullptr);
+        LLAMA_LOG_INFO("%s: installed pre-op anchor trigger for static plan, %d migrate\n",
+                       __func__, (int) elastic_migrate.size());
+        return;
+    }
+
+    // M5(D2b-runtime):RUNTIME-dispatch op 在 compute split 即将提交前查 plan 决定 backend。
     // hook:按 op 的 src[0](weight)名查 runtime route。返回 -1 = 用 split 默认。
     // 迁移由 ggml-backend 的 RUNTIME_DISPATCH_MIGRATE 通路处理(target ≠ split backend 时);
     // elastic_migrate 记录的 xform 供设备侧成本模型/日志参考。
@@ -876,7 +926,7 @@ void llama_context::elastic_install_runtime_dispatch() {
         return it->second;
     };
     set_op_runtime_dispatch(hook, this);
-    LLAMA_LOG_INFO("%s: installed runtime dispatch for %d op(s), %d migrate\n",
+    LLAMA_LOG_INFO("%s: installed runtime dispatch for %d route op(s), %d migrate, pre_op_anchor=1\n",
                    __func__, (int) elastic_runtime_route.size(), (int) elastic_migrate.size());
 }
 
@@ -887,7 +937,12 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     if (elastic_cpu_id < 0) {
         elastic_cpu_id = (int) backends.size() - 1;
         for (size_t i = 0; i < backends.size(); i++) {
-            if (backends[i].get() != backend_cpu) { elastic_gpu_id = (int) i; break; }
+            const char * name = ggml_backend_name(backends[i].get());
+            if (name && std::strcmp(name, "CPU_Elastic") == 0) {
+                elastic_cpu_id = (int) i;
+            } else if (backends[i].get() != backend_cpu && elastic_gpu_id < 0) {
+                elastic_gpu_id = (int) i;
+            }
         }
     }
 
@@ -938,27 +993,111 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
             if (!w) return;
             llama_weight_stage_request(w->name.c_str(), stage);
         };
-        auto transform_request = [this](const elastic::PlanEvent & ev) {
+        auto transform_kind_for_event = [](const elastic::PlanEvent & ev) {
+            switch (ev.to_loc) {
+                case elastic::Location::GPU:  return LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT;
+                case elastic::Location::CPU:  return LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;
+                case elastic::Location::DISK: return LLAMA_WEIGHT_TRANSFORM_NONE;
+            }
+            return LLAMA_WEIGHT_TRANSFORM_NONE;
+        };
+        auto transform_request = [this, transform_kind_for_event](const elastic::PlanEvent & ev) {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(ev.weight_id) : nullptr;
             if (!w) return;
-            llama_weight_transform_kind kind = LLAMA_WEIGHT_TRANSFORM_NONE;
-            switch (w->xform) {
-                case elastic::Xform::GPU_CONVERT: kind = LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT; break;
-                case elastic::Xform::CPU_REPACK:  kind = LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;  break;
-                case elastic::Xform::NONE:        kind = LLAMA_WEIGHT_TRANSFORM_NONE;        break;
-            }
+            llama_weight_transform_kind kind = transform_kind_for_event(ev);
             llama_weight_transform_request(w->name.c_str(), kind);
         };
         sinks.enqueue_load  = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "load"); };
-        sinks.enqueue_dma   = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "dma"); };
+        sinks.enqueue_transfer = [stage_request](const elastic::PlanEvent & ev) { stage_request(ev, "transfer"); };
         sinks.enqueue_transform = [transform_request](const elastic::PlanEvent & ev) { transform_request(ev); };
+        sinks.defer_stage_events = []() {
+            const char * e = std::getenv("LLAMA_ELASTIC_DEFER_STAGE");
+            return !(e && *e && *e == '0');
+        }();
         elastic_executor = std::make_unique<elastic::PlanExecutor>(std::move(sinks));
+
+        llama_weight_anchor_register(
+            [](const char * anchor_name, void * ud) -> int {
+                llama_context * self = static_cast<llama_context *>(ud);
+                if (!self || !anchor_name || !self->elastic_executor || !self->elastic_plan) return -2;
+                self->elastic_anchor_requests++;
+                if (!self->elastic_executor->defer_stage_events()) return 0;
+                auto ait = self->elastic_anchor_op.find(anchor_name);
+                if (ait == self->elastic_anchor_op.end()) return -2;
+                const int op_id = ait->second;
+                if (self->elastic_anchor_fired.count(op_id) > 0) {
+                    self->elastic_anchor_duplicates++;
+                    return 0;
+                }
+                self->elastic_anchor_fired.insert(op_id);
+                self->elastic_anchor_hits++;
+
+                const auto & events = self->elastic_executor->events_for_anchor(op_id);
+                self->elastic_anchor_events_fired += events.size();
+                static const bool trace_anchor = []() {
+                    const char * e = std::getenv("LLAMA_ELASTIC_ANCHOR_TRACE");
+                    return e && atoi(e) != 0;
+                }();
+                if (trace_anchor) {
+                    LLAMA_LOG_INFO("llama elastic anchor: anchor=%s op=%d events=%zu\n",
+                                   anchor_name, op_id, events.size());
+                }
+                for (const elastic::PlanEvent * evp : events) {
+                    if (!evp) continue;
+                    const elastic::WeightPlan * w = self->elastic_plan->weight_by_id(evp->weight_id);
+                    if (!w) continue;
+                    int rc = 0;
+                    switch (evp->kind) {
+                        case elastic::EvKind::LOAD:
+                            self->elastic_anchor_load_events++;
+                            rc = llama_weight_stage_request(w->name.c_str(), "load");
+                            break;
+                        case elastic::EvKind::TRANSFER:
+                            self->elastic_anchor_transfer_events++;
+                            rc = llama_weight_stage_request(w->name.c_str(), "transfer");
+                            break;
+                        case elastic::EvKind::XFORM: {
+                            self->elastic_anchor_xform_events++;
+                            llama_weight_transform_kind kind = LLAMA_WEIGHT_TRANSFORM_NONE;
+                            switch (evp->to_loc) {
+                                case elastic::Location::GPU:  kind = LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT; break;
+                                case elastic::Location::CPU:  kind = LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;  break;
+                                case elastic::Location::DISK: kind = LLAMA_WEIGHT_TRANSFORM_NONE;        break;
+                            }
+                            rc = llama_weight_transform_request(w->name.c_str(), kind);
+                            break;
+                        }
+                        case elastic::EvKind::PREFETCH:
+                        case elastic::EvKind::EVICT:
+                            break;
+                    }
+                    if (rc != 0) {
+                        self->elastic_anchor_stage_failures++;
+                        if (trace_anchor) {
+                            LLAMA_LOG_WARN("llama elastic anchor: stage request failed anchor=%s weight=%s kind=%d rc=%d\n",
+                                           anchor_name, w->name.c_str(), (int) evp->kind, rc);
+                        }
+                    }
+                }
+                return 0;
+            },
+            this);
     }
 
     elastic_plan = plan;
     elastic_route.clear();
     elastic_runtime_route.clear();
     elastic_migrate.clear();
+    elastic_anchor_op.clear();
+    elastic_anchor_fired.clear();
+    elastic_anchor_requests        = 0;
+    elastic_anchor_hits            = 0;
+    elastic_anchor_duplicates      = 0;
+    elastic_anchor_events_fired    = 0;
+    elastic_anchor_load_events     = 0;
+    elastic_anchor_transfer_events = 0;
+    elastic_anchor_xform_events    = 0;
+    elastic_anchor_stage_failures  = 0;
     elastic::ReconcileStats st = elastic_executor->apply(*plan);
 
     // RUNTIME-dispatch op:executor 不灌 static route,改由 op_runtime_dispatch hook
@@ -967,6 +1106,9 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
         if (o.dispatch != elastic::Dispatch::RUNTIME) continue;
         int bid = (o.compute_backend == elastic::Backend::GPU) ? elastic_gpu_id : elastic_cpu_id;
         if (bid >= 0) elastic_runtime_route[o.name] = bid;
+    }
+    for (const auto & o : plan->ops) {
+        elastic_anchor_op[o.name] = o.op_id;
     }
     // 有 RUNTIME op → 装 per-op runtime dispatch hook(接已有 ggml_backend_sched
     // runtime dispatch 通路)。无则不装(STATIC plan 0 开销,桌面 E2E 路径不受影响)。
@@ -983,31 +1125,43 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     if (!keep_reuse) graph_reuse_disable = true;
     graph_invalidate();  // 丢弃当前 cached graph,下次 decode 立即重建
 
-    LLAMA_LOG_INFO("%s: applied plan budget=%lldMiB weights=%d ops=%d "
-                   "prefetch=%d evict=%d route=%d migrate=%d events=%d load=%d dma=%d xform=%d\n",
+    LLAMA_LOG_INFO("%s: applied plan budget=%lldMiB weights=%d ops=%d anchors=%d "
+                   "prefetch=%d evict=%d route=%d migrate=%d events=%d load=%d transfer=%d xform=%d stage_defer=%d\n",
                    __func__, (long long) plan->budget_mib,
                    (int) plan->weights.size(), (int) plan->ops.size(),
+                   (int) elastic_anchor_op.size(),
                    st.n_prefetch, st.n_evict, st.n_route_static, st.n_migrate,
-                   st.n_overlap_events, st.n_load_events, st.n_dma_events, st.n_xform_events);
+                   st.n_overlap_events, st.n_load_events, st.n_transfer_events, st.n_xform_events,
+                   elastic_executor->defer_stage_events() ? 1 : 0);
     return 0;
 }
 
 void llama_context::maybe_apply_plan() {
     if (!elastic_enabled || !elastic_provider) return;
     const int64_t B = elastic_budget_mib();
+    const auto t_get0 = std::chrono::steady_clock::now();
     const elastic::ExecPlan * p = elastic_provider->get(B, 0, 0);
+    const auto t_get1 = std::chrono::steady_clock::now();
+    const double provider_get_ms = std::chrono::duration<double, std::milli>(t_get1 - t_get0).count();
     if (!p) return;
     // 档没变 → 0 开销。判据:指针相同(table 同档同指针),或 budget 档相同
     // (callback provider 按 exact budget 缓存,预算抖 1MB 也不同指针 → 用 budget_mib 兜底防抖)。
     if (p == elastic_last_applied) return;
-    if (elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib) {
+    static const bool callback_no_cache = []() {
+        const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
+        return e && *e && *e != '0';
+    }();
+    if (!callback_no_cache && elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib) {
         elastic_last_applied = p;  // 认作同档,只更新指针,不重 apply
         return;
     }
+    const auto t_apply0 = std::chrono::steady_clock::now();
     apply_exec_plan(p);
+    const auto t_apply1 = std::chrono::steady_clock::now();
+    const double apply_ms = std::chrono::duration<double, std::milli>(t_apply1 - t_apply0).count();
     elastic_last_applied = p;
-    LLAMA_LOG_INFO("%s: budget=%lldMiB → switched to plan(budget_mib=%lld)\n",
-                   __func__, (long long) B, (long long) p->budget_mib);
+    LLAMA_LOG_INFO("%s: budget=%lldMiB → switched to plan(budget_mib=%lld) provider_get_ms=%.3f apply_ms=%.3f\n",
+                   __func__, (long long) B, (long long) p->budget_mib, provider_get_ms, apply_ms);
 }
 
 int llama_context::n_backends() const { return (int)backends.size(); }
@@ -3047,6 +3201,17 @@ int64_t llama_runtime_mem_avail_mb(void) {
 
 bool llama_weight_is_resident(llama_context * /*ctx*/, const char * tensor_name) {
     return llama_weight_residency_query(tensor_name);
+}
+
+int llama_weight_get_state(llama_context * /*ctx*/, const char * tensor_name,
+                           struct llama_elastic_weight_state * out_state) {
+    if (!tensor_name || !out_state) return -1;
+    out_state->flags = llama_weight_state_query(tensor_name);
+    out_state->host_ptr = llama_weight_host_ptr_query(tensor_name);
+    if (out_state->host_ptr) {
+        out_state->flags |= LLAMA_ELASTIC_WEIGHT_DISK_AVAILABLE;
+    }
+    return 0;
 }
 
 int llama_weight_request_prefetch(llama_context * /*ctx*/, const char * tensor_name) {

@@ -159,3 +159,8 @@ third_party/
 runtime/build-android/
 build-android-llama/
 results/
+pkg-snapdragon/
+.history
+.wiki/
+.claude/
+

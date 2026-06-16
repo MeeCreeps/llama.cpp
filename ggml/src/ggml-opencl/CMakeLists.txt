@@ -9,6 +9,7 @@ set(TARGET_NAME ggml-opencl)
 set(_ELASTIC_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime")
 set(_ELASTIC_RUNTIME_SOURCES
     ${_ELASTIC_RUNTIME_DIR}/budget_watcher.cpp
+    ${_ELASTIC_RUNTIME_DIR}/elastic_profile_writer.cpp
     ${_ELASTIC_RUNTIME_DIR}/metrics_logger.cpp
     ${_ELASTIC_RUNTIME_DIR}/weight_buffer_manager.cpp
     ${_ELASTIC_RUNTIME_DIR}/weight_buffer_manager_opencl.cpp

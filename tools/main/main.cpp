@@ -7,7 +7,9 @@
 #include "chat.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -45,6 +47,299 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static std::string shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+struct elastic_online_solver_state {
+    llama_context * ctx = nullptr;
+    nlohmann::json  model_meta;
+    std::vector<std::string> weight_names;
+    std::unordered_map<std::string, nlohmann::json> weight_by_name;
+    nlohmann::json stage_costs;
+    nlohmann::json op_costs;
+    std::string mode;
+    std::string python;
+    std::string solver;
+    std::string model_meta_path;
+    std::string cost_dir;
+    std::string work_dir;
+    int kv_mib = 128;
+    int misc_mib = 256;
+    int safety_mib = 64;
+    int time_limit_ms = 20;
+    uint64_t calls = 0;
+    uint64_t failures = 0;
+    std::vector<llama_plan *> plans;
+};
+
+static double elastic_cost_lookup(const nlohmann::json & records, const std::string & backend,
+                                  const std::string & kind, const std::string & name,
+                                  size_t bytes, double fallback) {
+    const auto & rs = records.value("records", nlohmann::json::array());
+    const nlohmann::json * best_size = nullptr;
+    for (const auto & r : rs) {
+        if (r.value("backend", std::string()) != backend) continue;
+        if (!kind.empty() && r.value("kind", std::string()) != kind) continue;
+        if (r.value("name", std::string()) == name) return r.value("median_ms", fallback);
+        if ((size_t) r.value("bytes", 0) == bytes && best_size == nullptr) best_size = &r;
+    }
+    return best_size ? best_size->value("median_ms", fallback) : fallback;
+}
+
+static double elastic_stage_cost(elastic_online_solver_state * s, const std::string & backend,
+                                 const std::string & kind, const std::string & name, size_t bytes) {
+    const double mb = bytes / 1024.0 / 1024.0;
+    double fb = 0.0;
+    if (kind == "LOAD" || kind == "RELOAD_ENSURE") fb = 0.15 + mb / 1800.0 * 1000.0;
+    else if (kind == "TRANSFER") fb = 0.05 + mb / 6000.0 * 1000.0;
+    else if (kind == "XFORM") fb = 0.10 + mb / 8000.0 * 1000.0;
+    return elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
+}
+
+static double elastic_compute_cost(elastic_online_solver_state * s, const std::string & backend,
+                                   const std::string & name, size_t bytes) {
+    const double mb = bytes / 1024.0 / 1024.0;
+    const double fb = backend == "OpenCL" ? 0.03 + mb * 0.020 : 0.05 + mb * 0.045;
+    return elastic_cost_lookup(s->op_costs, backend, "COMPUTE", name, bytes, fb);
+}
+
+static bool elastic_state_has(uint32_t flags, const std::string & be) {
+    if (be == "GPU") return (flags & LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT) != 0;
+    return (flags & LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT) != 0;
+}
+
+static bool elastic_state_any_resident(uint32_t flags) {
+    return (flags & (LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT |
+                     LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT |
+                     LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
+                     LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT)) != 0;
+}
+
+static std::string elastic_xform_for(const std::string & be, const std::string & quant) {
+    if (be == "GPU") {
+        return (quant == "Q4_0" || quant == "Q8_0" || quant == "MXFP4" || quant.empty()) ? "gpu_convert" : "none";
+    }
+    return "cpu_repack";
+}
+
+static bool elastic_online_generate_native(elastic_online_solver_state * s, int64_t budget_mib, const std::string & plan_path) {
+    struct item {
+        int id;
+        std::string name;
+        std::string backend;
+        std::string quant;
+        int layer;
+        size_t bytes;
+        uint32_t flags;
+        double value;
+    };
+    std::vector<item> items;
+    for (const auto & w : s->model_meta.value("weights", nlohmann::json::array())) {
+        item it;
+        it.id = w.value("weight_id", (int) items.size());
+        it.name = w.value("name", std::string());
+        it.layer = w.value("layer", -1);
+        it.bytes = (size_t) w.value("byte_size", 0);
+        it.quant = w.value("quant", std::string());
+        llama_elastic_weight_state st{};
+        llama_weight_get_state(s->ctx, it.name.c_str(), &st);
+        it.flags = st.flags;
+        const double gpu = elastic_compute_cost(s, "OpenCL", it.name, it.bytes);
+        const double cpu = elastic_compute_cost(s, "CPU_Elastic", it.name, it.bytes);
+        it.backend = gpu <= cpu ? "GPU" : "CPU";
+        if (elastic_state_has(it.flags, it.backend)) {
+            it.value = 1e9 + it.bytes / 1024.0 / 1024.0;
+        } else if (it.backend == "GPU") {
+            it.value = elastic_stage_cost(s, "OpenCL", "LOAD", it.name, it.bytes)
+                     + elastic_stage_cost(s, "OpenCL", "TRANSFER", it.name, it.bytes)
+                     + elastic_stage_cost(s, "OpenCL", "XFORM", it.name, it.bytes);
+        } else {
+            it.value = elastic_stage_cost(s, "CPU_Elastic", "LOAD", it.name, it.bytes)
+                     + elastic_stage_cost(s, "CPU_Elastic", "XFORM", it.name, it.bytes);
+        }
+        if (!it.name.empty()) items.push_back(std::move(it));
+    }
+
+    const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
+    const size_t budget_bytes = usable_mib > 0 ? (size_t) usable_mib * 1024 * 1024 : 0;
+    std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+        const double da = a.value / std::max<size_t>(a.bytes, 1);
+        const double db = b.value / std::max<size_t>(b.bytes, 1);
+        if (da != db) return da > db;
+        return a.value > b.value;
+    });
+    std::unordered_set<int> keep;
+    size_t used = 0;
+    for (const auto & it : items) {
+        if (used + it.bytes <= budget_bytes) {
+            keep.insert(it.id);
+            used += it.bytes;
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const item & a, const item & b) { return a.id < b.id; });
+
+    nlohmann::json plan;
+    plan["schema_version"] = 1;
+    plan["budget_mib"] = budget_mib;
+    plan["kv_bytes"] = (size_t) s->kv_mib * 1024 * 1024;
+    plan["misc_bytes"] = (size_t) s->misc_mib * 1024 * 1024;
+    plan["weights"] = nlohmann::json::array();
+    plan["ops"] = nlohmann::json::array();
+    plan["timeline"] = nlohmann::json::array();
+    plan["pred_per_token_ms"] = 0.0;
+    plan["bottleneck"] = "native_greedy";
+
+    for (const auto & it : items) {
+        const bool resident = keep.find(it.id) != keep.end();
+        const std::string loc = resident ? (it.backend == "GPU" ? "gpu" : "cpu") : "disk";
+        plan["weights"].push_back({
+            {"weight_id", it.id},
+            {"name", it.name},
+            {"layer", it.layer},
+            {"byte_size", it.bytes},
+            {"location", loc},
+            {"pinned", false},
+            {"xform", resident ? elastic_xform_for(it.backend, it.quant) : "none"},
+        });
+        plan["ops"].push_back({
+            {"op_id", it.id},
+            {"name", it.name},
+            {"layer", it.layer},
+            {"compute_backend", it.backend == "GPU" ? "gpu" : "cpu"},
+            {"weight_id", it.id},
+            {"dispatch", "static"},
+            {"migrate", false},
+            {"migrate_from", "cpu"},
+            {"migrate_xform", "none"},
+        });
+        if (!resident) {
+            if (elastic_state_any_resident(it.flags)) {
+                plan["timeline"].push_back({
+                    {"kind", "evict"},
+                    {"weight_id", it.id},
+                    {"from_loc", (it.flags & LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT) ? "gpu" : "cpu"},
+                    {"to_loc", "disk"},
+                    {"engine", "cpu"},
+                    {"anchor_op_id", 0},
+                    {"overlap_group", -1},
+                });
+            }
+            plan["timeline"].push_back({
+                {"kind", "load"}, {"weight_id", it.id}, {"from_loc", "disk"}, {"to_loc", "cpu"},
+                {"engine", "disk"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+            });
+            if (it.backend == "GPU") {
+                plan["timeline"].push_back({
+                    {"kind", "transfer"}, {"weight_id", it.id}, {"from_loc", "cpu"}, {"to_loc", "gpu"},
+                    {"engine", "transfer"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                });
+                plan["timeline"].push_back({
+                    {"kind", "xform"}, {"weight_id", it.id}, {"from_loc", "gpu"}, {"to_loc", "gpu"},
+                    {"engine", "gpu"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                });
+            } else {
+                plan["timeline"].push_back({
+                    {"kind", "xform"}, {"weight_id", it.id}, {"from_loc", "cpu"}, {"to_loc", "cpu"},
+                    {"engine", "cpu"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                });
+            }
+        }
+    }
+
+    std::ofstream f(plan_path);
+    if (!f) return false;
+    f << plan.dump(2) << "\n";
+    return f.good();
+}
+
+static void elastic_online_state_dump(elastic_online_solver_state * s, const std::string & path) {
+    nlohmann::json out;
+    out["weights"] = nlohmann::json::array();
+    for (const auto & name : s->weight_names) {
+        llama_elastic_weight_state st{};
+        int rc = llama_weight_get_state(s->ctx, name.c_str(), &st);
+        nlohmann::json flags = nlohmann::json::array();
+        if (rc == 0) {
+            if (st.flags & LLAMA_ELASTIC_WEIGHT_DISK_AVAILABLE)       flags.push_back("disk_available");
+            if (st.flags & LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT)     flags.push_back("cpu_raw_resident");
+            if (st.flags & LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT) flags.push_back("cpu_compute_resident");
+            if (st.flags & LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT)     flags.push_back("gpu_raw_resident");
+            if (st.flags & LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT) flags.push_back("gpu_compute_resident");
+        }
+        out["weights"].push_back({
+            {"name", name},
+            {"flags", flags},
+        });
+    }
+    std::ofstream f(path);
+    f << out.dump(2) << "\n";
+}
+
+static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void * user_data) {
+    auto * s = static_cast<elastic_online_solver_state *>(user_data);
+    if (!s || !s->ctx) return nullptr;
+    s->calls++;
+
+    std::string prefix = s->work_dir + "/online_" + std::to_string((long long) budget_mib) + "_" + std::to_string((unsigned long long) s->calls);
+    std::string state_path = prefix + "_state.json";
+    std::string plan_path  = prefix + "_plan.json";
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (s->mode == "external") {
+        elastic_online_state_dump(s, state_path);
+        std::ostringstream cmd;
+        cmd << shell_quote(s->python) << " " << shell_quote(s->solver)
+            << " --model-meta " << shell_quote(s->model_meta_path)
+            << " --cost-dir " << shell_quote(s->cost_dir)
+            << " --state " << shell_quote(state_path)
+            << " --budget-mib " << budget_mib
+            << " --kv-mib " << s->kv_mib
+            << " --misc-mib " << s->misc_mib
+            << " --safety-mib " << s->safety_mib
+            << " --time-limit-ms " << s->time_limit_ms
+            << " --out " << shell_quote(plan_path)
+            << " >/dev/null";
+        int rc = std::system(cmd.str().c_str());
+        if (rc != 0) {
+            s->failures++;
+            LOG_ERR("[elastic-online] external solver failed rc=%d budget=%lld cmd=%s\n",
+                    rc, (long long) budget_mib, cmd.str().c_str());
+            return nullptr;
+        }
+    } else {
+        if (!elastic_online_generate_native(s, budget_mib, plan_path)) {
+            s->failures++;
+            LOG_ERR("[elastic-online] native-greedy generator failed budget=%lld out=%s\n",
+                    (long long) budget_mib, plan_path.c_str());
+            return nullptr;
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    llama_plan * plan = llama_plan_load_json(plan_path.c_str());
+    if (!plan) {
+        s->failures++;
+        LOG_ERR("[elastic-online] failed to load generated plan %s\n", plan_path.c_str());
+        return nullptr;
+    }
+    s->plans.push_back(plan);
+    const double gen_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    LOG_INF("[elastic-online] budget=%lld generated %s mode=%s gen_ms=%.3f weights=%d ops=%d calls=%llu failures=%llu\n",
+            (long long) budget_mib, plan_path.c_str(),
+            s->mode.c_str(), gen_ms,
+            llama_plan_n_weights(plan), llama_plan_n_ops(plan),
+            (unsigned long long) s->calls,
+            (unsigned long long) s->failures);
+    return plan;
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -191,6 +486,59 @@ int main(int argc, char ** argv) {
     if (const char * ed = std::getenv("LLAMA_ELASTIC_DIR")) {
         int rc = llama_elastic_enable(ctx, "table", ed);
         LOG_INF("[elastic-fw] enable(table, %s) rc=%d\n", ed, rc);
+    }
+    if (const char * eo = std::getenv("LLAMA_ELASTIC_ONLINE"); eo && *eo && *eo != '0') {
+        static elastic_online_solver_state online;
+        online.ctx = ctx;
+        online.mode = std::getenv("LLAMA_ELASTIC_ONLINE_MODE") ? std::getenv("LLAMA_ELASTIC_ONLINE_MODE") : "native-greedy";
+        online.python = std::getenv("LLAMA_ELASTIC_ONLINE_PYTHON") ? std::getenv("LLAMA_ELASTIC_ONLINE_PYTHON") : "python3";
+        online.solver = std::getenv("LLAMA_ELASTIC_ONLINE_SOLVER") ? std::getenv("LLAMA_ELASTIC_ONLINE_SOLVER") : "runtime/plan/dynamic_budget_solver.py";
+        online.model_meta_path = std::getenv("LLAMA_ELASTIC_MODEL_META") ? std::getenv("LLAMA_ELASTIC_MODEL_META") : "";
+        online.cost_dir = std::getenv("LLAMA_ELASTIC_COST_DIR") ? std::getenv("LLAMA_ELASTIC_COST_DIR") : "";
+        online.work_dir = std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") ? std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") : "/data/local/tmp/elastic/online";
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_KV_MB")) online.kv_mib = std::atoi(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_MISC_MB")) online.misc_mib = std::atoi(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_SAFETY_MB")) online.safety_mib = std::atoi(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS")) online.time_limit_ms = std::atoi(e);
+
+        if (online.model_meta_path.empty() || online.cost_dir.empty()) {
+            LOG_ERR("[elastic-online] LLAMA_ELASTIC_MODEL_META and LLAMA_ELASTIC_COST_DIR are required\n");
+        } else {
+            std::ifstream mf(online.model_meta_path);
+            if (!mf) {
+                LOG_ERR("[elastic-online] failed to open model meta %s\n", online.model_meta_path.c_str());
+            } else {
+                mf >> online.model_meta;
+                if (std::ifstream sf(online.cost_dir + "/stage_costs.json"); sf) sf >> online.stage_costs;
+                if (std::ifstream of(online.cost_dir + "/op_costs.json"); of) of >> online.op_costs;
+                for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
+                    std::string name = w.value("name", std::string());
+                    if (!name.empty()) {
+                        online.weight_by_name[name] = w;
+                        online.weight_names.push_back(std::move(name));
+                    }
+                }
+                std::string mkdir_cmd = "mkdir -p " + shell_quote(online.work_dir);
+                std::system(mkdir_cmd.c_str());
+
+#if defined(_WIN32)
+                _putenv_s("GGML_ELASTIC_CALLBACK_NOCACHE", "1");
+#else
+                setenv("GGML_ELASTIC_CALLBACK_NOCACHE", "1", 1);
+#endif
+                int rc = llama_elastic_enable(ctx, "callback", nullptr);
+                llama_elastic_set_plan_provider(ctx, elastic_online_plan_provider, &online);
+                LOG_INF("[elastic-online] enable(callback) rc=%d mode=%s weights=%zu solver=%s cost_dir=%s work_dir=%s\n",
+                        rc, online.mode.c_str(), online.weight_names.size(), online.solver.c_str(),
+                        online.cost_dir.c_str(), online.work_dir.c_str());
+                std::atexit([]() {
+                    for (llama_plan * p : online.plans) llama_plan_free(p);
+                    LOG_INF("[elastic-online] calls=%llu failures=%llu\n",
+                            (unsigned long long) online.calls,
+                            (unsigned long long) online.failures);
+                });
+            }
+        }
     }
 
     // ===== v8 demo: layer-partition via op_schedule (graph build time) =====

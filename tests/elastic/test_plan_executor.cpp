@@ -31,7 +31,7 @@ struct MockBackend {
     std::vector<int>                         migrate_log;    // 标了 migrate 的 op_id
     int                                      overlap_count = 0;
     int                                      load_count = 0;
-    int                                      dma_count = 0;
+    int                                      transfer_count = 0;
     int                                      xform_count = 0;
 
     ExecSinks make_sinks() {
@@ -48,7 +48,7 @@ struct MockBackend {
         };
         s.enqueue_overlapped = [this](const PlanEvent &) { overlap_count++; };
         s.enqueue_load  = [this](const PlanEvent &) { load_count++; };
-        s.enqueue_dma   = [this](const PlanEvent &) { dma_count++; };
+        s.enqueue_transfer = [this](const PlanEvent &) { transfer_count++; };
         s.enqueue_transform = [this](const PlanEvent &) { xform_count++; };
         return s;
     }
@@ -176,11 +176,30 @@ static void test_anchor_index() {
     CHECK(ex.events_for_anchor(100).size() == 0);
 }
 
+// defer_stage_events:apply 只建 timeline/计数，不立即调用 stage sinks。
+static void test_deferred_stage_events() {
+    MockBackend mb;
+    ExecSinks sinks = mb.make_sinks();
+    sinks.defer_stage_events = true;
+    PlanExecutor ex(std::move(sinks));
+    ExecPlan p = make_plan(10, 4);
+
+    ReconcileStats st = ex.apply(p);
+    CHECK(st.n_overlap_events == 6);
+    CHECK(st.n_load_events == 6);
+    CHECK(mb.overlap_count == 0);
+    CHECK(mb.load_count == 0);
+    CHECK(mb.transfer_count == 0);
+    CHECK(mb.xform_count == 0);
+    CHECK(ex.events_for_anchor(4).size() == 1);
+}
+
 int main() {
     test_fresh_apply();
     test_replan_diff();
     test_runtime_dispatch();
     test_anchor_index();
+    test_deferred_stage_events();
 
     if (g_fail == 0) {
         std::printf("test_plan_executor: ALL PASS\n");

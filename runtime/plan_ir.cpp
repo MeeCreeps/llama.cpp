@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -38,10 +39,10 @@ const char * to_string(Backend b) {
 }
 const char * to_string(Engine e) {
     switch (e) {
-        case Engine::CPU:  return "cpu";
-        case Engine::GPU:  return "gpu";
-        case Engine::DISK: return "disk";
-        case Engine::DMA:  return "dma";
+        case Engine::CPU:      return "cpu";
+        case Engine::GPU:      return "gpu";
+        case Engine::DISK:     return "disk";
+        case Engine::TRANSFER: return "transfer";
     }
     return "?";
 }
@@ -65,7 +66,7 @@ const char * to_string(EvKind k) {
         case EvKind::LOAD:     return "load";
         case EvKind::PREFETCH: return "prefetch";
         case EvKind::EVICT:    return "evict";
-        case EvKind::DMA:      return "dma";
+        case EvKind::TRANSFER: return "transfer";
         case EvKind::XFORM:    return "xform";
     }
     return "?";
@@ -82,6 +83,12 @@ Backend backend_of_location(Location l) {
 
 namespace {
 
+struct NameAnchorHash {
+    size_t operator()(const std::pair<std::string, int> & p) const {
+        return std::hash<std::string>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
+    }
+};
+
 Location location_from_string(const std::string & s) {
     if (s == "gpu")  return Location::GPU;
     if (s == "cpu")  return Location::CPU;
@@ -95,7 +102,7 @@ Backend backend_from_string(const std::string & s) {
 Engine engine_from_string(const std::string & s) {
     if (s == "gpu")  return Engine::GPU;
     if (s == "disk") return Engine::DISK;
-    if (s == "dma")  return Engine::DMA;
+    if (s == "transfer" || s == "dma") return Engine::TRANSFER;
     return Engine::CPU;
 }
 Xform xform_from_string(const std::string & s) {
@@ -109,7 +116,7 @@ Dispatch dispatch_from_string(const std::string & s) {
 EvKind evkind_from_string(const std::string & s) {
     if (s == "load")  return EvKind::LOAD;
     if (s == "evict") return EvKind::EVICT;
-    if (s == "dma")   return EvKind::DMA;
+    if (s == "transfer" || s == "dma") return EvKind::TRANSFER;
     if (s == "xform") return EvKind::XFORM;
     return EvKind::PREFETCH;
 }
@@ -420,11 +427,35 @@ bool plan_from_make_plan_file(const std::string & path, ExecPlan & out, std::str
             Backend cbe = (it != opid.end()) ? out.ops[it->second].compute_backend
                                              : backend_of_location(w.location);
             if (cbe == Backend::GPU)      w.xform = Xform::GPU_CONVERT;
-            else if (cbe == Backend::CPU) w.xform = Xform::NONE;  // 有 generic 退路,默认不 repack
+            else if (cbe == Backend::CPU) w.xform = Xform::CPU_REPACK;
         }
 
         // 5) timeline:把 schedule 的 disk_in / dma_to_gpu / evict_out 映射成 PlanEvent,
         //    anchor = 该 step 正在 compute 的 op。
+        std::unordered_set<std::pair<std::string, int>, NameAnchorHash> explicit_dma;
+        auto stage_anchor_for = [&](const std::string & weight_name,
+                                    const std::string & current_compute,
+                                    int current_anchor) -> int {
+            if (route_backend(weight_name) != Backend::GPU) return current_anchor;
+            if (!current_compute.empty() && route_backend(current_compute) == Backend::GPU) {
+                return current_anchor;
+            }
+            auto it = opid.find(weight_name);
+            return it != opid.end() ? it->second : current_anchor;
+        };
+        for (const auto & st : sched) {
+            const auto & cj = st.value("compute", json::object());
+            std::string cw  = cj.value("weight", std::string());
+            int anchor = -1;
+            if (!cw.empty()) {
+                auto it = opid.find(cw);
+                if (it != opid.end()) anchor = it->second;
+            }
+            for (const auto & d : st.value("dma_to_gpu", json::array())) {
+                std::string nm = d.value("weight", std::string());
+                if (!nm.empty()) explicit_dma.insert({nm, anchor});
+            }
+        }
         for (const auto & st : sched) {
             const auto & cj = st.value("compute", json::object());
             std::string cw  = cj.value("weight", std::string());
@@ -436,27 +467,59 @@ bool plan_from_make_plan_file(const std::string & path, ExecPlan & out, std::str
             for (const auto & d : st.value("disk_in", json::array())) {
                 std::string nm = d.value("weight", std::string());
                 if (nm.empty()) continue;
+                const int wi = ensure_weight(nm);
+                const int event_anchor = stage_anchor_for(nm, cw, anchor);
                 PlanEvent e;
                 e.kind         = EvKind::LOAD;
-                e.weight_id    = ensure_weight(nm);
+                e.weight_id    = wi;
                 e.from_loc     = Location::DISK;
                 e.to_loc       = Location::CPU;
                 e.engine       = Engine::DISK;
-                e.anchor_op_id = anchor;
+                e.anchor_op_id = event_anchor;
                 out.timeline.push_back(e);
+                if (route_backend(nm) == Backend::CPU) {
+                    PlanEvent xf;
+                    xf.kind         = EvKind::XFORM;
+                    xf.weight_id    = wi;
+                    xf.from_loc     = Location::CPU;
+                    xf.to_loc       = Location::CPU;
+                    xf.engine       = Engine::CPU;
+                    xf.anchor_op_id = event_anchor;
+                    out.timeline.push_back(xf);
+                } else if (route_backend(nm) == Backend::GPU &&
+                           explicit_dma.find({nm, anchor}) == explicit_dma.end()) {
+                    PlanEvent transfer;
+                    transfer.kind         = EvKind::TRANSFER;
+                    transfer.weight_id    = wi;
+                    transfer.from_loc     = Location::CPU;
+                    transfer.to_loc       = Location::GPU;
+                    transfer.engine       = Engine::TRANSFER;
+                    transfer.anchor_op_id = event_anchor;
+                    out.timeline.push_back(transfer);
+
+                    PlanEvent xf;
+                    xf.kind         = EvKind::XFORM;
+                    xf.weight_id    = wi;
+                    xf.from_loc     = Location::GPU;
+                    xf.to_loc       = Location::GPU;
+                    xf.engine       = Engine::GPU;
+                    xf.anchor_op_id = event_anchor;
+                    out.timeline.push_back(xf);
+                }
             }
             for (const auto & d : st.value("dma_to_gpu", json::array())) {
                 std::string nm = d.value("weight", std::string());
                 if (nm.empty()) continue;
                 int wi = ensure_weight(nm);
-                PlanEvent dma;
-                dma.kind         = EvKind::DMA;
-                dma.weight_id    = wi;
-                dma.from_loc     = Location::CPU;
-                dma.to_loc       = Location::GPU;
-                dma.engine       = Engine::DMA;
-                dma.anchor_op_id = anchor;
-                out.timeline.push_back(dma);
+                const int event_anchor = stage_anchor_for(nm, cw, anchor);
+                PlanEvent transfer;
+                transfer.kind         = EvKind::TRANSFER;
+                transfer.weight_id    = wi;
+                transfer.from_loc     = Location::CPU;
+                transfer.to_loc       = Location::GPU;
+                transfer.engine       = Engine::TRANSFER;
+                transfer.anchor_op_id = event_anchor;
+                out.timeline.push_back(transfer);
                 // GPU 落地伴随 convert+transpose(跑在 GPU 引擎)
                 PlanEvent xf;
                 xf.kind         = EvKind::XFORM;
@@ -464,7 +527,7 @@ bool plan_from_make_plan_file(const std::string & path, ExecPlan & out, std::str
                 xf.from_loc     = Location::GPU;
                 xf.to_loc       = Location::GPU;
                 xf.engine       = Engine::GPU;
-                xf.anchor_op_id = anchor;
+                xf.anchor_op_id = event_anchor;
                 out.timeline.push_back(xf);
             }
             for (const auto & d : st.value("evict_out", json::array())) {

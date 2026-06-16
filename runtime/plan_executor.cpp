@@ -65,24 +65,26 @@ ReconcileStats PlanExecutor::apply(const ExecPlan & plan) {
         }
     }
 
-    // 4) timeline (D3):已建 anchor 索引;若 sink 想立刻登记也下发一遍。
+    // 4) timeline (D3):已建 anchor 索引;默认兼容旧路径, sink 可立刻下发。
+    // defer_stage_events=true 时只计数/建索引, 由 decode/runtime 到达 anchor 后
+    // 通过 events_for_anchor() 精确触发。
     st.n_overlap_events = (int) plan.timeline.size();
     for (const auto & e : plan.timeline) {
-        if (sinks_.enqueue_overlapped) {
+        if (!sinks_.defer_stage_events && sinks_.enqueue_overlapped) {
             sinks_.enqueue_overlapped(e);
         }
         switch (e.kind) {
             case EvKind::LOAD:
                 st.n_load_events++;
-                if (sinks_.enqueue_load) sinks_.enqueue_load(e);
+                if (!sinks_.defer_stage_events && sinks_.enqueue_load) sinks_.enqueue_load(e);
                 break;
-            case EvKind::DMA:
-                st.n_dma_events++;
-                if (sinks_.enqueue_dma) sinks_.enqueue_dma(e);
+            case EvKind::TRANSFER:
+                st.n_transfer_events++;
+                if (!sinks_.defer_stage_events && sinks_.enqueue_transfer) sinks_.enqueue_transfer(e);
                 break;
             case EvKind::XFORM:
                 st.n_xform_events++;
-                if (sinks_.enqueue_transform) sinks_.enqueue_transform(e);
+                if (!sinks_.defer_stage_events && sinks_.enqueue_transform) sinks_.enqueue_transform(e);
                 break;
             case EvKind::PREFETCH:
             case EvKind::EVICT:

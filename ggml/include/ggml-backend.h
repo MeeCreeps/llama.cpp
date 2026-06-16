@@ -339,6 +339,20 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Callback called immediately before a node is submitted for backend compute.
+    // Unlike eval_callback, this does not request data and does not force a
+    // synchronize after the node. When installed without runtime dispatch, the
+    // scheduler submits nodes one by one in-order so the callback is precise.
+    typedef void (*ggml_backend_sched_pre_op_callback)(
+            const struct ggml_tensor * op,
+            int                        backend_id,
+            void *                     user_data);
+
+    GGML_API void                 ggml_backend_sched_set_pre_op_callback(
+            ggml_backend_sched_t                 sched,
+            ggml_backend_sched_pre_op_callback   callback,
+            void *                               user_data);
+
     // === Runtime per-op dispatch ===
     // 在每个 op 即将 compute 前调一次, hook 返回 target backend_id 可覆盖 split
     // 预分配的 backend. 跟 set_eval_callback 一样会强制 per-op 拆开 graph compute

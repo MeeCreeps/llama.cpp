@@ -3,12 +3,19 @@
 #include "weight_buffer_manager_opencl.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
 namespace elastic {
 
 namespace {
+
+uint64_t now_us() {
+    using clock = std::chrono::steady_clock;
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now().time_since_epoch()).count();
+}
 
 const char *cl_err(cl_int e) {
     switch (e) {
@@ -24,6 +31,34 @@ const char *cl_err(cl_int e) {
         case CL_INVALID_MEM_OBJECT:            return "CL_INVALID_MEM_OBJECT";
         default:                               return "(unknown cl_int)";
     }
+}
+
+const char *device_event_kind_name(wbmcl_device_event_kind kind) {
+    switch (kind) {
+        case wbmcl_device_event_kind::TRANSFER_WRITE:  return "transfer_write";
+        case wbmcl_device_event_kind::XFORM_CONVERT:   return "xform_convert";
+        case wbmcl_device_event_kind::XFORM_TRANSPOSE: return "xform_transpose";
+        case wbmcl_device_event_kind::XFORM_COPY:      return "xform_copy";
+        case wbmcl_device_event_kind::COMPUTE_WAIT:    return "compute_wait";
+    }
+    return "unknown";
+}
+
+const char *stage_detail_kind_name(wbmcl_stage_detail_kind kind) {
+    switch (kind) {
+        case wbmcl_stage_detail_kind::SOA_POOL_LOOKUP:    return "soa_pool_lookup";
+        case wbmcl_stage_detail_kind::PARENT_ALLOC:       return "parent_alloc";
+        case wbmcl_stage_detail_kind::STAGING_ALLOC:      return "staging_alloc";
+        case wbmcl_stage_detail_kind::HOST_SRC:           return "host_src";
+        case wbmcl_stage_detail_kind::WRITE_ENQUEUE:      return "write_enqueue";
+        case wbmcl_stage_detail_kind::SUBBUFFER:          return "subbuffer";
+        case wbmcl_stage_detail_kind::BARRIER_ENQUEUE:    return "barrier_enqueue";
+        case wbmcl_stage_detail_kind::CONVERT_ENQUEUE:    return "convert_enqueue";
+        case wbmcl_stage_detail_kind::TRANSPOSE_ENQUEUE:  return "transpose_enqueue";
+        case wbmcl_stage_detail_kind::FINAL_WAIT_ENQUEUE: return "final_wait_enqueue";
+        case wbmcl_stage_detail_kind::MARK_RESIDENT:      return "mark_resident";
+    }
+    return "unknown";
 }
 
 void host_staging_pool_trim(wbm_opencl_ctx *octx, size_t incoming) {
@@ -114,7 +149,135 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->host_staging_pool_by_size.clear();
     octx->host_staging_pool_order.clear();
     octx->bytes_loaded_total   = 0;
+    octx->stage_load_calls = 0;
+    octx->stage_load_ok = 0;
+    octx->stage_load_us = 0;
+    octx->stage_load_bytes = 0;
+    octx->stage_transfer_calls = 0;
+    octx->stage_transfer_ok = 0;
+    octx->stage_transfer_us = 0;
+    octx->stage_transfer_bytes = 0;
+    octx->stage_xform_calls = 0;
+    octx->stage_xform_ok = 0;
+    octx->stage_xform_us = 0;
+    octx->stage_xform_bytes = 0;
+    octx->soa_pool_hit = 0;
+    octx->soa_pool_miss = 0;
+    octx->parent_pool_hit = 0;
+    octx->parent_pool_miss = 0;
+    octx->parent_create_calls = 0;
+    octx->parent_create_us = 0;
+    octx->parent_create_bytes = 0;
+    octx->device_timing = false;
+    octx->device_events.clear();
+    octx->stage_detail = false;
+    for (auto & b : octx->stage_detail_buckets) b = {};
     return 0;
+}
+
+void wbmcl_record_device_event(wbm_opencl_ctx *octx,
+                               cl_event ev,
+                               wbmcl_device_event_kind kind,
+                               size_t bytes) {
+    if (!octx || !octx->device_timing || !ev) return;
+    if (clRetainEvent(ev) != CL_SUCCESS) return;
+    std::lock_guard<std::mutex> lock(octx->device_timing_mtx);
+    octx->device_events.push_back({ev, kind, bytes});
+}
+
+void wbmcl_dump_device_timing(wbm_opencl_ctx *octx, FILE *out) {
+    if (!octx || !octx->device_timing || !out) return;
+    std::vector<wbmcl_device_event_sample> events;
+    {
+        std::lock_guard<std::mutex> lock(octx->device_timing_mtx);
+        events.swap(octx->device_events);
+    }
+
+    struct bucket {
+        uint64_t n = 0;
+        uint64_t ok = 0;
+        uint64_t ns = 0;
+        size_t bytes = 0;
+    };
+    bucket buckets[5];
+
+    for (auto & sample : events) {
+        cl_event ev = sample.event;
+        const int idx = (int) sample.kind;
+        if (idx < 0 || idx >= 5) {
+            clReleaseEvent(ev);
+            continue;
+        }
+        buckets[idx].n++;
+        buckets[idx].bytes += sample.bytes;
+
+        cl_int werr = clWaitForEvents(1, &ev);
+        if (werr == CL_SUCCESS) {
+            cl_ulong start = 0;
+            cl_ulong end = 0;
+            cl_int serr = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
+            cl_int eerr = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
+            // Some mobile OpenCL drivers return bogus profiling timestamps for
+            // barrier/marker commands. Stage events in this path should be well
+            // below one second; discard outliers instead of polluting the dump.
+            const uint64_t dur = (end >= start) ? (uint64_t) (end - start) : UINT64_MAX;
+            if (serr == CL_SUCCESS && eerr == CL_SUCCESS && dur < 1000ull * 1000ull * 1000ull) {
+                buckets[idx].ok++;
+                buckets[idx].ns += dur;
+            }
+        }
+        clReleaseEvent(ev);
+    }
+
+    std::fprintf(out, "\n=== wbmcl device timing dump (event profiling) ===\n");
+    for (int i = 0; i < 5; ++i) {
+        const auto & b = buckets[i];
+        const double ms = b.ns / 1000000.0;
+        const double mb = b.bytes / 1024.0 / 1024.0;
+        const double avg = b.ok ? ms / b.ok : 0.0;
+        const double mbps = ms > 0 ? mb / (ms / 1000.0) : 0.0;
+        std::fprintf(out,
+                     "device %-15s events=%llu ok=%llu total=%.3f ms avg=%.3f ms MB=%.1f MB/s=%.1f\n",
+                     device_event_kind_name((wbmcl_device_event_kind) i),
+                     (unsigned long long) b.n,
+                     (unsigned long long) b.ok,
+                     ms, avg, mb, mbps);
+    }
+    std::fprintf(out, "==================================================\n");
+}
+
+void wbmcl_record_stage_detail(wbm_opencl_ctx *octx,
+                               wbmcl_stage_detail_kind kind,
+                               uint64_t us,
+                               size_t bytes) {
+    if (!octx || !octx->stage_detail) return;
+    const int idx = (int) kind;
+    if (idx < 0 || idx >= 11) return;
+    std::lock_guard<std::mutex> lock(octx->stage_detail_mtx);
+    auto & b = octx->stage_detail_buckets[idx];
+    b.n++;
+    b.us += us;
+    b.bytes += bytes;
+}
+
+void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
+    if (!octx || !octx->stage_detail || !out) return;
+    wbmcl_stage_detail_bucket buckets[11];
+    {
+        std::lock_guard<std::mutex> lock(octx->stage_detail_mtx);
+        for (int i = 0; i < 11; ++i) buckets[i] = octx->stage_detail_buckets[i];
+    }
+    std::fprintf(out, "\n=== wbmcl stage detail timing dump (host substage) ===\n");
+    for (int i = 0; i < 11; ++i) {
+        const auto & b = buckets[i];
+        const double ms = b.us / 1000.0;
+        const double mb = b.bytes / 1024.0 / 1024.0;
+        const double avg = b.n ? ms / b.n : 0.0;
+        std::fprintf(out, "detail %-18s calls=%llu total=%.3f ms avg=%.3f ms MB=%.1f\n",
+                     stage_detail_kind_name((wbmcl_stage_detail_kind) i),
+                     (unsigned long long) b.n, ms, avg, mb);
+    }
+    std::fprintf(out, "======================================================\n");
 }
 
 int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
@@ -144,22 +307,21 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         return -3;
     }
 
-    // DMA 源解析: LOAD stage 已执行时优先用 host staging；否则默认 mmap host_ptr
+    // Transfer 源解析: LOAD stage 已执行时优先用 host staging；否则默认 mmap host_ptr
     // (隐式 page fault 读盘)。 若注入了
     // direct_read_fn (GGML_ELASTIC_DIRECT_IO=1), 先 O_DIRECT pread 到 thread_local
-    // scratch (绕 page cache, 模拟真 disk 成本), 再用 scratch 做 DMA 源。
+    // scratch (绕 page cache, 模拟真 disk 成本), 再用 scratch 做 transfer 源。
     const void *dma_src = meta->host_ptr;
-    bool use_direct = false;
+    bool use_direct_scratch = false;
     auto staged = octx->host_staging_by_idx.find(idx);
     if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= meta->byte_size) {
         dma_src = staged->second.data();
-        use_direct = true; // staging lifetime is owned by octx, so async DMA is safe.
     } else if (octx->direct_read_fn) {
         static thread_local std::vector<char> direct_scratch;
         if (direct_scratch.size() < meta->byte_size) direct_scratch.resize(meta->byte_size);
         if (octx->direct_read_fn(meta->host_ptr, direct_scratch.data(), meta->byte_size) == 0) {
-            dma_src    = direct_scratch.data();
-            use_direct = true;
+            dma_src            = direct_scratch.data();
+            use_direct_scratch = true;
         } else {
             std::fprintf(stderr, "[wbmcl] direct_read_fn 失败 idx=%d, fallback mmap\n", idx);
         }
@@ -180,10 +342,41 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
                 }
             }
             octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
-            err = clEnqueueWriteBuffer(octx->compute_queue,
-                                       cached, CL_TRUE,
-                                       0, meta->byte_size, dma_src,
-                                       0, nullptr, nullptr);
+            if (octx->xfer_queue) {
+                cl_command_queue use_q = octx->xfer_queue;
+                if (octx->n_xfer_extra > 0) {
+                    unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
+                    if (slot > 0) use_q = octx->xfer_extra[slot - 1];
+                }
+                cl_event write_ev = nullptr;
+                err = clEnqueueWriteBuffer(use_q, cached, use_direct_scratch ? CL_TRUE : CL_FALSE,
+                                           0, meta->byte_size, dma_src,
+                                           0, nullptr, &write_ev);
+                if (err == CL_SUCCESS) {
+                    wbmcl_record_device_event(octx, write_ev,
+                                              wbmcl_device_event_kind::TRANSFER_WRITE,
+                                              meta->byte_size);
+                    clFlush(use_q);
+                    cl_event wait_ev = nullptr;
+                    cl_int berr = clEnqueueBarrierWithWaitList(octx->compute_queue, 1, &write_ev, &wait_ev);
+                    if (berr != CL_SUCCESS) {
+                        std::fprintf(stderr, "[wbmcl retain] clEnqueueBarrierWithWaitList 失败: %s (%d)，退回 wait\n",
+                                     cl_err(berr), berr);
+                        clWaitForEvents(1, &write_ev);
+                    } else {
+                        wbmcl_record_device_event(octx, wait_ev,
+                                                  wbmcl_device_event_kind::COMPUTE_WAIT,
+                                                  meta->byte_size);
+                    }
+                    if (wait_ev) clReleaseEvent(wait_ev);
+                    clReleaseEvent(write_ev);
+                }
+            } else {
+                err = clEnqueueWriteBuffer(octx->compute_queue,
+                                           cached, use_direct_scratch ? CL_TRUE : CL_FALSE,
+                                           0, meta->byte_size, dma_src,
+                                           0, nullptr, nullptr);
+            }
             if (err != CL_SUCCESS) {
                 std::fprintf(stderr, "[wbmcl retain] enqueueWriteBuffer 失败 idx=%d: %s (%d)\n",
                              idx, cl_err(err), err);
@@ -204,9 +397,9 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         const char *e = std::getenv("GGML_ELASTIC_USE_HOST_PTR");
         return e && *e && *e != '0';
     }();
-    // direct 模式跟 USE_HOST_PTR 互斥: direct 要把 scratch 显式 DMA 上去,
+    // direct 模式跟 USE_HOST_PTR 互斥: direct scratch 要显式 transfer 上去,
     // USE_HOST_PTR 是让 driver 直接绑 mmap 指针 (不会读 scratch)。direct 优先。
-    const bool s_use_host_ptr = s_use_host_ptr_env && !use_direct;
+    const bool s_use_host_ptr = s_use_host_ptr_env && !use_direct_scratch;
 
     cl_mem buf = nullptr;
     if (s_use_host_ptr) {
@@ -234,17 +427,17 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
 
     if (octx->xfer_queue) {
         // 多 xfer queue 池：round-robin 派发；micro-bench (probe_overlap.cpp)
-        // 实测 2 queue 并发能让 DMA 吞吐 ~2× (Adreno 单 DMA 没吃满 host→GPU
+        // 实测 2 queue 并发能让 transfer 吞吐 ~2× (Adreno 单队列没吃满 host→GPU
         // staging 的 per-call overhead)。
         cl_command_queue use_q = octx->xfer_queue;
         if (octx->n_xfer_extra > 0) {
             unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
             if (slot > 0) use_q = octx->xfer_extra[slot - 1];
         }
-        // direct 模式: dma_src 是复用的 thread_local scratch, 非阻塞写会在下次
+        // direct scratch 模式: dma_src 是复用的 thread_local scratch, 非阻塞写会在下次
         // ensure_resident 覆盖 scratch 前来不及读完 → 用阻塞写保证 scratch 安全。
         cl_event write_ev = nullptr;
-        err = clEnqueueWriteBuffer(use_q, buf, use_direct ? CL_TRUE : CL_FALSE,
+        err = clEnqueueWriteBuffer(use_q, buf, use_direct_scratch ? CL_TRUE : CL_FALSE,
                                    0, meta->byte_size, dma_src,
                                    0, nullptr, &write_ev);
         if (err != CL_SUCCESS) {
@@ -254,19 +447,28 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
             octx->n_releases += 1;
             return -5;
         }
+        wbmcl_record_device_event(octx, write_ev,
+                                  wbmcl_device_event_kind::TRANSFER_WRITE,
+                                  meta->byte_size);
         clFlush(use_q);
         // compute queue 插 barrier，依赖 write_ev
-        cl_int berr = clEnqueueBarrierWithWaitList(octx->compute_queue, 1, &write_ev, nullptr);
+        cl_event wait_ev = nullptr;
+        cl_int berr = clEnqueueBarrierWithWaitList(octx->compute_queue, 1, &write_ev, &wait_ev);
         if (berr != CL_SUCCESS) {
             std::fprintf(stderr, "[wbmcl] clEnqueueBarrierWithWaitList 失败: %s (%d)，退回 wait\n",
                          cl_err(berr), berr);
             clWaitForEvents(1, &write_ev);
+        } else {
+            wbmcl_record_device_event(octx, wait_ev,
+                                      wbmcl_device_event_kind::COMPUTE_WAIT,
+                                      meta->byte_size);
         }
+        if (wait_ev) clReleaseEvent(wait_ev);
         clReleaseEvent(write_ev);
     } else {
         // 同步路径：单队列阻塞写
         err = clEnqueueWriteBuffer(octx->compute_queue,
-                                   buf, CL_TRUE /* 阻塞 */,
+                                   buf, use_direct_scratch ? CL_TRUE : CL_FALSE,
                                    0, meta->byte_size, dma_src,
                                    0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
@@ -358,6 +560,8 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
     const block_meta *meta = wbm_get(octx->wbm, idx);
     if (!meta) return -2;
     if (!meta->host_ptr || meta->byte_size == 0) return -3;
+    const uint64_t t0 = now_us();
+    octx->stage_load_calls++;
 
     auto & staging = octx->host_staging_by_idx[idx];
     if (staging.size() < meta->byte_size) {
@@ -377,35 +581,62 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
         std::memcpy(staging.data(), meta->host_ptr, meta->byte_size);
     }
     octx->bytes_loaded_total += meta->byte_size;
+    octx->stage_load_ok++;
+    octx->stage_load_bytes += meta->byte_size;
+    octx->stage_load_us += now_us() - t0;
     return 0;
 }
 
 int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    const size_t nbytes = meta ? meta->byte_size : 0;
+    const uint64_t t0 = now_us();
+    octx->stage_transfer_calls++;
+    int rc = 0;
     if (octx && octx->soa_per_idx.find(idx) != octx->soa_per_idx.end()) {
-        return 0;
+        rc = 0;
+    } else {
+        rc = wbmcl_ensure_resident(octx, idx);
+        if (rc == 0) {
+            release_host_staging(octx, idx);
+        }
     }
-    int rc = wbmcl_ensure_resident(octx, idx);
     if (rc == 0) {
-        release_host_staging(octx, idx);
+        octx->stage_transfer_ok++;
+        octx->stage_transfer_bytes += nbytes;
     }
+    octx->stage_transfer_us += now_us() - t0;
     return rc;
 }
 
 int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
     if (!octx || !octx->wbm) return -1;
+    const block_meta *meta0 = wbm_get(octx->wbm, idx);
+    const size_t nbytes = meta0 ? meta0->byte_size : 0;
+    const uint64_t t0 = now_us();
+    octx->stage_xform_calls++;
+    int rc = 0;
     auto it = octx->soa_per_idx.find(idx);
     if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
         const block_meta *meta = wbm_get(octx->wbm, idx);
         if (meta && meta->resident) {
             release_host_staging(octx, idx);
-            return 0;
+            rc = 0;
+        } else {
+            rc = it->second.reload_fn();
+            if (rc == 0) release_host_staging(octx, idx);
         }
-        int rc = it->second.reload_fn();
-        if (rc == 0) release_host_staging(octx, idx);
-        return rc;
+    } else {
+        release_host_staging(octx, idx);
+        rc = 0;
     }
-    release_host_staging(octx, idx);
-    return 0;
+    if (rc == 0) {
+        octx->stage_xform_ok++;
+        octx->stage_xform_bytes += nbytes;
+    }
+    octx->stage_xform_us += now_us() - t0;
+    return rc;
 }
 
 int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
@@ -464,6 +695,9 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
         octx->n_releases += 1;
         return -5;
     }
+    wbmcl_record_device_event(octx, write_ev,
+                              wbmcl_device_event_kind::TRANSFER_WRITE,
+                              meta->byte_size);
     clFlush(use_q);
 
     // 暂存 backend_handle + prefetch_event；不调 mark_resident，等 ensure_resident

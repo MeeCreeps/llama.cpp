@@ -21,9 +21,179 @@
 #include <string.h>
 #include <algorithm>
 #include <cstring>   // std::memcpy (elastic v6 host_ptr 路径用; gcc 下 <string.h> 不够)
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include <chrono>
+#include <new>
+
+namespace {
+
+struct sched_switch_trace_state {
+    bool enabled = false;
+    bool registered = false;
+    uint64_t graphs = 0;
+    uint64_t static_splits = 0;
+    uint64_t static_split_switches = 0;
+    uint64_t static_input_copies = 0;
+    uint64_t static_input_copy_bytes = 0;
+    uint64_t static_input_weight_copies = 0;
+    uint64_t static_input_weight_bytes = 0;
+    uint64_t static_input_activation_copies = 0;
+    uint64_t static_input_activation_bytes = 0;
+    uint64_t static_input_other_copies = 0;
+    uint64_t static_input_other_bytes = 0;
+    uint64_t static_input_to_cpu_copies = 0;
+    uint64_t static_input_to_cpu_bytes = 0;
+    uint64_t static_input_to_gpu_copies = 0;
+    uint64_t static_input_to_gpu_bytes = 0;
+    uint64_t static_input_wait_us = 0;
+    uint64_t static_input_copy_us = 0;
+    uint64_t static_compute_submit_us = 0;
+    uint64_t runtime_groups = 0;
+    uint64_t runtime_group_switches = 0;
+    uint64_t runtime_syncs = 0;
+    uint64_t runtime_migration_groups = 0;
+    uint64_t runtime_input_migrations = 0;
+    uint64_t runtime_input_weight_migrations = 0;
+    uint64_t runtime_input_activation_migrations = 0;
+    uint64_t runtime_input_other_migrations = 0;
+    uint64_t runtime_output_migrations = 0;
+    uint64_t runtime_compute_calls = 0;
+    uint64_t runtime_switch_sync_us = 0;
+    uint64_t runtime_migration_sync_us = 0;
+    uint64_t runtime_input_migration_us = 0;
+    uint64_t runtime_input_weight_migration_us = 0;
+    uint64_t runtime_input_activation_migration_us = 0;
+    uint64_t runtime_input_other_migration_us = 0;
+    uint64_t runtime_output_migration_us = 0;
+    uint64_t runtime_compute_submit_us = 0;
+    uint64_t runtime_migration_group_us = 0;
+};
+
+sched_switch_trace_state & sched_switch_trace();
+
+static uint64_t sched_trace_now_us() {
+    using clock = std::chrono::steady_clock;
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now().time_since_epoch()).count();
+}
+
+static bool sched_trace_is_weight_tensor_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+    const size_t n = std::strlen(name);
+    const char suffix[] = ".weight";
+    const size_t suffix_n = sizeof(suffix) - 1;
+    return n >= suffix_n && std::strcmp(name + n - suffix_n, suffix) == 0;
+}
+
+static bool sched_trace_is_activation_tensor(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return false;
+    }
+    return ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           !sched_trace_is_weight_tensor_name(tensor->name);
+}
+
+static void sched_trace_record_static_copy(const ggml_tensor * tensor, ggml_backend_t dst_backend) {
+    auto & st = sched_switch_trace();
+    if (!st.enabled || tensor == nullptr) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    st.static_input_copies++;
+    st.static_input_copy_bytes += nbytes;
+    if (sched_trace_is_weight_tensor_name(tensor->name) ||
+            (tensor->buffer && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+        st.static_input_weight_copies++;
+        st.static_input_weight_bytes += nbytes;
+    } else if (sched_trace_is_activation_tensor(tensor)) {
+        st.static_input_activation_copies++;
+        st.static_input_activation_bytes += nbytes;
+    } else {
+        st.static_input_other_copies++;
+        st.static_input_other_bytes += nbytes;
+    }
+    if (dst_backend != nullptr) {
+        const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(dst_backend));
+        if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            st.static_input_to_cpu_copies++;
+            st.static_input_to_cpu_bytes += nbytes;
+        } else {
+            st.static_input_to_gpu_copies++;
+            st.static_input_to_gpu_bytes += nbytes;
+        }
+    }
+}
+
+sched_switch_trace_state & sched_switch_trace() {
+    static sched_switch_trace_state s;
+    if (!s.registered) {
+        s.registered = true;
+        const char * e = std::getenv("GGML_SCHED_SWITCH_TRACE");
+        s.enabled = e && *e && *e != '0';
+        if (s.enabled) {
+            std::atexit([]() {
+                const auto & st = sched_switch_trace();
+                std::fprintf(stderr,
+                        "\n=== ggml scheduler switch trace ===\n"
+                        "graphs=%llu static_splits=%llu static_split_switches=%llu\n"
+                        "static_input_copies=%llu bytes=%.3f MiB wait=%.3f ms copy=%.3f ms compute_submit=%.3f ms\n"
+                        "static_input_breakdown: weight=%llu (%.3f MiB) activation=%llu (%.3f MiB) other=%llu (%.3f MiB)\n"
+                        "static_input_direction: to_cpu=%llu (%.3f MiB) to_gpu=%llu (%.3f MiB)\n"
+                        "runtime_groups=%llu runtime_group_switches=%llu runtime_syncs=%llu runtime_compute_calls=%llu\n"
+                        "runtime_migration_groups=%llu input_migrations=%llu output_migrations=%llu\n"
+                        "input_migration_breakdown: weight=%llu (%.3f ms) activation=%llu (%.3f ms) other=%llu (%.3f ms)\n"
+                        "runtime_switch_sync=%.3f ms migration_sync=%.3f ms migration_group_total=%.3f ms\n"
+                        "runtime_input_migration=%.3f ms output_migration=%.3f ms compute_submit=%.3f ms\n"
+                        "===================================\n",
+                        (unsigned long long) st.graphs,
+                        (unsigned long long) st.static_splits,
+                        (unsigned long long) st.static_split_switches,
+                        (unsigned long long) st.static_input_copies,
+                        st.static_input_copy_bytes / 1024.0 / 1024.0,
+                        st.static_input_wait_us / 1000.0,
+                        st.static_input_copy_us / 1000.0,
+                        st.static_compute_submit_us / 1000.0,
+                        (unsigned long long) st.static_input_weight_copies,
+                        st.static_input_weight_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) st.static_input_activation_copies,
+                        st.static_input_activation_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) st.static_input_other_copies,
+                        st.static_input_other_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) st.static_input_to_cpu_copies,
+                        st.static_input_to_cpu_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) st.static_input_to_gpu_copies,
+                        st.static_input_to_gpu_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) st.runtime_groups,
+                        (unsigned long long) st.runtime_group_switches,
+                        (unsigned long long) st.runtime_syncs,
+                        (unsigned long long) st.runtime_compute_calls,
+                        (unsigned long long) st.runtime_migration_groups,
+                        (unsigned long long) st.runtime_input_migrations,
+                        (unsigned long long) st.runtime_output_migrations,
+                        (unsigned long long) st.runtime_input_weight_migrations,
+                        st.runtime_input_weight_migration_us / 1000.0,
+                        (unsigned long long) st.runtime_input_activation_migrations,
+                        st.runtime_input_activation_migration_us / 1000.0,
+                        (unsigned long long) st.runtime_input_other_migrations,
+                        st.runtime_input_other_migration_us / 1000.0,
+                        st.runtime_switch_sync_us / 1000.0,
+                        st.runtime_migration_sync_us / 1000.0,
+                        st.runtime_migration_group_us / 1000.0,
+                        st.runtime_input_migration_us / 1000.0,
+                        st.runtime_output_migration_us / 1000.0,
+                        st.runtime_compute_submit_us / 1000.0);
+            });
+        }
+    }
+    return s;
+}
+
+} // namespace
 
 // Forward decl: llama-mmap.cpp 提供. ggml-opencl-elastic 注册后, 给 evict 的 weight
 // 返回 mmap 区 host_ptr (绕 cl_mem 释放问题). 不可用时返 nullptr.
@@ -738,21 +908,34 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_pre_op_callback callback_pre_op;
+    void * callback_pre_op_user_data;
+
     // Runtime per-op dispatch hook (set via ggml_backend_sched_set_runtime_dispatch).
     // 非 NULL 时强制 per-op iteration in compute_splits (类似 callback_eval 模式),
     // 每个 op 之前调 fn 决定 target backend.
     ggml_backend_sched_runtime_dispatch_fn callback_runtime_dispatch;
     void * callback_runtime_dispatch_user_data;
 
-    // v4: migration temp buffer pool. Key = (backend_id, size_bucket). 跨 decode
+    // v4: migration temp buffer pool. Key = (backend_id, buffer_type, size_bucket). 跨 decode
     // 复用避免反复 alloc/free. 每 bucket 用 power-of-2 round up 减少碎片.
     struct migration_buf_entry {
         int    backend_id;
+        ggml_backend_buffer_type_t buft;
         size_t size;          // 实际 alloc 的 size (round up)
         ggml_backend_buffer_t buf;
         bool   in_use;
     };
     std::vector<migration_buf_entry> migration_pool;
+
+    struct static_weight_mirror_entry {
+        int backend_id;
+        ggml_backend_buffer_t buf;
+        void * data;
+        void * extra;
+        size_t size;
+    };
+    std::unordered_map<std::string, static_weight_mirror_entry> static_weight_mirrors;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1120,23 +1303,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         } else {
             // assigned node: upgrade to higher prio backend if possible
-            for (int b = 0; b < *node_backend_id; b++) {
-                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
-                    bool supported = true;
-                    for (int j = 0; j < GGML_MAX_SRC; j++) {
-                        struct ggml_tensor * src = node->src[j];
-                        if (src == NULL) {
-                            continue;
+            static const bool disable_same_buft_upgrade =
+                std::getenv("GGML_SCHED_DISABLE_SAME_BUFT_UPGRADE") != nullptr;
+            if (!disable_same_buft_upgrade) {
+                for (int b = 0; b < *node_backend_id; b++) {
+                    if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
+                        bool supported = true;
+                        for (int j = 0; j < GGML_MAX_SRC; j++) {
+                            struct ggml_tensor * src = node->src[j];
+                            if (src == NULL) {
+                                continue;
+                            }
+                            if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
+                                supported = false;
+                                break;
+                            }
                         }
-                        if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
-                            supported = false;
+                        if (supported) {
+                            *node_backend_id = b;
+                            SET_CAUSE(node, "3.upg");
                             break;
                         }
-                    }
-                    if (supported) {
-                        *node_backend_id = b;
-                        SET_CAUSE(node, "3.upg");
-                        break;
                     }
                 }
             }
@@ -1454,9 +1641,60 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    auto & switch_trace = sched_switch_trace();
+    if (switch_trace.enabled) {
+        switch_trace.graphs++;
+        switch_trace.static_splits += sched->n_splits;
+        for (int sid = 1; sid < sched->n_splits; ++sid) {
+            if (splits[sid - 1].backend_id != splits[sid].backend_id) {
+                switch_trace.static_split_switches++;
+            }
+        }
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    static const bool en_static_weight_mirror =
+        std::getenv("GGML_SCHED_STATIC_WEIGHT_MIRROR") != nullptr;
+
+    auto apply_static_weight_mirror = [&](ggml_tensor * input, ggml_tensor * input_cpy, int backend_id) -> bool {
+        if (!en_static_weight_mirror || input == nullptr || input_cpy == nullptr) {
+            return false;
+        }
+        if (!(sched_trace_is_weight_tensor_name(input->name) ||
+              (input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS))) {
+            return false;
+        }
+        const std::string key = std::to_string(backend_id) + ":" + input->name;
+        auto it = sched->static_weight_mirrors.find(key);
+        if (it == sched->static_weight_mirrors.end()) {
+            ggml_backend_buffer_type_t buft = sched->bufts[backend_id];
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(input));
+            if (buf == nullptr) {
+                return false;
+            }
+            ggml_tensor * mirror = ggml_dup_tensor_layout(sched->ctx, input);
+            if (mirror == nullptr) {
+                ggml_backend_buffer_free(buf);
+                return false;
+            }
+            ggml_backend_tensor_alloc(buf, mirror, ggml_backend_buffer_get_base(buf));
+            ggml_backend_tensor_copy(input, mirror);
+            auto inserted = sched->static_weight_mirrors.emplace(key, ggml_backend_sched::static_weight_mirror_entry {
+                backend_id,
+                buf,
+                mirror->data,
+                mirror->extra,
+                ggml_nbytes(input),
+            });
+            it = inserted.first;
+        }
+        input_cpy->buffer = it->second.buf;
+        input_cpy->data   = it->second.data;
+        input_cpy->extra  = it->second.extra;
+        return true;
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1471,18 +1709,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                uint64_t wait_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                if (switch_trace.enabled) {
+                    switch_trace.static_input_wait_us += sched_trace_now_us() - wait_t0;
+                }
+                uint64_t copy_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (switch_trace.enabled) {
+                    sched_trace_record_static_copy(input, split_backend);
+                    switch_trace.static_input_copy_us += sched_trace_now_us() - copy_t0;
+                }
             } else {
+                if (apply_static_weight_mirror(input, input_cpy, split_backend_id)) {
+                    continue;
+                }
                 // wait for the split backend to finish using the input before overwriting it
+                uint64_t wait_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+                if (switch_trace.enabled) {
+                    switch_trace.static_input_wait_us += sched_trace_now_us() - wait_t0;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1574,13 +1828,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        uint64_t wait_src_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        if (switch_trace.enabled) {
+                            switch_trace.static_input_wait_us += sched_trace_now_us() - wait_src_t0;
+                        }
+                        uint64_t copy_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (switch_trace.enabled) {
+                            sched_trace_record_static_copy(input, split_backend);
+                            switch_trace.static_input_copy_us += sched_trace_now_us() - copy_t0;
+                        }
                     }
                 }
             }
@@ -1616,6 +1879,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // 不开默认行为不变 (跟 v2 一样 silent fallback).
             static const bool dbg_runtime = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_DEBUG") != nullptr;
             static const bool en_migrate = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_MIGRATE") != nullptr;
+            static const bool en_unified_migration = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_UNIFIED_MIGRATE") != nullptr;
+            static const bool en_unified_activation = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_UNIFIED_ACTIVATION") != nullptr;
+            static const bool en_unified_defer_output = std::getenv("GGML_SCHED_RUNTIME_DISPATCH_UNIFIED_DEFER_OUTPUT") != nullptr;
             int n_overrides_ok = 0, n_overrides_migrate = 0, n_overrides_no_op = 0, n_overrides_no_buft = 0;
             for (int j = 0; j < n_nodes; j++) {
                 struct ggml_tensor * t = split->graph.nodes[j];
@@ -1671,51 +1937,101 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return (k * 31) ^ (uint64_t)backend_id;
             };
 
+            auto choose_migration_buft = [&](int backend_id) -> ggml_backend_buffer_type_t {
+                ggml_backend_t target = sched->backends[backend_id];
+                if (en_unified_migration || en_unified_activation) {
+                    for (int b = 0; b < sched->n_backends; ++b) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+                        if (host_buft != nullptr && ggml_backend_supports_buft(target, host_buft)) {
+                            return host_buft;
+                        }
+                    }
+                }
+                return ggml_backend_get_default_buffer_type(target);
+            };
+
             // Helper: get a temp buffer from pool (alloc if not cached)
             auto get_migration_buffer = [&](int backend_id, size_t need_bytes) -> ggml_backend_buffer_t {
                 // Round up to nearest power of 2 (bucket) to maximize reuse
                 size_t bucket = 4096;
                 while (bucket < need_bytes) bucket <<= 1;
+                ggml_backend_buffer_type_t buft = choose_migration_buft(backend_id);
+                if (!buft) return nullptr;
                 // Search free entry
                 for (size_t i = 0; i < sched->migration_pool.size(); i++) {
                     auto & e = sched->migration_pool[i];
-                    if (!e.in_use && e.backend_id == backend_id && e.size >= bucket) {
+                    if (!e.in_use && e.backend_id == backend_id && e.buft == buft && e.size >= bucket) {
                         e.in_use = true;
                         migration_pool_used.push_back((int)i);
                         return e.buf;
                     }
                 }
                 // Allocate new
-                ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(sched->backends[backend_id]);
-                if (!buft) return nullptr;
                 ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, bucket);
                 if (!buf) return nullptr;
-                sched->migration_pool.push_back({backend_id, bucket, buf, true});
+                sched->migration_pool.push_back({backend_id, buft, bucket, buf, true});
                 migration_pool_used.push_back((int)sched->migration_pool.size() - 1);
                 return buf;
             };
 
             int j = 0;
             ggml_backend_t prev_backend = nullptr;
+            // Per op: save original output tensor's data/buffer + 临时 output buffer
+            struct saved_output { int op_idx; void * data; void * extra; ggml_backend_buffer_t buffer; ggml_backend_buffer_t tmp_buf; };
+            std::vector<char> split_output_has_consumer(n_nodes, 0);
+            if (en_unified_activation) {
+                std::unordered_map<const ggml_tensor *, int> node_index;
+                node_index.reserve(n_nodes);
+                for (int ni = 0; ni < n_nodes; ++ni) {
+                    node_index[split->graph.nodes[ni]] = ni;
+                }
+                for (int ni = 0; ni < n_nodes; ++ni) {
+                    const ggml_tensor * node = split->graph.nodes[ni];
+                    for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                        const ggml_tensor * src = node->src[si];
+                        if (!src) continue;
+                        auto it = node_index.find(src);
+                        if (it != node_index.end()) {
+                            split_output_has_consumer[it->second] = 1;
+                        }
+                    }
+                }
+            }
+            // Unified activation mode keeps redirected intermediate outputs in
+            // host-mapped buffers until the split ends. Downstream CPU/OpenCL ops
+            // can then consume the same storage instead of forcing immediate
+            // copy-back at every backend boundary.
+            std::vector<saved_output> deferred_output_saves;
             while (j < n_nodes) {
                 ggml_backend_t exec_backend = op_backend[j];
+                int exec_backend_id = split_backend_id;
+                for (int b = 0; b < sched->n_backends; b++) {
+                    if (sched->backends[b] == exec_backend) { exec_backend_id = b; break; }
+                }
                 int k = j + 1;
                 while (k < n_nodes && op_backend[k] == exec_backend) k++;
                 if (prev_backend && prev_backend != exec_backend) {
+                    if (switch_trace.enabled) {
+                        switch_trace.runtime_group_switches++;
+                        switch_trace.runtime_syncs++;
+                    }
+                    uint64_t sync_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                     ggml_backend_synchronize(prev_backend);
+                    if (switch_trace.enabled) {
+                        switch_trace.runtime_switch_sync_us += sched_trace_now_us() - sync_t0;
+                    }
+                }
+                if (switch_trace.enabled) {
+                    switch_trace.runtime_groups++;
                 }
 
                 // For migration: per-op input migration (only when exec_backend ≠ split_backend)
                 std::vector<saved_src> group_saves;
-                // Per op: save original output tensor's data/buffer + 临时 output buffer
-                struct saved_output { int op_idx; void * data; ggml_backend_buffer_t buffer; ggml_backend_buffer_t tmp_buf; };
                 std::vector<saved_output> output_saves;
                 if (en_migrate && exec_backend != split_backend) {
+                    bool group_has_migration = false;
                     // 找 target backend id
-                    int target_bid = -1;
-                    for (int b = 0; b < sched->n_backends; b++) {
-                        if (sched->backends[b] == exec_backend) { target_bid = b; break; }
-                    }
                     for (int g = j; g < k; g++) {
                         struct ggml_tensor * op = split->graph.nodes[g];
                         // === Input migration (v4 buffer pool + v5 src cache) ===
@@ -1726,7 +2042,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (ggml_backend_supports_buft(exec_backend, src_buft)) continue;
 
                             // v5: check cache first
-                            uint64_t key = mig_cache_key(src, target_bid);
+                            uint64_t key = mig_cache_key(src, exec_backend_id);
                             auto cit = mig_cache.find(key);
                             if (cit != mig_cache.end()) {
                                 group_saves.push_back({g, s, src});
@@ -1736,7 +2052,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
 
                             size_t need_bytes = ggml_nbytes(src);
-                            ggml_backend_buffer_t tmp_buf = get_migration_buffer(target_bid, need_bytes);
+                            ggml_backend_buffer_t tmp_buf = get_migration_buffer(exec_backend_id, need_bytes);
                             if (!tmp_buf) continue;
                             struct ggml_tensor * tmp = ggml_dup_tensor_layout(sched->ctx, src);
                             if (!tmp) continue;
@@ -1749,11 +2065,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 && src->name[0]) {
                                 host_ptr = llama_weight_host_ptr_query(src->name);
                             }
+                            uint64_t mig_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                             if (host_ptr) {
                                 std::memcpy(ggml_backend_buffer_get_base(tmp_buf),
                                             host_ptr, need_bytes);
                             } else {
                                 ggml_backend_tensor_copy(src, tmp);
+                            }
+                            group_has_migration = true;
+                            if (switch_trace.enabled) {
+                                const uint64_t mig_dt = sched_trace_now_us() - mig_t0;
+                                switch_trace.runtime_input_migrations++;
+                                switch_trace.runtime_input_migration_us += mig_dt;
+                                if (sched_trace_is_weight_tensor_name(src->name)) {
+                                    switch_trace.runtime_input_weight_migrations++;
+                                    switch_trace.runtime_input_weight_migration_us += mig_dt;
+                                } else if (src->name[0] == '\0') {
+                                    switch_trace.runtime_input_activation_migrations++;
+                                    switch_trace.runtime_input_activation_migration_us += mig_dt;
+                                } else {
+                                    switch_trace.runtime_input_other_migrations++;
+                                    switch_trace.runtime_input_other_migration_us += mig_dt;
+                                }
                             }
                             mig_cache[key] = tmp;
                             mig_cache_miss++;
@@ -1761,23 +2094,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             op->src[s] = tmp;
                         }
                         // === Output redirect ===
-                        if (op->buffer) {
+                        if (op->buffer && op->view_src == nullptr) {
                             ggml_backend_buffer_type_t op_buft = ggml_backend_buffer_get_type(op->buffer);
                             if (!ggml_backend_supports_buft(exec_backend, op_buft)) {
                                 size_t out_bytes = ggml_nbytes(op);
-                                ggml_backend_buffer_t out_buf = get_migration_buffer(target_bid, out_bytes);
+                                ggml_backend_buffer_t out_buf = get_migration_buffer(exec_backend_id, out_bytes);
                                 if (out_buf) {
                                     saved_output sv;
                                     sv.op_idx = g;
                                     sv.data   = op->data;
+                                    sv.extra  = op->extra;
                                     sv.buffer = op->buffer;
                                     sv.tmp_buf = out_buf;
                                     output_saves.push_back(sv);
-                                    op->data   = ggml_backend_buffer_get_base(out_buf);
-                                    op->buffer = out_buf;
+                                    op->data   = nullptr;
+                                    op->extra  = nullptr;
+                                    op->buffer = nullptr;
+                                    if (ggml_backend_tensor_alloc(out_buf, op, ggml_backend_buffer_get_base(out_buf)) != GGML_STATUS_SUCCESS) {
+                                        op->data   = sv.data;
+                                        op->extra  = sv.extra;
+                                        op->buffer = sv.buffer;
+                                        output_saves.pop_back();
+                                        continue;
+                                    }
+                                    group_has_migration = true;
+                                    if (switch_trace.enabled) switch_trace.runtime_output_migrations++;
                                 }
                             }
                         }
+                    }
+                    if (group_has_migration && switch_trace.enabled) {
+                        switch_trace.runtime_migration_groups++;
+                    }
+                }
+                if (sched->callback_pre_op) {
+                    for (int g = j; g < k; ++g) {
+                        sched->callback_pre_op(split->graph.nodes[g], exec_backend_id,
+                                                sched->callback_pre_op_user_data);
                     }
                 }
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, k);
@@ -1786,7 +2139,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             k-j, ggml_backend_name(exec_backend), group_saves.size());
                     fflush(stderr);
                 }
+                uint64_t group_t0 = (switch_trace.enabled && (!group_saves.empty() || !output_saves.empty())) ? sched_trace_now_us() : 0;
+                uint64_t submit_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                 enum ggml_status ec = ggml_backend_graph_compute_async(exec_backend, &gv);
+                if (switch_trace.enabled) {
+                    switch_trace.runtime_compute_calls++;
+                    switch_trace.runtime_compute_submit_us += sched_trace_now_us() - submit_t0;
+                }
                 if (dbg_runtime && !group_saves.empty()) {
                     fprintf(stderr, "[migrate] compute returned ec=%d\n", ec);
                     fflush(stderr);
@@ -1794,15 +2153,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // Restore src ptrs after compute (sync first if backend not synchronous)
                 if (!group_saves.empty() || !output_saves.empty()) {
+                    uint64_t sync_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
+                    if (switch_trace.enabled) switch_trace.runtime_syncs++;
                     ggml_backend_synchronize(exec_backend);
+                    if (switch_trace.enabled) {
+                        switch_trace.runtime_migration_sync_us += sched_trace_now_us() - sync_t0;
+                    }
                     // 把 redirect 出去的 output 写回原 backend buffer
                     for (auto & sv : output_saves) {
                         struct ggml_tensor * op = split->graph.nodes[sv.op_idx];
+                        if (en_unified_activation || en_unified_defer_output) {
+                            deferred_output_saves.push_back(sv);
+                            continue;
+                        }
                         void * host_data = op->data;
                         op->data   = sv.data;
+                        op->extra  = sv.extra;
                         op->buffer = sv.buffer;
+                        uint64_t out_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
                         ggml_backend_tensor_set(op, host_data, 0, ggml_nbytes(op));
+                        if (switch_trace.enabled) {
+                            switch_trace.runtime_output_migration_us += sched_trace_now_us() - out_t0;
+                        }
                         // 不 free, 留给 pool 复用
+                    }
+                    if (switch_trace.enabled) {
+                        switch_trace.runtime_migration_group_us += sched_trace_now_us() - group_t0;
                     }
                     output_saves.clear();
                     for (auto & sv : group_saves) {
@@ -1820,8 +2196,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j = k;
             }
             if (prev_backend && prev_backend != split_backend) {
+                uint64_t sync_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
+                if (switch_trace.enabled) switch_trace.runtime_syncs++;
                 ggml_backend_synchronize(prev_backend);
+                if (switch_trace.enabled) {
+                    switch_trace.runtime_switch_sync_us += sched_trace_now_us() - sync_t0;
+                }
             }
+            for (auto it = deferred_output_saves.rbegin(); it != deferred_output_saves.rend(); ++it) {
+                struct ggml_tensor * op = split->graph.nodes[it->op_idx];
+                void * host_data = op->data;
+                op->data   = it->data;
+                op->extra  = it->extra;
+                op->buffer = it->buffer;
+                bool copy_back = true;
+                if (en_unified_activation && it->op_idx >= 0 && it->op_idx < n_nodes) {
+                    copy_back = !split_output_has_consumer[it->op_idx];
+                }
+                if (copy_back) {
+                    uint64_t out_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
+                    ggml_backend_tensor_set(op, host_data, 0, ggml_nbytes(op));
+                    if (switch_trace.enabled) {
+                        switch_trace.runtime_output_migration_us += sched_trace_now_us() - out_t0;
+                    }
+                }
+            }
+            deferred_output_saves.clear();
             // 标记本 split 用过的 pool entry 为 free, 留给后续 split / 后续 decode 复用
             for (int idx : migration_pool_used) sched->migration_pool[idx].in_use = false;
             if (dbg_runtime && (mig_cache_hits + mig_cache_miss) > 0) {
@@ -1830,7 +2230,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         100.0 * mig_cache_hits / (mig_cache_hits + mig_cache_miss));
             }
         } else if (!sched->callback_eval) {
+            if (sched->callback_pre_op) {
+                for (int j = 0; j < split->graph.n_nodes; ++j) {
+                    struct ggml_tensor * t = split->graph.nodes[j];
+                    sched->callback_pre_op(t, split_backend_id, sched->callback_pre_op_user_data);
+                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, j + 1);
+                    uint64_t compute_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
+                    enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                    if (switch_trace.enabled) {
+                        switch_trace.static_compute_submit_us += sched_trace_now_us() - compute_t0;
+                    }
+                    if (ec != GGML_STATUS_SUCCESS) {
+                        return ec;
+                    }
+                }
+                continue;
+            }
+            uint64_t compute_t0 = switch_trace.enabled ? sched_trace_now_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (switch_trace.enabled) {
+                switch_trace.static_compute_submit_us += sched_trace_now_us() - compute_t0;
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1891,6 +2311,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    new (&sched->migration_pool) std::vector<ggml_backend_sched::migration_buf_entry>();
+    new (&sched->static_weight_mirrors) std::unordered_map<std::string, ggml_backend_sched::static_weight_mirror_entry>();
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -1946,6 +2368,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         if (e.buf) ggml_backend_buffer_free(e.buf);
     }
     sched->migration_pool.clear();
+    for (auto & kv : sched->static_weight_mirrors) {
+        if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+    }
+    sched->static_weight_mirrors.clear();
+    sched->static_weight_mirrors.~unordered_map();
+    sched->migration_pool.~vector();
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2055,6 +2483,15 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_pre_op_callback(
+        ggml_backend_sched_t                 sched,
+        ggml_backend_sched_pre_op_callback   callback,
+        void *                               user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_pre_op = callback;
+    sched->callback_pre_op_user_data = user_data;
 }
 
 void ggml_backend_sched_set_runtime_dispatch(

@@ -109,10 +109,22 @@ bool llama_weight_pin_query   (const char * name, int layer, size_t byte_size);
 // Public API (llama_weight_is_resident / _request_prefetch / _request_evict) lives
 // in llama.h and delegates here.
 typedef bool (*llama_weight_residency_fn_t)(const char * name, void * user_data);
+typedef uint32_t (*llama_weight_state_fn_t)(const char * name, void * user_data);
+
+enum llama_weight_state_flags_internal {
+    LLAMA_WEIGHT_STATE_DISK_AVAILABLE       = 1u << 0,
+    LLAMA_WEIGHT_STATE_CPU_RAW_RESIDENT     = 1u << 1,
+    LLAMA_WEIGHT_STATE_CPU_COMPUTE_RESIDENT = 1u << 2,
+    LLAMA_WEIGHT_STATE_GPU_RAW_RESIDENT     = 1u << 3,
+    LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT = 1u << 4,
+};
 // evict=false → prefetch, evict=true → evict. Return 0 on enqueue OK, <0 fail.
 typedef int  (*llama_weight_movement_fn_t)(const char * name, bool evict, void * user_data);
-// 分阶段 movement: load = disk/mmap->host, dma = host->backend.
+// 分阶段 movement: load = disk/mmap->host, transfer = host->backend.
 typedef int  (*llama_weight_stage_fn_t)(const char * name, const char * stage, void * user_data);
+// Anchor-stage trigger: backend calls this when a weight/op anchor is reached
+// during real graph execution. Return 0 if handled, -2 if not handled.
+typedef int  (*llama_weight_anchor_fn_t)(const char * anchor_name, void * user_data);
 
 // Explicit layout transform hook. This is separate from stage strings so runtime plans can
 // request a concrete transform implementation instead of treating transform as generic movement.
@@ -124,14 +136,18 @@ enum llama_weight_transform_kind {
 typedef int  (*llama_weight_transform_fn_t)(const char * name, llama_weight_transform_kind kind, void * user_data);
 
 void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data);
+void llama_weight_state_register    (llama_weight_state_fn_t     fn, void * user_data);
 void llama_weight_movement_register (llama_weight_movement_fn_t  fn, void * user_data);
 void llama_weight_stage_register    (llama_weight_stage_fn_t     fn, void * user_data);
+void llama_weight_anchor_register   (llama_weight_anchor_fn_t    fn, void * user_data);
 void llama_weight_transform_register(llama_weight_transform_fn_t fn, void * user_data);
 
 // Public query/action used by llama_context.cpp.
 bool llama_weight_residency_query(const char * name);
+uint32_t llama_weight_state_query(const char * name);
 int  llama_weight_movement_request(const char * name, bool evict);
 int  llama_weight_stage_request   (const char * name, const char * stage);
+int  llama_weight_anchor_request  (const char * anchor_name);
 int  llama_weight_transform_request(const char * name, llama_weight_transform_kind kind);
 
 // === Weight host (mmap) pointer query ===

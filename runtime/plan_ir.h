@@ -31,7 +31,7 @@ enum class Location { GPU = 0, CPU = 1, DISK = 2 };
 enum class Backend { CPU = 0, GPU = 1, NPU = 2 /*未来*/ };
 
 // 物理引擎:overlap = 各引擎 busy 的 max。一段活儿落哪条引擎,决定它能跟谁并行。
-enum class Engine { CPU = 0, GPU = 1, DISK = 2, DMA = 3 };
+enum class Engine { CPU = 0, GPU = 1, DISK = 2, TRANSFER = 3 };
 
 // layout 变换 + 它跑在哪条引擎
 //   CPU_REPACK  : 引擎=CPU,可被 generic 退路免掉;∥ GPU matmul/disk,不 ∥ CPU matmul
@@ -45,10 +45,10 @@ enum class Dispatch { STATIC = 0, RUNTIME = 1 };
 
 // 时间线事件类型
 //   LOAD     : disk / mmap -> host staging, 不创建 backend layout
-//   DMA      : host staging -> backend raw/staging buffer
+//   TRANSFER : host staging -> backend-visible raw/staging buffer
 //   XFORM    : backend/raw buffer -> compute layout (OpenCL SOA+transpose, CPU repack)
-//   PREFETCH : legacy combined event; executor/backend may implement as LOAD+DMA+XFORM
-enum class EvKind { LOAD = 0, PREFETCH = 1, EVICT = 2, DMA = 3, XFORM = 4 };
+//   PREFETCH : legacy combined event; executor/backend may implement as LOAD+TRANSFER+XFORM
+enum class EvKind { LOAD = 0, PREFETCH = 1, EVICT = 2, TRANSFER = 3, XFORM = 4 };
 
 // ── 放置:每个 weight 当前在哪 / 取用时的变换 ── (决策 D2a)
 struct WeightPlan {

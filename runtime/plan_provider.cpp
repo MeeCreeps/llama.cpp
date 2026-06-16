@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -46,9 +47,14 @@ public:
             auto plan = std::make_unique<ExecPlan>();
             std::string err;
             std::string path = dir_ + "/" + pick->file;
-            if (!plan_from_make_plan_file(path, *plan, &err)) {
-                last_err_ = err;
-                return nullptr;
+            if (!plan_from_json_file(path, *plan, &err) || plan->weights.empty()) {
+                ExecPlan mp;
+                std::string err2;
+                if (!plan_from_make_plan_file(path, mp, &err2)) {
+                    last_err_ = "native: " + err + "; make_plan: " + err2;
+                    return nullptr;
+                }
+                *plan = std::move(mp);
             }
             // 补上 kv/misc(plan_*.json 不含;由调用方现场给)
             plan->kv_bytes   = kv_bytes;
@@ -114,10 +120,21 @@ namespace {
 class CallbackProvider : public PlanProvider {
 public:
     explicit CallbackProvider(std::function<bool(int64_t, ExecPlan &)> fn)
-        : fn_(std::move(fn)) {}
+        : fn_(std::move(fn)) {
+        const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
+        no_cache_ = e && *e && *e != '0';
+    }
 
     const ExecPlan * get(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) override {
         if (!fn_) return nullptr;
+        if (no_cache_) {
+            auto plan = std::make_unique<ExecPlan>();
+            if (!fn_(budget_mib, *plan)) return nullptr;
+            plan->kv_bytes   = kv_bytes;
+            plan->misc_bytes = misc_bytes;
+            history_.push_back(std::move(plan));
+            return history_.back().get();
+        }
         // 按 budget 缓存以保证指针稳定(同 budget → 同 plan 指针)。
         auto it = cache_.find(budget_mib);
         if (it == cache_.end()) {
@@ -130,11 +147,13 @@ public:
         return it->second.get();
     }
 
-    int n_bands() const override { return (int) cache_.size(); }
+    int n_bands() const override { return (int) (cache_.size() + history_.size()); }
 
 private:
     std::function<bool(int64_t, ExecPlan &)>         fn_;
     std::map<int64_t, std::unique_ptr<ExecPlan>>     cache_;
+    std::vector<std::unique_ptr<ExecPlan>>           history_;
+    bool                                             no_cache_ = false;
 };
 
 }  // namespace

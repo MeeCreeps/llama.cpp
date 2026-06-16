@@ -39,11 +39,14 @@ struct ExecSinks {
     // overlap(D3):把一个搬运/变换事件挂到某 op 的 compute 上并行。底层 = 异步 prefetch 入队。
     std::function<void(const PlanEvent & ev)>             enqueue_overlapped;
 
-    // 分阶段执行(D3):LOAD / DMA / TRANSFORM 可分别落到 disk / dma / transform engine。
-    // 未设置时 executor 只记录 timeline；设置后 apply() 会按 plan.timeline 顺序下发。
+    // 分阶段执行(D3):LOAD / TRANSFER / TRANSFORM 可分别落到 disk / transfer / transform engine。
+    // 未设置时 executor 只记录 timeline；设置后 apply() 默认会按 plan.timeline 顺序下发。
+    // defer_stage_events=true 时 apply() 只建 anchor index，不立即下发；decode/runtime
+    // 到达 anchor 后再通过 events_for_anchor() 触发。
     std::function<void(const PlanEvent & ev)>             enqueue_load;
-    std::function<void(const PlanEvent & ev)>             enqueue_dma;
+    std::function<void(const PlanEvent & ev)>             enqueue_transfer;
     std::function<void(const PlanEvent & ev)>             enqueue_transform;
+    bool                                                  defer_stage_events = false;
 };
 
 // apply 的统计(单测断言 + 日志用)
@@ -56,7 +59,7 @@ struct ReconcileStats {
     int n_migrate        = 0;  // 标了迁移的 op 数
     int n_overlap_events = 0;  // 记录的 timeline 事件数
     int n_load_events    = 0;  // LOAD stage 数
-    int n_dma_events     = 0;  // DMA stage 数
+    int n_transfer_events = 0;  // TRANSFER stage 数
     int n_xform_events   = 0;  // XFORM stage 数
 };
 
@@ -77,6 +80,7 @@ public:
 
     // anchor 在某个 op 上的所有 timeline 事件(decode 到该 op 时拿去 overlap enqueue)。
     const std::vector<const PlanEvent *> & events_for_anchor(int op_id) const;
+    bool defer_stage_events() const { return sinks_.defer_stage_events; }
 
     const ExecPlan * current() const { return plan_; }
 
