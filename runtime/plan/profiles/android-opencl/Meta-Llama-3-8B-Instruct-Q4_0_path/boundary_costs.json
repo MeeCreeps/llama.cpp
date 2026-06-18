@@ -1,0 +1,9 @@
+{
+  "device": "android-opencl-op13",
+  "input_rows": 1940,
+  "model": "Meta-Llama-3-8B-Instruct-Q4_0",
+  "records": [],
+  "source_csv": [
+    ".wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/profile_path_8b_opencl_n4.csv"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "device": "android-opencl",
+  "input_rows": 17,
+  "model": "Meta-Llama-3-8B-Instruct-Q4_0",
+  "records": [
+    {
+      "backend": "CPU_Elastic",
+      "bytes": 0,
+      "extra": "delegate_cpu_graph",
+      "kind": "COMPUTE_GRAPH",
+      "mbps": 0.0,
+      "mean_ms": 0.06376217647058824,
+      "median_ms": 0.010677,
+      "name": "ggml_cgraph",
+      "op": "GRAPH",
+      "p90_ms": 0.062249800000000036,
+      "quant": "",
+      "samples": 17,
+      "shape": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_bytes": 0,
+      "total_ms": 1.083957
+    }
+  ],
+  "source_csv": [
+    ".wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/logs/matrix15/profile_8b_bootstrap.csv"
+  ]
+}

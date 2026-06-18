@@ -23,6 +23,39 @@
 // Forward decls for use before file-scope definitions later in this TU.
 static size_t read_mem_available_mb();
 
+static uint64_t elastic_mix_u64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
+static uint64_t elastic_plan_signature(const elastic::ExecPlan & p) {
+    uint64_t h = 1469598103934665603ULL;
+    h = elastic_mix_u64(h, p.weights.size());
+    for (const auto & w : p.weights) {
+        h = elastic_mix_u64(h, (uint64_t) w.weight_id);
+        h = elastic_mix_u64(h, (uint64_t) w.location);
+        h = elastic_mix_u64(h, w.pinned ? 1ULL : 0ULL);
+    }
+    h = elastic_mix_u64(h, p.ops.size());
+    for (const auto & o : p.ops) {
+        h = elastic_mix_u64(h, (uint64_t) o.op_id);
+        h = elastic_mix_u64(h, (uint64_t) o.dispatch);
+        h = elastic_mix_u64(h, (uint64_t) o.compute_backend);
+        h = elastic_mix_u64(h, o.migrate ? 1ULL : 0ULL);
+        h = elastic_mix_u64(h, (uint64_t) o.migrate_from);
+        h = elastic_mix_u64(h, (uint64_t) o.migrate_xform);
+    }
+    h = elastic_mix_u64(h, p.timeline.size());
+    for (const auto & e : p.timeline) {
+        h = elastic_mix_u64(h, (uint64_t) e.kind);
+        h = elastic_mix_u64(h, (uint64_t) e.weight_id);
+        h = elastic_mix_u64(h, (uint64_t) e.anchor_op_id);
+        h = elastic_mix_u64(h, (uint64_t) e.from_loc);
+        h = elastic_mix_u64(h, (uint64_t) e.to_loc);
+    }
+    return h;
+}
+
 //
 // llama_context
 //
@@ -1138,21 +1171,50 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
 
 void llama_context::maybe_apply_plan() {
     if (!elastic_enabled || !elastic_provider) return;
-    const int64_t B = elastic_budget_mib();
+    int64_t B = elastic_budget_mib();
+    static const int64_t budget_bucket_mib = []() {
+        const char * e = std::getenv("GGML_ELASTIC_BUDGET_BUCKET_MB");
+        if (!e || !*e) return (int64_t) 1;
+        const int64_t v = std::atoll(e);
+        return v > 1 ? v : (int64_t) 1;
+    }();
+    if (budget_bucket_mib > 1 && B > 0) {
+        B = (B / budget_bucket_mib) * budget_bucket_mib;
+    }
+    static const bool callback_no_cache = []() {
+        const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
+        return e && *e && *e != '0';
+    }();
+    static const bool callback_apply_same_budget = []() {
+        const char * e = std::getenv("GGML_ELASTIC_CALLBACK_APPLY_SAME_BUDGET");
+        return e && *e && *e != '0';
+    }();
+
+    // 档没变 → 0 开销。callback no-cache 也默认按 budget 档防抖,避免稳定低预算
+    // 下每 token 重复生成/应用同一份 stage plan；需要复现旧行为时可打开上面的 env。
+    if (elastic_last_applied && B == elastic_last_applied->budget_mib &&
+        (!callback_no_cache || !callback_apply_same_budget)) {
+        return;
+    }
+
     const auto t_get0 = std::chrono::steady_clock::now();
     const elastic::ExecPlan * p = elastic_provider->get(B, 0, 0);
     const auto t_get1 = std::chrono::steady_clock::now();
     const double provider_get_ms = std::chrono::duration<double, std::milli>(t_get1 - t_get0).count();
     if (!p) return;
-    // 档没变 → 0 开销。判据:指针相同(table 同档同指针),或 budget 档相同
-    // (callback provider 按 exact budget 缓存,预算抖 1MB 也不同指针 → 用 budget_mib 兜底防抖)。
+    // 指针相同(table 同档同指针) 或 provider 量化到同 budget 档时,只更新指针。
     if (p == elastic_last_applied) return;
-    static const bool callback_no_cache = []() {
-        const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
-        return e && *e && *e != '0';
-    }();
-    if (!callback_no_cache && elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib) {
+    if (elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib &&
+        (!callback_no_cache || !callback_apply_same_budget)) {
         elastic_last_applied = p;  // 认作同档,只更新指针,不重 apply
+        return;
+    }
+    const uint64_t sig = elastic_plan_signature(*p);
+    if (elastic_last_applied && sig == elastic_last_plan_signature &&
+        (!callback_no_cache || !callback_apply_same_budget)) {
+        elastic_last_applied = p;
+        LLAMA_LOG_INFO("%s: budget=%lldMiB → plan(budget_mib=%lld) execution-equivalent, skipped apply provider_get_ms=%.3f\n",
+                       __func__, (long long) B, (long long) p->budget_mib, provider_get_ms);
         return;
     }
     const auto t_apply0 = std::chrono::steady_clock::now();
@@ -1160,6 +1222,7 @@ void llama_context::maybe_apply_plan() {
     const auto t_apply1 = std::chrono::steady_clock::now();
     const double apply_ms = std::chrono::duration<double, std::milli>(t_apply1 - t_apply0).count();
     elastic_last_applied = p;
+    elastic_last_plan_signature = sig;
     LLAMA_LOG_INFO("%s: budget=%lldMiB → switched to plan(budget_mib=%lld) provider_get_ms=%.3f apply_ms=%.3f\n",
                    __func__, (long long) B, (long long) p->budget_mib, provider_get_ms, apply_ms);
 }

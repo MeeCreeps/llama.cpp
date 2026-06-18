@@ -1,0 +1,44 @@
+{
+  "index": [
+    {
+      "budget_mib": 3328,
+      "file": "plan_3328MiB.json"
+    },
+    {
+      "budget_mib": 3584,
+      "file": "plan_3584MiB.json"
+    },
+    {
+      "budget_mib": 3840,
+      "file": "plan_3840MiB.json"
+    },
+    {
+      "budget_mib": 4096,
+      "file": "plan_4096MiB.json"
+    },
+    {
+      "budget_mib": 4352,
+      "file": "plan_4352MiB.json"
+    },
+    {
+      "budget_mib": 4608,
+      "file": "plan_4608MiB.json"
+    },
+    {
+      "budget_mib": 4864,
+      "file": "plan_4864MiB.json"
+    },
+    {
+      "budget_mib": 5120,
+      "file": "plan_5120MiB.json"
+    },
+    {
+      "budget_mib": 5376,
+      "file": "plan_5376MiB.json"
+    },
+    {
+      "budget_mib": 5632,
+      "file": "plan_5632MiB.json"
+    }
+  ]
+}

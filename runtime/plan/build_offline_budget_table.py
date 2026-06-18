@@ -20,6 +20,8 @@ def main() -> None:
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
     ap.add_argument("--time-limit-ms", type=int, default=20)
+    ap.add_argument("--allow-cpu-fallback", action="store_true")
+    ap.add_argument("--transition-weight", type=float, default=1.0)
     args = ap.parse_args()
 
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
@@ -42,8 +44,11 @@ def main() -> None:
             "--misc-mib", str(args.misc_mib),
             "--safety-mib", str(args.safety_mib),
             "--time-limit-ms", str(args.time_limit_ms),
+            "--transition-weight", str(args.transition_weight),
             "--out", str(out),
         ]
+        if args.allow_cpu_fallback:
+            cmd.append("--allow-cpu-fallback")
         subprocess.run(cmd, check=True)
         index.append({"budget_mib": b, "file": out.name})
 
@@ -53,4 +58,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

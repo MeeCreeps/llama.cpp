@@ -333,6 +333,7 @@ private:
     std::unique_ptr<elastic::PlanProvider> elastic_provider;   // dynamic 模式
     const elastic::ExecPlan * elastic_plan         = nullptr;  // 当前已 apply(不拥有)
     const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
+    uint64_t elastic_last_plan_signature = 0;                  // execution-equivalence debounce
     std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id (STATIC routing)
     std::unordered_map<std::string, int> elastic_runtime_route;// weight 名 → backend_id (RUNTIME dispatch, M5)
     std::unordered_map<std::string, int> elastic_anchor_op;    // anchor weight/op 名 → op_id

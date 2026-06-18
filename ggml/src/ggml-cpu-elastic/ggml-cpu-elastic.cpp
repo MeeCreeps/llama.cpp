@@ -411,6 +411,25 @@ void cpu_profile_compute_graph(const ggml_cgraph *cgraph, double ms, int ok) {
     elastic::profile_write(rec);
 }
 
+void cpu_profile_compute_node(const ggml_tensor *node, int op_id, double ms, int ok) {
+    if (!elastic::profile_enabled() || !node) return;
+    elastic::profile_record rec;
+    rec.backend = "CPU_Elastic";
+    rec.kind    = "COMPUTE";
+    rec.name    = node->name;
+    rec.op      = ggml_op_name(node->op);
+    rec.op_id   = op_id;
+    rec.ne[0]   = node->ne[0];
+    rec.ne[1]   = node->ne[1];
+    rec.ne[2]   = node->ne[2];
+    rec.ne[3]   = node->ne[3];
+    rec.bytes   = ggml_nbytes(node);
+    rec.ms      = ms;
+    rec.ok      = ok;
+    rec.extra   = "chunk_size_1";
+    elastic::profile_write(rec);
+}
+
 // ============================================================
 // Buffer context: 一整块 region + tensor → wbm_idx 映射
 // ============================================================
@@ -827,7 +846,8 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     using clk = std::chrono::steady_clock;
     clk::time_point t_total_start = clk::now();
     clk::time_point t_io_start{};
-    if (s->profile) t_io_start = clk::now();
+    const bool csv_profile = s->profile_csv;
+    if (s->profile || csv_profile) t_io_start = clk::now();
 
     // 工具：从 tensor 找它的 wbm_idx + buffer ctx + handle。如果 t 本身是
     // view 没注册，跟着 view_src 链找到原始 tensor（reload 时要把原始 weight
@@ -995,6 +1015,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
         pick_some_ctx(cgraph->nodes[i0]);
 
         ggml_status st_chunk = GGML_STATUS_SUCCESS;
+        double chunk_compute_total_ms = 0.0;
         // Per chunk pending list. pending[k] = chunks N+1, N+2, ..., N+lookahead.
         // Index 0 always = next chunk's pending (to wait before computing next).
         std::vector<std::vector<std::pair<int,size_t>>> pending_q;
@@ -1027,7 +1048,14 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
 
                 // Compute current chunk in parallel with kernel processing pre-submitted IOs
                 struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
+                const auto t_chunk_start = clk::now();
                 st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
+                const auto t_chunk_end = clk::now();
+                const double chunk_ms = std::chrono::duration<double, std::milli>(t_chunk_end - t_chunk_start).count();
+                chunk_compute_total_ms += chunk_ms;
+                if (csv_profile && s_chunk_size == 1) {
+                    cpu_profile_compute_node(cgraph->nodes[i0], i0, chunk_ms, st_chunk == GGML_STATUS_SUCCESS ? 1 : 0);
+                }
 
                 // Wait for next chunk's IO (front of pending_q) before computing it next iter
                 if (!pending_q.empty()) {
@@ -1044,7 +1072,14 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                     });
                 }
                 struct ggml_cgraph chunk = ggml_graph_view(cgraph, i0, i1);
+                const auto t_chunk_start = clk::now();
                 st_chunk = bctx->cpu->iface.graph_compute(bctx->cpu, &chunk);
+                const auto t_chunk_end = clk::now();
+                const double chunk_ms = std::chrono::duration<double, std::milli>(t_chunk_end - t_chunk_start).count();
+                chunk_compute_total_ms += chunk_ms;
+                if (csv_profile && s_chunk_size == 1) {
+                    cpu_profile_compute_node(cgraph->nodes[i0], i0, chunk_ms, st_chunk == GGML_STATUS_SUCCESS ? 1 : 0);
+                }
                 if (worker.joinable()) worker.join();
             }
             if (st_chunk != GGML_STATUS_SUCCESS) break;
@@ -1059,6 +1094,10 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
             // Roughly attribute: count ensure as IO, graph_compute as compute.
             // (we don't have fine-grained per-chunk timing without more invasive code)
             s->profile_n_graph += 1;
+            s->profile_compute_total_ms += chunk_compute_total_ms;
+        }
+        if (csv_profile) {
+            cpu_profile_compute_graph(cgraph, chunk_compute_total_ms, st_chunk == GGML_STATUS_SUCCESS ? 1 : 0);
         }
         // 4) evict to target
         if (s->bw_inited && some_ctx) {
@@ -1116,7 +1155,6 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
     }
     // 3) 数据齐了 → delegate compute
     clk::time_point t_compute_start{};
-    const bool csv_profile = s->profile_csv;
     if (s->profile || csv_profile) {
         auto t_io_end = clk::now();
         if (s->profile) {

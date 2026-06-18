@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "http.h"
 #include "console.h"
 #include "log.h"
 #include "sampling.h"
@@ -20,10 +21,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <limits>
 #include <nlohmann/json.hpp>
+#include <cerrno>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #elif defined (_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -58,16 +62,61 @@ static std::string shell_quote(const std::string & s) {
     return out;
 }
 
+static bool mkdir_p_local(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::string cur;
+    cur.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        const char c = path[i];
+        cur.push_back(c);
+        if (c != '/' && i + 1 != path.size()) {
+            continue;
+        }
+        while (i + 1 < path.size() && path[i + 1] == '/') {
+            ++i;
+        }
+        if (cur.empty() || cur == "/") {
+            continue;
+        }
+#if defined(_WIN32)
+        if (!CreateDirectoryA(cur.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+#else
+        if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST) {
+            return false;
+        }
+#endif
+    }
+    return true;
+}
+
 struct elastic_online_solver_state {
+    struct item_base {
+        int id = -1;
+        std::string name;
+        std::string backend;
+        std::string quant;
+        int layer = -1;
+        size_t bytes = 0;
+        double resident_value_gpu = 0.0;
+        double resident_value_cpu = 0.0;
+    };
+
     llama_context * ctx = nullptr;
     nlohmann::json  model_meta;
     std::vector<std::string> weight_names;
     std::unordered_map<std::string, nlohmann::json> weight_by_name;
+    std::vector<item_base> item_bases;
     nlohmann::json stage_costs;
     nlohmann::json op_costs;
     std::string mode;
     std::string python;
     std::string solver;
+    std::string remote_url;
     std::string model_meta_path;
     std::string cost_dir;
     std::string work_dir;
@@ -75,8 +124,12 @@ struct elastic_online_solver_state {
     int misc_mib = 256;
     int safety_mib = 64;
     int time_limit_ms = 20;
+    bool allow_cpu_fallback = false;
+    double transition_weight = 1.0;
     uint64_t calls = 0;
     uint64_t failures = 0;
+    double remote_wall_ms_total = 0.0;
+    double remote_server_ms_total = 0.0;
     std::vector<llama_plan *> plans;
 };
 
@@ -94,6 +147,64 @@ static double elastic_cost_lookup(const nlohmann::json & records, const std::str
     return best_size ? best_size->value("median_ms", fallback) : fallback;
 }
 
+static bool elastic_state_has(uint32_t flags, const std::string & be);
+
+static std::vector<std::string> elastic_compute_profile_names(const std::string & name) {
+    std::vector<std::string> out;
+    out.push_back(name);
+    if (name == "output.weight") {
+        out.push_back("result_output");
+        return out;
+    }
+
+    const std::string prefix = "blk.";
+    const std::string suffix = ".weight";
+    if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size() + suffix.size()) {
+        return out;
+    }
+    if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return out;
+    }
+
+    const size_t layer_begin = prefix.size();
+    const size_t layer_end = name.find('.', layer_begin);
+    if (layer_end == std::string::npos) {
+        return out;
+    }
+    const std::string layer = name.substr(layer_begin, layer_end - layer_begin);
+    const std::string field = name.substr(layer_end + 1, name.size() - layer_end - 1 - suffix.size());
+
+    if (field == "attn_q") out.push_back("Qcur-" + layer);
+    else if (field == "attn_k") out.push_back("Kcur-" + layer);
+    else if (field == "attn_v") out.push_back("Vcur-" + layer);
+    else if (field == "attn_output") out.push_back("attn_out-" + layer);
+    else if (field == "ffn_gate") out.push_back("ffn_gate-" + layer);
+    else if (field == "ffn_up") out.push_back("ffn_up-" + layer);
+    else if (field == "ffn_down") out.push_back("ffn_out-" + layer);
+    return out;
+}
+
+static bool elastic_has_measured_compute(elastic_online_solver_state * s, const std::string & backend) {
+    const auto & rs = s->op_costs.value("records", nlohmann::json::array());
+    for (const auto & r : rs) {
+        if (r.value("backend", std::string()) == backend && r.value("kind", std::string()) == "COMPUTE") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool elastic_has_measured_stage_kind(elastic_online_solver_state * s,
+                                            const std::string & backend, const std::string & kind) {
+    const auto & rs = s->stage_costs.value("records", nlohmann::json::array());
+    for (const auto & r : rs) {
+        if (r.value("backend", std::string()) == backend && r.value("kind", std::string()) == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static double elastic_stage_cost(elastic_online_solver_state * s, const std::string & backend,
                                  const std::string & kind, const std::string & name, size_t bytes) {
     const double mb = bytes / 1024.0 / 1024.0;
@@ -104,11 +215,61 @@ static double elastic_stage_cost(elastic_online_solver_state * s, const std::str
     return elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
 }
 
+static double elastic_gpu_reload_cost(elastic_online_solver_state * s, const std::string & name, size_t bytes) {
+    if (elastic_has_measured_stage_kind(s, "OpenCL", "RELOAD_ENSURE")) {
+        return elastic_stage_cost(s, "OpenCL", "RELOAD_ENSURE", name, bytes);
+    }
+    return elastic_stage_cost(s, "OpenCL", "LOAD", name, bytes) +
+           elastic_stage_cost(s, "OpenCL", "TRANSFER", name, bytes) +
+           elastic_stage_cost(s, "OpenCL", "XFORM", name, bytes);
+}
+
 static double elastic_compute_cost(elastic_online_solver_state * s, const std::string & backend,
                                    const std::string & name, size_t bytes) {
+    if (backend == "CPU_Elastic" && !elastic_has_measured_compute(s, "CPU_Elastic")) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const auto candidates = elastic_compute_profile_names(name);
+    const auto & rs = s->op_costs.value("records", nlohmann::json::array());
+    const nlohmann::json * exact = nullptr;
+    const nlohmann::json * best_mul_mat = nullptr;
+    for (const auto & r : rs) {
+        if (r.value("backend", std::string()) != backend) continue;
+        if (r.value("kind", std::string()) != "COMPUTE") continue;
+        const std::string rname = r.value("name", std::string());
+        if (std::find(candidates.begin(), candidates.end(), rname) == candidates.end()) continue;
+        if (r.value("op", std::string()) == "MUL_MAT") {
+            if (best_mul_mat == nullptr || r.value("samples", 0) > best_mul_mat->value("samples", 0)) {
+                best_mul_mat = &r;
+            }
+            continue;
+        }
+        if (exact == nullptr) exact = &r;
+    }
+    if (best_mul_mat != nullptr) return best_mul_mat->value("median_ms", 0.0);
+    if (exact != nullptr) return exact->value("median_ms", 0.0);
+
     const double mb = bytes / 1024.0 / 1024.0;
     const double fb = backend == "OpenCL" ? 0.03 + mb * 0.020 : 0.05 + mb * 0.045;
     return elastic_cost_lookup(s->op_costs, backend, "COMPUTE", name, bytes, fb);
+}
+
+static double elastic_backend_path_cost(elastic_online_solver_state * s, const std::string & backend,
+                                        const std::string & name, size_t bytes, uint32_t flags = 0) {
+    if (backend == "GPU") {
+        double cost = elastic_compute_cost(s, "OpenCL", name, bytes);
+        if (!elastic_state_has(flags, "GPU")) {
+            cost += elastic_gpu_reload_cost(s, name, bytes);
+        }
+        return cost;
+    }
+
+    double cost = elastic_compute_cost(s, "CPU_Elastic", name, bytes);
+    if (!elastic_state_has(flags, "CPU")) {
+        cost += elastic_stage_cost(s, "CPU_Elastic", "LOAD", name, bytes);
+        cost += elastic_stage_cost(s, "CPU_Elastic", "XFORM", name, bytes);
+    }
+    return cost;
 }
 
 static bool elastic_state_has(uint32_t flags, const std::string & be) {
@@ -122,6 +283,24 @@ static bool elastic_state_any_resident(uint32_t flags) {
                      LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
                      LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT)) != 0;
 }
+
+static std::string elastic_backend_from_state(uint32_t flags, const std::string & fallback) {
+    const bool gpu = (flags & (LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
+                               LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT)) != 0;
+    const bool cpu = (flags & (LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT |
+                               LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT)) != 0;
+    if (gpu && !cpu) return "GPU";
+    if (cpu && !gpu) return "CPU";
+    return fallback;
+}
+
+static std::string elastic_backend_for_item(uint32_t flags, const std::string & fallback, const std::string & quant) {
+    if (quant.empty()) {
+        return elastic_backend_from_state(flags, fallback);
+    }
+    return fallback;
+}
+
 
 static std::string elastic_xform_for(const std::string & be, const std::string & quant) {
     if (be == "GPU") {
@@ -140,45 +319,64 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
         size_t bytes;
         uint32_t flags;
         double value;
+        bool manageable;
     };
     std::vector<item> items;
-    for (const auto & w : s->model_meta.value("weights", nlohmann::json::array())) {
+    items.reserve(s->item_bases.size());
+    const bool mru_mode = s->mode == "mru" || s->mode == "native-mru";
+    for (const auto & b : s->item_bases) {
         item it;
-        it.id = w.value("weight_id", (int) items.size());
-        it.name = w.value("name", std::string());
-        it.layer = w.value("layer", -1);
-        it.bytes = (size_t) w.value("byte_size", 0);
-        it.quant = w.value("quant", std::string());
+        it.id = b.id;
+        it.name = b.name;
+        it.layer = b.layer;
+        it.bytes = b.bytes;
+        it.quant = b.quant;
         llama_elastic_weight_state st{};
         llama_weight_get_state(s->ctx, it.name.c_str(), &st);
         it.flags = st.flags;
-        const double gpu = elastic_compute_cost(s, "OpenCL", it.name, it.bytes);
-        const double cpu = elastic_compute_cost(s, "CPU_Elastic", it.name, it.bytes);
-        it.backend = gpu <= cpu ? "GPU" : "CPU";
+        // Items in model_meta are elastic model weights and can be evicted and
+        // reloaded from the model file. Do not let a missing disk_available bit
+        // in a transient state dump pin online plans to an old resident set.
+        it.manageable = true;
+        it.backend = elastic_backend_for_item(it.flags, b.backend, it.quant);
+        const double movement_value = it.backend == "GPU" ? b.resident_value_gpu : b.resident_value_cpu;
         if (elastic_state_has(it.flags, it.backend)) {
-            it.value = 1e9 + it.bytes / 1024.0 / 1024.0;
-        } else if (it.backend == "GPU") {
-            it.value = elastic_stage_cost(s, "OpenCL", "LOAD", it.name, it.bytes)
-                     + elastic_stage_cost(s, "OpenCL", "TRANSFER", it.name, it.bytes)
-                     + elastic_stage_cost(s, "OpenCL", "XFORM", it.name, it.bytes);
+            // Finite churn bonus only. An infinite bonus makes online keep cheap
+            // stale tensors and can be worse than the offline table.
+            it.value = movement_value + std::min(movement_value * 0.25, 2.0);
         } else {
-            it.value = elastic_stage_cost(s, "CPU_Elastic", "LOAD", it.name, it.bytes)
-                     + elastic_stage_cost(s, "CPU_Elastic", "XFORM", it.name, it.bytes);
+            it.value = movement_value;
         }
         if (!it.name.empty()) items.push_back(std::move(it));
     }
 
     const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
     const size_t budget_bytes = usable_mib > 0 ? (size_t) usable_mib * 1024 * 1024 : 0;
-    std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
-        const double da = a.value / std::max<size_t>(a.bytes, 1);
-        const double db = b.value / std::max<size_t>(b.bytes, 1);
-        if (da != db) return da > db;
-        return a.value > b.value;
-    });
+    if (mru_mode) {
+        // MRU eviction baseline: after a completed decode step, later op ids are
+        // treated as the most recently used weights, so pressure evicts them first.
+        std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            if (a.id != b.id) return a.id < b.id;
+            return a.name < b.name;
+        });
+    } else {
+        std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            const double da = a.value / std::max<size_t>(a.bytes, 1);
+            const double db = b.value / std::max<size_t>(b.bytes, 1);
+            if (da != db) return da > db;
+            return a.value > b.value;
+        });
+    }
     std::unordered_set<int> keep;
     size_t used = 0;
     for (const auto & it : items) {
+        if (!it.manageable) {
+            keep.insert(it.id);
+            used += it.bytes;
+        }
+    }
+    for (const auto & it : items) {
+        if (!it.manageable) continue;
         if (used + it.bytes <= budget_bytes) {
             keep.insert(it.id);
             used += it.bytes;
@@ -195,7 +393,7 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
     plan["ops"] = nlohmann::json::array();
     plan["timeline"] = nlohmann::json::array();
     plan["pred_per_token_ms"] = 0.0;
-    plan["bottleneck"] = "native_greedy";
+    plan["bottleneck"] = mru_mode ? "native_mru" : "native_greedy";
 
     for (const auto & it : items) {
         const bool resident = keep.find(it.id) != keep.end();
@@ -221,6 +419,7 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
             {"migrate_xform", "none"},
         });
         if (!resident) {
+            const int anchor_id = it.id > 1 ? it.id - 1 : it.id;
             if (elastic_state_any_resident(it.flags)) {
                 plan["timeline"].push_back({
                     {"kind", "evict"},
@@ -228,27 +427,27 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
                     {"from_loc", (it.flags & LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT) ? "gpu" : "cpu"},
                     {"to_loc", "disk"},
                     {"engine", "cpu"},
-                    {"anchor_op_id", 0},
+                    {"anchor_op_id", anchor_id},
                     {"overlap_group", -1},
                 });
             }
             plan["timeline"].push_back({
                 {"kind", "load"}, {"weight_id", it.id}, {"from_loc", "disk"}, {"to_loc", "cpu"},
-                {"engine", "disk"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                {"engine", "disk"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
             });
             if (it.backend == "GPU") {
                 plan["timeline"].push_back({
                     {"kind", "transfer"}, {"weight_id", it.id}, {"from_loc", "cpu"}, {"to_loc", "gpu"},
-                    {"engine", "transfer"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                    {"engine", "transfer"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
                 });
                 plan["timeline"].push_back({
                     {"kind", "xform"}, {"weight_id", it.id}, {"from_loc", "gpu"}, {"to_loc", "gpu"},
-                    {"engine", "gpu"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                    {"engine", "gpu"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
                 });
             } else {
                 plan["timeline"].push_back({
                     {"kind", "xform"}, {"weight_id", it.id}, {"from_loc", "cpu"}, {"to_loc", "cpu"},
-                    {"engine", "cpu"}, {"anchor_op_id", std::max(0, it.id - 1)}, {"overlap_group", -1},
+                    {"engine", "cpu"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
                 });
             }
         }
@@ -283,6 +482,55 @@ static void elastic_online_state_dump(elastic_online_solver_state * s, const std
     f << out.dump(2) << "\n";
 }
 
+static bool elastic_online_generate_remote(elastic_online_solver_state * s, int64_t budget_mib,
+                                           const std::string & state_path, const std::string & plan_path,
+                                           double * remote_wall_ms, double * server_ms) {
+    if (!s || s->remote_url.empty()) return false;
+
+    nlohmann::json req;
+    req["budget_mib"] = budget_mib;
+    req["kv_mib"] = s->kv_mib;
+    req["misc_mib"] = s->misc_mib;
+    req["safety_mib"] = s->safety_mib;
+    req["time_limit_ms"] = s->time_limit_ms;
+    req["allow_cpu_fallback"] = s->allow_cpu_fallback;
+    req["transition_weight"] = s->transition_weight;
+    {
+        std::ifstream sf(state_path);
+        if (!sf) return false;
+        sf >> req["state"];
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        auto [cli, parts] = common_http_client(s->remote_url);
+        cli.set_connection_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+        cli.set_read_timeout(60, 0);
+        auto res = cli.Post(parts.path, req.dump(), "application/json");
+        const auto t1 = std::chrono::steady_clock::now();
+        if (remote_wall_ms) {
+            *remote_wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        if (!res || res->status < 200 || res->status >= 300) {
+            LOG_ERR("[elastic-online] remote solver http failed status=%d url=%s\n",
+                    res ? res->status : -1, common_http_show_masked_url(parts).c_str());
+            return false;
+        }
+        nlohmann::json out = nlohmann::json::parse(res->body);
+        if (server_ms) *server_ms = out.value("solve_ms", 0.0);
+        nlohmann::json plan = out.contains("plan") ? out["plan"] : out;
+        std::ofstream pf(plan_path);
+        if (!pf) return false;
+        pf << plan.dump(2) << "\n";
+        return pf.good();
+    } catch (const std::exception & e) {
+        LOG_ERR("[elastic-online] remote solver exception url=%s err=%s\n",
+                s->remote_url.c_str(), e.what());
+        return false;
+    }
+}
+
 static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void * user_data) {
     auto * s = static_cast<elastic_online_solver_state *>(user_data);
     if (!s || !s->ctx) return nullptr;
@@ -314,6 +562,20 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
                     rc, (long long) budget_mib, cmd.str().c_str());
             return nullptr;
         }
+    } else if (s->mode == "remote") {
+        elastic_online_state_dump(s, state_path);
+        double remote_wall_ms = 0.0;
+        double server_ms = 0.0;
+        if (!elastic_online_generate_remote(s, budget_mib, state_path, plan_path, &remote_wall_ms, &server_ms)) {
+            s->failures++;
+            LOG_ERR("[elastic-online] remote solver failed budget=%lld url=%s\n",
+                    (long long) budget_mib, s->remote_url.c_str());
+            return nullptr;
+        }
+        s->remote_wall_ms_total += remote_wall_ms;
+        s->remote_server_ms_total += server_ms;
+        LOG_INF("[elastic-online] remote budget=%lld remote_wall_ms=%.3f server_solve_ms=%.3f\n",
+                (long long) budget_mib, remote_wall_ms, server_ms);
     } else {
         if (!elastic_online_generate_native(s, budget_mib, plan_path)) {
             s->failures++;
@@ -493,6 +755,7 @@ int main(int argc, char ** argv) {
         online.mode = std::getenv("LLAMA_ELASTIC_ONLINE_MODE") ? std::getenv("LLAMA_ELASTIC_ONLINE_MODE") : "native-greedy";
         online.python = std::getenv("LLAMA_ELASTIC_ONLINE_PYTHON") ? std::getenv("LLAMA_ELASTIC_ONLINE_PYTHON") : "python3";
         online.solver = std::getenv("LLAMA_ELASTIC_ONLINE_SOLVER") ? std::getenv("LLAMA_ELASTIC_ONLINE_SOLVER") : "runtime/plan/dynamic_budget_solver.py";
+        online.remote_url = std::getenv("LLAMA_ELASTIC_ONLINE_REMOTE_URL") ? std::getenv("LLAMA_ELASTIC_ONLINE_REMOTE_URL") : "";
         online.model_meta_path = std::getenv("LLAMA_ELASTIC_MODEL_META") ? std::getenv("LLAMA_ELASTIC_MODEL_META") : "";
         online.cost_dir = std::getenv("LLAMA_ELASTIC_COST_DIR") ? std::getenv("LLAMA_ELASTIC_COST_DIR") : "";
         online.work_dir = std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") ? std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") : "/data/local/tmp/elastic/online";
@@ -500,6 +763,8 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_MISC_MB")) online.misc_mib = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_SAFETY_MB")) online.safety_mib = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS")) online.time_limit_ms = std::atoi(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOW_CPU_FALLBACK")) online.allow_cpu_fallback = std::atoi(e) != 0;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
 
         if (online.model_meta_path.empty() || online.cost_dir.empty()) {
             LOG_ERR("[elastic-online] LLAMA_ELASTIC_MODEL_META and LLAMA_ELASTIC_COST_DIR are required\n");
@@ -518,8 +783,29 @@ int main(int argc, char ** argv) {
                         online.weight_names.push_back(std::move(name));
                     }
                 }
-                std::string mkdir_cmd = "mkdir -p " + shell_quote(online.work_dir);
-                std::system(mkdir_cmd.c_str());
+                online.item_bases.clear();
+                online.item_bases.reserve(online.weight_names.size());
+                for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
+                    elastic_online_solver_state::item_base b;
+                    b.id = w.value("weight_id", (int) online.item_bases.size());
+                    b.name = w.value("name", std::string());
+                    if (b.name.empty()) continue;
+                    b.layer = w.value("layer", -1);
+                    b.bytes = (size_t) w.value("byte_size", 0);
+                    b.quant = w.value("quant", std::string());
+                    const double gpu = elastic_backend_path_cost(&online, "GPU", b.name, b.bytes);
+                    const double cpu = elastic_backend_path_cost(&online, "CPU", b.name, b.bytes);
+                    b.backend = gpu <= cpu ? "GPU" : "CPU";
+                    b.resident_value_gpu =
+                        elastic_gpu_reload_cost(&online, b.name, b.bytes);
+                    b.resident_value_cpu =
+                        elastic_stage_cost(&online, "CPU_Elastic", "LOAD", b.name, b.bytes) +
+                        elastic_stage_cost(&online, "CPU_Elastic", "XFORM", b.name, b.bytes);
+                    online.item_bases.push_back(std::move(b));
+                }
+                if (!mkdir_p_local(online.work_dir)) {
+                    LOG_ERR("[elastic-online] failed to create work_dir %s\n", online.work_dir.c_str());
+                }
 
 #if defined(_WIN32)
                 _putenv_s("GGML_ELASTIC_CALLBACK_NOCACHE", "1");
@@ -529,13 +815,15 @@ int main(int argc, char ** argv) {
                 int rc = llama_elastic_enable(ctx, "callback", nullptr);
                 llama_elastic_set_plan_provider(ctx, elastic_online_plan_provider, &online);
                 LOG_INF("[elastic-online] enable(callback) rc=%d mode=%s weights=%zu solver=%s cost_dir=%s work_dir=%s\n",
-                        rc, online.mode.c_str(), online.weight_names.size(), online.solver.c_str(),
+                        rc, online.mode.c_str(), online.item_bases.size(), online.solver.c_str(),
                         online.cost_dir.c_str(), online.work_dir.c_str());
                 std::atexit([]() {
                     for (llama_plan * p : online.plans) llama_plan_free(p);
-                    LOG_INF("[elastic-online] calls=%llu failures=%llu\n",
+                    LOG_INF("[elastic-online] calls=%llu failures=%llu remote_wall_ms=%.3f remote_server_ms=%.3f\n",
                             (unsigned long long) online.calls,
-                            (unsigned long long) online.failures);
+                            (unsigned long long) online.failures,
+                            online.remote_wall_ms_total,
+                            online.remote_server_ms_total);
                 });
             }
         }
@@ -1664,6 +1952,17 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    const double elastic_bench_seconds = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_BENCH_SECONDS");
+        return (e && *e) ? std::atof(e) : 0.0;
+    }();
+    std::chrono::steady_clock::time_point elastic_bench_t0{};
+    bool elastic_bench_started = false;
+    bool elastic_bench_time_done = false;
+    int  elastic_bench_generated = 0;
+    if (elastic_bench_seconds > 0.0) {
+        LOG_INF("[elastic-bench] duration limit enabled: %.3f seconds\n", elastic_bench_seconds);
+    }
 
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
@@ -1830,7 +2129,16 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
-            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            llama_token id = common_sampler_sample(smpl, ctx, -1);
+            if (elastic_bench_seconds > 0.0 && llama_vocab_is_eog(vocab, id)) {
+                auto cont = common_tokenize(ctx, "\n", false, false);
+                if (!cont.empty() && !llama_vocab_is_eog(vocab, cont.front())) {
+                    id = cont.front();
+                } else {
+                    id = llama_vocab_bos(vocab);
+                }
+                LOG_DBG("[elastic-bench] replaced EOG with continuation token %d\n", id);
+            }
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
@@ -1847,6 +2155,18 @@ int main(int argc, char ** argv) {
 
             // decrement remaining sampling budget
             --n_remain;
+            ++elastic_bench_generated;
+            if (elastic_bench_seconds > 0.0 && elastic_bench_generated > 0) {
+                if (!elastic_bench_started) {
+                    elastic_bench_started = true;
+                    elastic_bench_t0 = std::chrono::steady_clock::now();
+                }
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - elastic_bench_t0).count();
+                if (elapsed >= elastic_bench_seconds) {
+                    elastic_bench_time_done = true;
+                }
+            }
 
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {
@@ -1891,6 +2211,11 @@ int main(int argc, char ** argv) {
         if (input_echo && (int) embd_inp.size() == n_consumed) {
             console::set_display(console::reset);
             display = true;
+        }
+        if (elastic_bench_time_done) {
+            LOG_INF("\n[elastic-bench] reached duration %.3f s after %d generated tokens\n",
+                    elastic_bench_seconds, elastic_bench_generated);
+            break;
         }
 
         // if not currently processing queued inputs;

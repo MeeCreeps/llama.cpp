@@ -1,0 +1,11 @@
+{
+  "device": "android-opencl",
+  "input_rows": 22642,
+  "model": "Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_reload.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/cpu_compute.csv"
+  ]
+}

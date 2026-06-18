@@ -1,0 +1,99 @@
+{
+  "commands": [
+    {
+      "phase": "opencl-compute",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE=1 GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/opencl_compute.csv GGML_OPENCL_DISABLE_ALLOC_HOST_PTR=1 GGML_OPENCL_USE_SVM=1 GGML_OPENCL_ELASTIC=1 ./llama-cli -m /data/local/tmp/hyzheng/elastic/Meta-Llama-3-8B-Instruct.Q4_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 16 -c 512 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -ngl 99 -fa on"
+    },
+    {
+      "phase": "opencl-reload",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE=1 GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/opencl_reload.csv GGML_OPENCL_DISABLE_ALLOC_HOST_PTR=1 GGML_OPENCL_USE_SVM=1 GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_TIMING=1 GGML_ELASTIC_DYNAMIC=1 GGML_ELASTIC_BUDGET_BUCKET_MB=256 GGML_ELASTIC_BUDGET_CSV=/data/local/tmp/hyzheng/elastic/trace_01_user_147_minstart_5min.csv ./llama-cli -m /data/local/tmp/hyzheng/elastic/Meta-Llama-3-8B-Instruct.Q4_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 16 -c 512 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -ngl 99 -fa on"
+    },
+    {
+      "phase": "cpu-compute",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE=1 GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/cpu_compute.csv GGML_ELASTIC_CHUNK_SIZE=1 ./llama-cli -m /data/local/tmp/hyzheng/elastic/Meta-Llama-3-8B-Instruct.Q4_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 4 -c 512 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -ngl 0 -dev CPU_Elastic"
+    },
+    {
+      "cmd": [
+        "/home/myid/hz85760/miniconda3/bin/python3",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/build_model_meta_from_profile.py",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_compute.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_reload.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/cpu_compute.csv",
+        "--out",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01.weights_ops.json"
+      ],
+      "phase": "build_model_meta"
+    },
+    {
+      "cmd": [
+        "/home/myid/hz85760/miniconda3/bin/python3",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/build_cost_model.py",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_compute.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_reload.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/cpu_compute.csv",
+        "--out-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+        "--device",
+        "android-opencl",
+        "--model",
+        "Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01"
+      ],
+      "phase": "build_cost_model"
+    },
+    {
+      "cmd": [
+        "/home/myid/hz85760/miniconda3/bin/python3",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/build_offline_budget_table.py",
+        "--model-meta",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01.weights_ops.json",
+        "--cost-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+        "--out-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/offline_table",
+        "--budgets",
+        "3328,3584,3840,4096,4352,4608,4864,5120,5376,5632",
+        "--kv-mib",
+        "512",
+        "--misc-mib",
+        "256",
+        "--safety-mib",
+        "64",
+        "--time-limit-ms",
+        "250"
+      ],
+      "phase": "build_offline_table"
+    },
+    {
+      "phase": "push_offline_table",
+      "remote_dir": "/data/local/tmp/hyzheng/elastic/plans_Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01"
+    }
+  ],
+  "cost_dir": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+  "cost_summary": {
+    "boundary_records": 0,
+    "device": "android-opencl",
+    "input_rows": 22642,
+    "model": "Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+    "op_records": 2815,
+    "source_csv": [
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_compute.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/opencl_reload.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/csv/cpu_compute.csv"
+    ],
+    "stage_records": 55
+  },
+  "csv_rows": {
+    "cpu_compute.csv": 5795,
+    "opencl_compute.csv": 8245,
+    "opencl_reload.csv": 8602
+  },
+  "model": "/data/local/tmp/hyzheng/elastic/Meta-Llama-3-8B-Instruct.Q4_0.gguf",
+  "model_meta": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01.weights_ops.json",
+  "model_tag": "Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+  "offline_table": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01/offline_table",
+  "ops": 55,
+  "remote_dir": "/data/local/tmp/hyzheng/elastic",
+  "started": "2026-06-18T11:36:14-0400",
+  "trace": "trace/traces_9g/trace_01_user_147_minstart_5min.csv",
+  "weights": 55
+}

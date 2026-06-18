@@ -1,0 +1,1123 @@
+{
+  "bottleneck": "cp_sat",
+  "budget_mib": 4608,
+  "cost_model": {
+    "backend_choice": "multi_backend_placement",
+    "cpu_elastic_compute_measured": true,
+    "cpu_elastic_stage_measured": false,
+    "cpu_fallback_enabled": false,
+    "gpu_movement_cost": "reload_ensure",
+    "opencl_compute_measured": true,
+    "opencl_stage_measured": true,
+    "transition_weight": 0.0
+  },
+  "kv_bytes": 536870912,
+  "misc_bytes": 268435456,
+  "ops": [
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_k.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_q.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_v.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 24,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.24.ffn_down.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 24,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.24.ffn_gate.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 24,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.24.ffn_up.weight",
+      "op_id": 5,
+      "weight_id": 5
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.25.attn_k.weight",
+      "op_id": 6,
+      "weight_id": 6
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.25.attn_output.weight",
+      "op_id": 7,
+      "weight_id": 7
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.25.attn_q.weight",
+      "op_id": 8,
+      "weight_id": 8
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.25.attn_v.weight",
+      "op_id": 9,
+      "weight_id": 9
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.25.ffn_down.weight",
+      "op_id": 10,
+      "weight_id": 10
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.25.ffn_gate.weight",
+      "op_id": 11,
+      "weight_id": 11
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 25,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.25.ffn_up.weight",
+      "op_id": 12,
+      "weight_id": 12
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.26.attn_k.weight",
+      "op_id": 13,
+      "weight_id": 13
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.26.attn_output.weight",
+      "op_id": 14,
+      "weight_id": 14
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.26.attn_q.weight",
+      "op_id": 15,
+      "weight_id": 15
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.26.attn_v.weight",
+      "op_id": 16,
+      "weight_id": 16
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.26.ffn_down.weight",
+      "op_id": 17,
+      "weight_id": 17
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.26.ffn_gate.weight",
+      "op_id": 18,
+      "weight_id": 18
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 26,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.26.ffn_up.weight",
+      "op_id": 19,
+      "weight_id": 19
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.27.attn_k.weight",
+      "op_id": 20,
+      "weight_id": 20
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.27.attn_output.weight",
+      "op_id": 21,
+      "weight_id": 21
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.27.attn_q.weight",
+      "op_id": 22,
+      "weight_id": 22
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.27.attn_v.weight",
+      "op_id": 23,
+      "weight_id": 23
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.27.ffn_down.weight",
+      "op_id": 24,
+      "weight_id": 24
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.27.ffn_gate.weight",
+      "op_id": 25,
+      "weight_id": 25
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 27,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.27.ffn_up.weight",
+      "op_id": 26,
+      "weight_id": 26
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.28.attn_k.weight",
+      "op_id": 27,
+      "weight_id": 27
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.28.attn_output.weight",
+      "op_id": 28,
+      "weight_id": 28
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.28.attn_q.weight",
+      "op_id": 29,
+      "weight_id": 29
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.28.attn_v.weight",
+      "op_id": 30,
+      "weight_id": 30
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.28.ffn_down.weight",
+      "op_id": 31,
+      "weight_id": 31
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.28.ffn_gate.weight",
+      "op_id": 32,
+      "weight_id": 32
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 28,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.28.ffn_up.weight",
+      "op_id": 33,
+      "weight_id": 33
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.29.attn_k.weight",
+      "op_id": 34,
+      "weight_id": 34
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.29.attn_output.weight",
+      "op_id": 35,
+      "weight_id": 35
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.29.attn_q.weight",
+      "op_id": 36,
+      "weight_id": 36
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.29.attn_v.weight",
+      "op_id": 37,
+      "weight_id": 37
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.29.ffn_down.weight",
+      "op_id": 38,
+      "weight_id": 38
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.29.ffn_gate.weight",
+      "op_id": 39,
+      "weight_id": 39
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 29,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.29.ffn_up.weight",
+      "op_id": 40,
+      "weight_id": 40
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.30.attn_k.weight",
+      "op_id": 41,
+      "weight_id": 41
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.30.attn_output.weight",
+      "op_id": 42,
+      "weight_id": 42
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.30.attn_q.weight",
+      "op_id": 43,
+      "weight_id": 43
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.30.attn_v.weight",
+      "op_id": 44,
+      "weight_id": 44
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.30.ffn_down.weight",
+      "op_id": 45,
+      "weight_id": 45
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.30.ffn_gate.weight",
+      "op_id": 46,
+      "weight_id": 46
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 30,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.30.ffn_up.weight",
+      "op_id": 47,
+      "weight_id": 47
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.31.attn_k.weight",
+      "op_id": 48,
+      "weight_id": 48
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.31.attn_output.weight",
+      "op_id": 49,
+      "weight_id": 49
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.31.attn_q.weight",
+      "op_id": 50,
+      "weight_id": 50
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.31.attn_v.weight",
+      "op_id": 51,
+      "weight_id": 51
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.31.ffn_down.weight",
+      "op_id": 52,
+      "weight_id": 52
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.31.ffn_gate.weight",
+      "op_id": 53,
+      "weight_id": 53
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 31,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.31.ffn_up.weight",
+      "op_id": 54,
+      "weight_id": 54
+    }
+  ],
+  "pred_per_token_ms": 12.682733499999998,
+  "schema_version": 1,
+  "timeline": [],
+  "weights": [
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_k.weight",
+      "pinned": false,
+      "weight_id": 0,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_q.weight",
+      "pinned": false,
+      "weight_id": 1,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_v.weight",
+      "pinned": false,
+      "weight_id": 2,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "location": "gpu",
+      "name": "blk.24.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 3,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "location": "gpu",
+      "name": "blk.24.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 4,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "location": "gpu",
+      "name": "blk.24.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 5,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 25,
+      "location": "cpu",
+      "name": "blk.25.attn_k.weight",
+      "pinned": false,
+      "weight_id": 6,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 25,
+      "location": "gpu",
+      "name": "blk.25.attn_output.weight",
+      "pinned": false,
+      "weight_id": 7,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 25,
+      "location": "gpu",
+      "name": "blk.25.attn_q.weight",
+      "pinned": false,
+      "weight_id": 8,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 25,
+      "location": "cpu",
+      "name": "blk.25.attn_v.weight",
+      "pinned": false,
+      "weight_id": 9,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "location": "gpu",
+      "name": "blk.25.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 10,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "location": "gpu",
+      "name": "blk.25.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 11,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "location": "gpu",
+      "name": "blk.25.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 12,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 26,
+      "location": "cpu",
+      "name": "blk.26.attn_k.weight",
+      "pinned": false,
+      "weight_id": 13,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 26,
+      "location": "gpu",
+      "name": "blk.26.attn_output.weight",
+      "pinned": false,
+      "weight_id": 14,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 26,
+      "location": "gpu",
+      "name": "blk.26.attn_q.weight",
+      "pinned": false,
+      "weight_id": 15,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 26,
+      "location": "cpu",
+      "name": "blk.26.attn_v.weight",
+      "pinned": false,
+      "weight_id": 16,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "location": "gpu",
+      "name": "blk.26.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 17,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "location": "gpu",
+      "name": "blk.26.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 18,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "location": "gpu",
+      "name": "blk.26.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 19,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 27,
+      "location": "cpu",
+      "name": "blk.27.attn_k.weight",
+      "pinned": false,
+      "weight_id": 20,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 27,
+      "location": "gpu",
+      "name": "blk.27.attn_output.weight",
+      "pinned": false,
+      "weight_id": 21,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 27,
+      "location": "gpu",
+      "name": "blk.27.attn_q.weight",
+      "pinned": false,
+      "weight_id": 22,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 27,
+      "location": "cpu",
+      "name": "blk.27.attn_v.weight",
+      "pinned": false,
+      "weight_id": 23,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "location": "gpu",
+      "name": "blk.27.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 24,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "location": "gpu",
+      "name": "blk.27.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 25,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "location": "gpu",
+      "name": "blk.27.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 26,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 28,
+      "location": "cpu",
+      "name": "blk.28.attn_k.weight",
+      "pinned": false,
+      "weight_id": 27,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 28,
+      "location": "gpu",
+      "name": "blk.28.attn_output.weight",
+      "pinned": false,
+      "weight_id": 28,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 28,
+      "location": "gpu",
+      "name": "blk.28.attn_q.weight",
+      "pinned": false,
+      "weight_id": 29,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 28,
+      "location": "cpu",
+      "name": "blk.28.attn_v.weight",
+      "pinned": false,
+      "weight_id": 30,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "location": "gpu",
+      "name": "blk.28.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 31,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "location": "gpu",
+      "name": "blk.28.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 32,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "location": "gpu",
+      "name": "blk.28.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 33,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 29,
+      "location": "cpu",
+      "name": "blk.29.attn_k.weight",
+      "pinned": false,
+      "weight_id": 34,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 29,
+      "location": "gpu",
+      "name": "blk.29.attn_output.weight",
+      "pinned": false,
+      "weight_id": 35,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 29,
+      "location": "gpu",
+      "name": "blk.29.attn_q.weight",
+      "pinned": false,
+      "weight_id": 36,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 29,
+      "location": "cpu",
+      "name": "blk.29.attn_v.weight",
+      "pinned": false,
+      "weight_id": 37,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "location": "gpu",
+      "name": "blk.29.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 38,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "location": "gpu",
+      "name": "blk.29.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 39,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "location": "gpu",
+      "name": "blk.29.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 40,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 30,
+      "location": "cpu",
+      "name": "blk.30.attn_k.weight",
+      "pinned": false,
+      "weight_id": 41,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 30,
+      "location": "gpu",
+      "name": "blk.30.attn_output.weight",
+      "pinned": false,
+      "weight_id": 42,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 30,
+      "location": "gpu",
+      "name": "blk.30.attn_q.weight",
+      "pinned": false,
+      "weight_id": 43,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 30,
+      "location": "cpu",
+      "name": "blk.30.attn_v.weight",
+      "pinned": false,
+      "weight_id": 44,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "location": "gpu",
+      "name": "blk.30.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 45,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "location": "gpu",
+      "name": "blk.30.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 46,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "location": "gpu",
+      "name": "blk.30.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 47,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 31,
+      "location": "cpu",
+      "name": "blk.31.attn_k.weight",
+      "pinned": false,
+      "weight_id": 48,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 31,
+      "location": "gpu",
+      "name": "blk.31.attn_output.weight",
+      "pinned": false,
+      "weight_id": 49,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 31,
+      "location": "gpu",
+      "name": "blk.31.attn_q.weight",
+      "pinned": false,
+      "weight_id": 50,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 31,
+      "location": "cpu",
+      "name": "blk.31.attn_v.weight",
+      "pinned": false,
+      "weight_id": 51,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "location": "gpu",
+      "name": "blk.31.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 52,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "location": "gpu",
+      "name": "blk.31.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 53,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "location": "gpu",
+      "name": "blk.31.ffn_up.weight",
+      "pinned": false,
+      "weight_id": 54,
+      "xform": "gpu_convert"
+    }
+  ]
+}

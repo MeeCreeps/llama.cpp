@@ -1,0 +1,721 @@
+{
+  "ops": [
+    {
+      "layer": 0,
+      "name": "blk.0.attn_k.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_q.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_v.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "layer": 24,
+      "name": "blk.24.ffn_down.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "layer": 24,
+      "name": "blk.24.ffn_gate.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "layer": 24,
+      "name": "blk.24.ffn_up.weight",
+      "op_id": 5,
+      "weight_id": 5
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.attn_k.weight",
+      "op_id": 6,
+      "weight_id": 6
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.attn_output.weight",
+      "op_id": 7,
+      "weight_id": 7
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.attn_q.weight",
+      "op_id": 8,
+      "weight_id": 8
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.attn_v.weight",
+      "op_id": 9,
+      "weight_id": 9
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.ffn_down.weight",
+      "op_id": 10,
+      "weight_id": 10
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.ffn_gate.weight",
+      "op_id": 11,
+      "weight_id": 11
+    },
+    {
+      "layer": 25,
+      "name": "blk.25.ffn_up.weight",
+      "op_id": 12,
+      "weight_id": 12
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.attn_k.weight",
+      "op_id": 13,
+      "weight_id": 13
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.attn_output.weight",
+      "op_id": 14,
+      "weight_id": 14
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.attn_q.weight",
+      "op_id": 15,
+      "weight_id": 15
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.attn_v.weight",
+      "op_id": 16,
+      "weight_id": 16
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.ffn_down.weight",
+      "op_id": 17,
+      "weight_id": 17
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.ffn_gate.weight",
+      "op_id": 18,
+      "weight_id": 18
+    },
+    {
+      "layer": 26,
+      "name": "blk.26.ffn_up.weight",
+      "op_id": 19,
+      "weight_id": 19
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.attn_k.weight",
+      "op_id": 20,
+      "weight_id": 20
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.attn_output.weight",
+      "op_id": 21,
+      "weight_id": 21
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.attn_q.weight",
+      "op_id": 22,
+      "weight_id": 22
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.attn_v.weight",
+      "op_id": 23,
+      "weight_id": 23
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.ffn_down.weight",
+      "op_id": 24,
+      "weight_id": 24
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.ffn_gate.weight",
+      "op_id": 25,
+      "weight_id": 25
+    },
+    {
+      "layer": 27,
+      "name": "blk.27.ffn_up.weight",
+      "op_id": 26,
+      "weight_id": 26
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.attn_k.weight",
+      "op_id": 27,
+      "weight_id": 27
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.attn_output.weight",
+      "op_id": 28,
+      "weight_id": 28
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.attn_q.weight",
+      "op_id": 29,
+      "weight_id": 29
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.attn_v.weight",
+      "op_id": 30,
+      "weight_id": 30
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.ffn_down.weight",
+      "op_id": 31,
+      "weight_id": 31
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.ffn_gate.weight",
+      "op_id": 32,
+      "weight_id": 32
+    },
+    {
+      "layer": 28,
+      "name": "blk.28.ffn_up.weight",
+      "op_id": 33,
+      "weight_id": 33
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.attn_k.weight",
+      "op_id": 34,
+      "weight_id": 34
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.attn_output.weight",
+      "op_id": 35,
+      "weight_id": 35
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.attn_q.weight",
+      "op_id": 36,
+      "weight_id": 36
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.attn_v.weight",
+      "op_id": 37,
+      "weight_id": 37
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.ffn_down.weight",
+      "op_id": 38,
+      "weight_id": 38
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.ffn_gate.weight",
+      "op_id": 39,
+      "weight_id": 39
+    },
+    {
+      "layer": 29,
+      "name": "blk.29.ffn_up.weight",
+      "op_id": 40,
+      "weight_id": 40
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.attn_k.weight",
+      "op_id": 41,
+      "weight_id": 41
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.attn_output.weight",
+      "op_id": 42,
+      "weight_id": 42
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.attn_q.weight",
+      "op_id": 43,
+      "weight_id": 43
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.attn_v.weight",
+      "op_id": 44,
+      "weight_id": 44
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.ffn_down.weight",
+      "op_id": 45,
+      "weight_id": 45
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.ffn_gate.weight",
+      "op_id": 46,
+      "weight_id": 46
+    },
+    {
+      "layer": 30,
+      "name": "blk.30.ffn_up.weight",
+      "op_id": 47,
+      "weight_id": 47
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.attn_k.weight",
+      "op_id": 48,
+      "weight_id": 48
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.attn_output.weight",
+      "op_id": 49,
+      "weight_id": 49
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.attn_q.weight",
+      "op_id": 50,
+      "weight_id": 50
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.attn_v.weight",
+      "op_id": 51,
+      "weight_id": 51
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.ffn_down.weight",
+      "op_id": 52,
+      "weight_id": 52
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.ffn_gate.weight",
+      "op_id": 53,
+      "weight_id": 53
+    },
+    {
+      "layer": 31,
+      "name": "blk.31.ffn_up.weight",
+      "op_id": 54,
+      "weight_id": 54
+    }
+  ],
+  "weights": [
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "name": "blk.0.attn_k.weight",
+      "quant": "",
+      "weight_id": 0
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 0,
+      "name": "blk.0.attn_q.weight",
+      "quant": "",
+      "weight_id": 1
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "name": "blk.0.attn_v.weight",
+      "quant": "",
+      "weight_id": 2
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "name": "blk.24.ffn_down.weight",
+      "quant": "",
+      "weight_id": 3
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "name": "blk.24.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 4
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 24,
+      "name": "blk.24.ffn_up.weight",
+      "quant": "",
+      "weight_id": 5
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 25,
+      "name": "blk.25.attn_k.weight",
+      "quant": "",
+      "weight_id": 6
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 25,
+      "name": "blk.25.attn_output.weight",
+      "quant": "",
+      "weight_id": 7
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 25,
+      "name": "blk.25.attn_q.weight",
+      "quant": "",
+      "weight_id": 8
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 25,
+      "name": "blk.25.attn_v.weight",
+      "quant": "",
+      "weight_id": 9
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "name": "blk.25.ffn_down.weight",
+      "quant": "",
+      "weight_id": 10
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "name": "blk.25.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 11
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 25,
+      "name": "blk.25.ffn_up.weight",
+      "quant": "",
+      "weight_id": 12
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 26,
+      "name": "blk.26.attn_k.weight",
+      "quant": "",
+      "weight_id": 13
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 26,
+      "name": "blk.26.attn_output.weight",
+      "quant": "",
+      "weight_id": 14
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 26,
+      "name": "blk.26.attn_q.weight",
+      "quant": "",
+      "weight_id": 15
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 26,
+      "name": "blk.26.attn_v.weight",
+      "quant": "",
+      "weight_id": 16
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "name": "blk.26.ffn_down.weight",
+      "quant": "",
+      "weight_id": 17
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "name": "blk.26.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 18
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 26,
+      "name": "blk.26.ffn_up.weight",
+      "quant": "",
+      "weight_id": 19
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 27,
+      "name": "blk.27.attn_k.weight",
+      "quant": "",
+      "weight_id": 20
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 27,
+      "name": "blk.27.attn_output.weight",
+      "quant": "",
+      "weight_id": 21
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 27,
+      "name": "blk.27.attn_q.weight",
+      "quant": "",
+      "weight_id": 22
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 27,
+      "name": "blk.27.attn_v.weight",
+      "quant": "",
+      "weight_id": 23
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "name": "blk.27.ffn_down.weight",
+      "quant": "",
+      "weight_id": 24
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "name": "blk.27.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 25
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 27,
+      "name": "blk.27.ffn_up.weight",
+      "quant": "",
+      "weight_id": 26
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 28,
+      "name": "blk.28.attn_k.weight",
+      "quant": "",
+      "weight_id": 27
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 28,
+      "name": "blk.28.attn_output.weight",
+      "quant": "",
+      "weight_id": 28
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 28,
+      "name": "blk.28.attn_q.weight",
+      "quant": "",
+      "weight_id": 29
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 28,
+      "name": "blk.28.attn_v.weight",
+      "quant": "",
+      "weight_id": 30
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "name": "blk.28.ffn_down.weight",
+      "quant": "",
+      "weight_id": 31
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "name": "blk.28.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 32
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 28,
+      "name": "blk.28.ffn_up.weight",
+      "quant": "",
+      "weight_id": 33
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 29,
+      "name": "blk.29.attn_k.weight",
+      "quant": "",
+      "weight_id": 34
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 29,
+      "name": "blk.29.attn_output.weight",
+      "quant": "",
+      "weight_id": 35
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 29,
+      "name": "blk.29.attn_q.weight",
+      "quant": "",
+      "weight_id": 36
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 29,
+      "name": "blk.29.attn_v.weight",
+      "quant": "",
+      "weight_id": 37
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "name": "blk.29.ffn_down.weight",
+      "quant": "",
+      "weight_id": 38
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "name": "blk.29.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 39
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 29,
+      "name": "blk.29.ffn_up.weight",
+      "quant": "",
+      "weight_id": 40
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 30,
+      "name": "blk.30.attn_k.weight",
+      "quant": "",
+      "weight_id": 41
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 30,
+      "name": "blk.30.attn_output.weight",
+      "quant": "",
+      "weight_id": 42
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 30,
+      "name": "blk.30.attn_q.weight",
+      "quant": "",
+      "weight_id": 43
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 30,
+      "name": "blk.30.attn_v.weight",
+      "quant": "",
+      "weight_id": 44
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "name": "blk.30.ffn_down.weight",
+      "quant": "",
+      "weight_id": 45
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "name": "blk.30.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 46
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 30,
+      "name": "blk.30.ffn_up.weight",
+      "quant": "",
+      "weight_id": 47
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 31,
+      "name": "blk.31.attn_k.weight",
+      "quant": "",
+      "weight_id": 48
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 31,
+      "name": "blk.31.attn_output.weight",
+      "quant": "",
+      "weight_id": 49
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 31,
+      "name": "blk.31.attn_q.weight",
+      "quant": "",
+      "weight_id": 50
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 31,
+      "name": "blk.31.attn_v.weight",
+      "quant": "",
+      "weight_id": 51
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "name": "blk.31.ffn_down.weight",
+      "quant": "",
+      "weight_id": 52
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "name": "blk.31.ffn_gate.weight",
+      "quant": "",
+      "weight_id": 53
+    },
+    {
+      "byte_size": 33030144,
+      "layer": 31,
+      "name": "blk.31.ffn_up.weight",
+      "quant": "",
+      "weight_id": 54
+    }
+  ]
+}

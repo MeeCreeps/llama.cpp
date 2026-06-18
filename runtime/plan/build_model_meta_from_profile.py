@@ -30,8 +30,6 @@ def main() -> None:
     args = ap.parse_args()
 
     by_name: dict[str, dict] = {}
-    compute_order: list[str] = []
-
     for path in args.csv:
         with path.open(newline="") as f:
             for row in csv.DictReader(f):
@@ -42,13 +40,8 @@ def main() -> None:
                 if kind in WEIGHT_KINDS:
                     cur = by_name.setdefault(name, {"name": name, "byte_size": 0, "quant": ""})
                     cur["byte_size"] = max(cur["byte_size"], int(row.get("bytes", "0") or 0))
-                if kind == "COMPUTE" and name not in compute_order:
-                    compute_order.append(name)
-                    cur = by_name.setdefault(name, {"name": name, "byte_size": 0, "quant": ""})
-                    cur["byte_size"] = max(cur["byte_size"], int(row.get("bytes", "0") or 0))
-                    cur["quant"] = row.get("quant", "") or cur.get("quant", "")
 
-    ordered_names = compute_order + sorted(n for n in by_name if n not in set(compute_order))
+    ordered_names = sorted(by_name, key=lambda n: (layer_of(n), n))
     weights = []
     ops = []
     for i, name in enumerate(ordered_names):
@@ -78,4 +71,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

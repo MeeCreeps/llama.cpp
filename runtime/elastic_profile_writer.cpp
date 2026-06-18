@@ -80,7 +80,7 @@ void profile_write(const profile_record & rec) {
     csv_put(s.file, rec.name);    std::fputc(',', s.file);
     csv_put(s.file, rec.op);      std::fputc(',', s.file);
     csv_put(s.file, rec.quant);   std::fputc(',', s.file);
-    std::fprintf(s.file, ",%d,%d,%d,%lld,%lld,%lld,%lld,%zu,%.6f,%d,",
+    std::fprintf(s.file, "%d,%d,%d,%lld,%lld,%lld,%lld,%zu,%.6f,%d,",
                  rec.token,
                  rec.op_id,
                  rec.weight_id,
@@ -97,4 +97,3 @@ void profile_write(const profile_record & rec) {
 }
 
 }  // namespace elastic
-
