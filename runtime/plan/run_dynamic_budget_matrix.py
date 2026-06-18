@@ -135,6 +135,57 @@ def adb_shell_retry(
     raise RuntimeError(f"adb shell retry failed without exception: {script}")
 
 
+def read_thermal_snapshot(serial: str, timeout: float) -> dict[str, Any]:
+    proc = adb_shell(serial, "dumpsys thermalservice 2>/dev/null", check=False, timeout=timeout)
+    text = proc.stdout or ""
+    temps: dict[str, float] = {}
+    for m in re.finditer(r"Temperature\{mValue=([-0-9.]+).*?mName=([^,}]+)", text):
+        value = float(m.group(1))
+        name = m.group(2)
+        if -50.0 < value < 200.0:
+            temps[name] = value
+
+    cpu = [v for k, v in temps.items() if k.startswith("CPU")]
+    gpu = [v for k, v in temps.items() if k.startswith("GPU")]
+    skin = [v for k, v in temps.items() if "skin" in k.lower()]
+    status = ""
+    m = re.search(r"Thermal Status:\s*(\d+)", text)
+    if m:
+        status = int(m.group(1))
+    return {
+        "thermal_status": status,
+        "thermal_cpu_max_c": max(cpu) if cpu else "",
+        "thermal_gpu_max_c": max(gpu) if gpu else "",
+        "thermal_skin_max_c": max(skin) if skin else "",
+    }
+
+
+def thermal_max(snapshot: dict[str, Any]) -> float:
+    values = []
+    for key in ("thermal_cpu_max_c", "thermal_gpu_max_c", "thermal_skin_max_c"):
+        value = snapshot.get(key, "")
+        if value != "":
+            values.append(float(value))
+    return max(values) if values else 0.0
+
+
+def wait_for_cooldown(args: argparse.Namespace, trace_name: str, method: str) -> dict[str, Any]:
+    snapshot = read_thermal_snapshot(args.adb_serial, args.adb_timeout_s)
+    if args.cooldown_thermal_max_c <= 0:
+        return snapshot
+
+    deadline = time.monotonic() + args.cooldown_timeout_s
+    while thermal_max(snapshot) > args.cooldown_thermal_max_c and time.monotonic() < deadline:
+        print(
+            "=== cooldown trace=%s method=%s thermal_max=%.1fC target=%.1fC status=%s ==="
+            % (trace_name, method, thermal_max(snapshot), args.cooldown_thermal_max_c, snapshot.get("thermal_status", "")),
+            flush=True,
+        )
+        time.sleep(args.cooldown_poll_s)
+        snapshot = read_thermal_snapshot(args.adb_serial, args.adb_timeout_s)
+    return snapshot
+
+
 def shell_quote(value: str | Path) -> str:
     return shlex.quote(str(value))
 
@@ -376,6 +427,7 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         f"- n_predict fallback: `{args.n_pred}`",
         f"- budget bucket: `{args.bucket_mib}` MiB",
         f"- offline table: `{args.phone_plan_dir}`",
+        f"- cooldown thermal max: `{args.cooldown_thermal_max_c}` C",
         "",
         "## Trace Windows",
         "",
@@ -393,15 +445,30 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         "",
         "`decode ms/token` excludes remote solver wall time for `online`; for other baselines it equals raw eval ms/token.",
         "",
-        "| trace | method | status | raw ms/token | decode ms/token | remote wall ms | apply count | planned evict/load/xfer/xform | direct read ms | direct read calls | failures |",
-        "|---|---|---|---:|---:|---:|---:|---|---:|---:|---:|",
+        "| trace | method | status | raw ms/token | decode ms/token | thermal before/after C | remote wall ms | apply count | planned evict/load/xfer/xform | direct read ms | direct read calls | failures |",
+        "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|",
     ]
     for r in rows:
         planned = f"{r.get('evict_planned', 0)}/{r.get('load_planned', 0)}/{r.get('transfer_planned', 0)}/{r.get('xform_planned', 0)}"
         failures = r.get("anchor_failures", r.get("online_failures", ""))
+        before = thermal_max(
+            {
+                "thermal_cpu_max_c": r.get("thermal_cpu_max_c_before", ""),
+                "thermal_gpu_max_c": r.get("thermal_gpu_max_c_before", ""),
+                "thermal_skin_max_c": r.get("thermal_skin_max_c_before", ""),
+            }
+        )
+        after = thermal_max(
+            {
+                "thermal_cpu_max_c": r.get("thermal_cpu_max_c_after", ""),
+                "thermal_gpu_max_c": r.get("thermal_gpu_max_c_after", ""),
+                "thermal_skin_max_c": r.get("thermal_skin_max_c_after", ""),
+            }
+        )
+        thermal = "n/a" if before == 0.0 and after == 0.0 else f"{before:.1f}/{after:.1f}"
         lines.append(
             f"| {r['trace']} | {r['method']} | {r['status']} | {fmt(r.get('raw_ms_per_token', ''))} | "
-            f"{fmt(r.get('decode_ms_per_token', ''))} | {fmt(r.get('remote_wall_ms', ''))} | "
+            f"{fmt(r.get('decode_ms_per_token', ''))} | {thermal} | {fmt(r.get('remote_wall_ms', ''))} | "
             f"{fmt(r.get('apply_count', ''))} | {planned} | {fmt(r.get('direct_read_ms', ''))} | "
             f"{fmt(r.get('direct_read_calls', ''))} | {fmt(failures)} |"
         )
@@ -540,6 +607,10 @@ def main() -> None:
     ap.add_argument("--timeout-s", type=int, default=480)
     ap.add_argument("--adb-timeout-s", type=int, default=30)
     ap.add_argument("--adb-retries", type=int, default=2)
+    ap.add_argument("--cooldown-thermal-max-c", type=float, default=0.0,
+                    help="if >0, wait before each run until max CPU/GPU/skin temperature is below this value")
+    ap.add_argument("--cooldown-poll-s", type=float, default=30.0)
+    ap.add_argument("--cooldown-timeout-s", type=float, default=1800.0)
     ap.add_argument("--port", type=int, default=18082)
     ap.add_argument("--no-resume", action="store_true", help="rerun rows already present in summary/results.csv")
     ap.add_argument("--skip-build-table", action="store_true")
@@ -710,17 +781,26 @@ def main() -> None:
                 if args.dry_run:
                     print(script)
                     rc = 0
+                    thermal_before = {"thermal_status": "", "thermal_cpu_max_c": "", "thermal_gpu_max_c": "", "thermal_skin_max_c": ""}
+                    thermal_after = {"thermal_status": "", "thermal_cpu_max_c": "", "thermal_gpu_max_c": "", "thermal_skin_max_c": ""}
                 else:
                     log_path.parent.mkdir(parents=True, exist_ok=True)
+                    thermal_before = wait_for_cooldown(args, t.local.name, method)
                     with log_path.open("w") as f:
+                        f.write("[thermal-before] " + json.dumps(thermal_before, sort_keys=True) + "\n")
+                        f.flush()
                         try:
                             proc = adb_shell(args.adb_serial, script, check=False, timeout=args.timeout_s, stdout=f)
                             rc = proc.returncode
                         except subprocess.TimeoutExpired:
                             rc = 124
                             f.write(f"\nTIMEOUT after {args.timeout_s}s\n")
+                        thermal_after = read_thermal_snapshot(args.adb_serial, args.adb_timeout_s)
+                        f.write("[thermal-after] " + json.dumps(thermal_after, sort_keys=True) + "\n")
                     print(f"=== done trace={t.local.name} method={method} rc={rc} ===", flush=True)
                 parsed = parse_log(log_path, method) if not args.dry_run else {"status": "dry-run"}
+                parsed.update({f"{k}_before": v for k, v in thermal_before.items()})
+                parsed.update({f"{k}_after": v for k, v in thermal_after.items()})
                 parsed.update(
                     {
                         "trace": t.local.name,
