@@ -7,7 +7,27 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+
+def plan_to_state(plan_path: Path, state_path: Path) -> None:
+    plan = json.loads(plan_path.read_text())
+    rows = []
+    for w in plan.get("weights", []):
+        if not isinstance(w, dict):
+            continue
+        loc = str(w.get("location", "disk")).lower()
+        flags = ["disk_available"]
+        if loc == "gpu":
+            flags.append("gpu_compute_resident")
+        elif loc == "cpu":
+            flags.append("cpu_compute_resident")
+        rows.append({
+            "name": w.get("name", ""),
+            "flags": flags,
+        })
+    state_path.write_text(json.dumps({"weights": rows}, indent=2, sort_keys=True) + "\n")
 
 
 def main() -> None:
@@ -22,6 +42,8 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
     ap.add_argument("--transition-weight", type=float, default=1.0)
+    ap.add_argument("--chain-state", action="store_true",
+                    help="build each budget using the previous lower-budget plan as current state")
     args = ap.parse_args()
 
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
@@ -32,25 +54,33 @@ def main() -> None:
     solver = Path(__file__).with_name("dynamic_budget_solver.py")
     index = []
 
-    for b in budgets:
-        out = args.out_dir / f"plan_{b}MiB.json"
-        cmd = [
-            sys.executable,
-            str(solver),
-            "--model-meta", str(args.model_meta),
-            "--cost-dir", str(args.cost_dir),
-            "--budget-mib", str(b),
-            "--kv-mib", str(args.kv_mib),
-            "--misc-mib", str(args.misc_mib),
-            "--safety-mib", str(args.safety_mib),
-            "--time-limit-ms", str(args.time_limit_ms),
-            "--transition-weight", str(args.transition_weight),
-            "--out", str(out),
-        ]
-        if args.allow_cpu_fallback:
-            cmd.append("--allow-cpu-fallback")
-        subprocess.run(cmd, check=True)
-        index.append({"budget_mib": b, "file": out.name})
+    with tempfile.TemporaryDirectory(prefix="offline_chain_state_") as td:
+        prev_state: Path | None = None
+        for b in budgets:
+            out = args.out_dir / f"plan_{b}MiB.json"
+            cmd = [
+                sys.executable,
+                str(solver),
+                "--model-meta", str(args.model_meta),
+                "--cost-dir", str(args.cost_dir),
+                "--budget-mib", str(b),
+                "--kv-mib", str(args.kv_mib),
+                "--misc-mib", str(args.misc_mib),
+                "--safety-mib", str(args.safety_mib),
+                "--time-limit-ms", str(args.time_limit_ms),
+                "--transition-weight", str(args.transition_weight),
+                "--out", str(out),
+            ]
+            if args.chain_state and prev_state is not None:
+                cmd.extend(["--state", str(prev_state)])
+            if args.allow_cpu_fallback:
+                cmd.append("--allow-cpu-fallback")
+            subprocess.run(cmd, check=True)
+            index.append({"budget_mib": b, "file": out.name})
+            if args.chain_state:
+                next_state = Path(td) / f"state_{b}MiB.json"
+                plan_to_state(out, next_state)
+                prev_state = next_state
 
     (args.out_dir / "index.json").write_text(json.dumps({"index": index}, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"out_dir": str(args.out_dir), "plans": len(index)}, indent=2))

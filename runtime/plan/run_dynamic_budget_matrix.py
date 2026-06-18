@@ -605,6 +605,9 @@ def main() -> None:
             str(args.safety_mib),
             "--time-limit-ms",
             str(args.time_limit_ms),
+            "--transition-weight",
+            str(args.transition_weight),
+            "--chain-state",
         ]
         if not args.dry_run:
             run(cmd)
