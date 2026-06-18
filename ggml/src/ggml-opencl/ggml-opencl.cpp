@@ -3667,7 +3667,18 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const bool csv_profile = est->profile_csv;
                 auto rl_t0 = (est->profile || est->timing || csv_profile) ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
-                int rc = elastic::wbmcl_ensure_resident(&est->octx, src_wbm_idx);
+                int rc = 0;
+                if (is_soa) {
+                    auto cit = est->octx.soa_per_idx.find(src_wbm_idx);
+                    if (cit == est->octx.soa_per_idx.end() || !cit->second.reload_fn) {
+                        GGML_LOG_ERROR("ggml_opencl elastic: missing SOA reload_fn idx=%d tensor=%s\n",
+                                       src_wbm_idx, src->name);
+                        return false;
+                    }
+                    rc = cit->second.reload_fn();
+                } else {
+                    rc = elastic::wbmcl_ensure_resident(&est->octx, src_wbm_idx);
+                }
                 if (rc != 0) {
                     GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
                                    src_wbm_idx, rc);
@@ -5163,11 +5174,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         auto e = it->second.back(); it->second.pop_back();
                         new_parent     = (cl_mem)e.parent;
                         s_soa_pooled_parents.erase((cl_mem)e.parent);   // 出池
-                        // 诊断 GGML_ELASTIC_POOL_PARENT_ONLY=1: 只复用 parent,
-                        // 释放旧 q/d sub-buffer, 下面重建 fresh(隔离 sub-buffer 对象复用是否出错)。
+                        // 默认只复用 parent, q/d sub-buffer 每次 reload 重建。
+                        // OP12/Adreno 在 dynamic plan 切换后复用旧 sub-buffer
+                        // 偶发 CL_INVALID_MEM_OBJECT; GGML_ELASTIC_POOL_PARENT_ONLY=0
+                        // 可恢复完整三件套复用用于性能诊断。
                         static const bool s_parent_only = []() {
                             const char *e2 = std::getenv("GGML_ELASTIC_POOL_PARENT_ONLY");
-                            return e2 && *e2 && *e2 != '0';
+                            return !(e2 && *e2 == '0');
                         }();
                         if (s_parent_only) {
                             if (e.q) clReleaseMemObject((cl_mem)e.q);

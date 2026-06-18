@@ -515,6 +515,17 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
         clReleaseEvent(static_cast<cl_event>(meta->last_use_event));
     }
 
+    auto soa = octx->soa_per_idx.find(idx);
+    if (soa != octx->soa_per_idx.end() && soa->second.evict_fn) {
+        const int rc = soa->second.evict_fn();
+        if (rc != 0) {
+            std::fprintf(stderr, "[wbmcl] SOA evict_fn 失败 block %d rc=%d\n", idx, rc);
+            return rc;
+        }
+        release_host_staging(octx, idx);
+        return 0;
+    }
+
     // Retain 模式：cl_mem 按 size 入池，cap 检查
     if (octx->retain_cl_mem) {
         if (octx->cache_byte_limit > 0) {
@@ -747,6 +758,17 @@ int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
         // 兼容性：若早期残留 last_use_event 引用还在则 release 掉
         if (m->last_use_event) {
             clReleaseEvent(static_cast<cl_event>(m->last_use_event));
+        }
+        auto soa = octx->soa_per_idx.find(v);
+        if (soa != octx->soa_per_idx.end() && soa->second.evict_fn) {
+            const int rc = soa->second.evict_fn();
+            if (rc != 0) {
+                std::fprintf(stderr, "[wbmcl] 批量 SOA evict_fn 失败 block %d rc=%d\n", v, rc);
+                continue;
+            }
+            release_host_staging(octx, v);
+            ++released;
+            continue;
         }
         cl_mem buf = static_cast<cl_mem>(m->backend_handle);
         if (buf) {
