@@ -493,11 +493,12 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
 
     cl_mem buf = static_cast<cl_mem>(meta->backend_handle);
 
-    // 默认不等 queue drain (MRU + 每 token sampling barrier 保证 victim 已 idle,
-    // 详见 wbmcl_evict_batch)。GGML_ELASTIC_EVICT_WAIT=1 恢复保守等待。
+    // 保守默认等待 queue drain。OP12/Adreno 750 在 dynamic plan 切换后若立即
+    // release/reuse cl_mem，driver 线程可能在旧 kernel 完成前触碰失效对象而崩溃。
+    // GGML_ELASTIC_EVICT_WAIT=0 可恢复激进路径用于单独做性能诊断。
     static const bool s_evict_wait = []() {
         const char *e = std::getenv("GGML_ELASTIC_EVICT_WAIT");
-        return e && *e && *e != '0';
+        return !(e && *e && *e == '0');
     }();
     if (s_evict_wait) {
         cl_event marker = nullptr;
@@ -711,15 +712,11 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
 int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
     if (!octx || !octx->wbm || !victims || n_victims <= 0) return 0;
 
-    // evict 前是否等 queue drain。默认 *不等*：
-    //   MRU 策略下 victim = 上一个 graph 最近用过的 weight；而 decode 每个 token
-    //   结尾要 sampling，读 logits 会隐式 drain 整个 graph → 下个 token 的 hook
-    //   进来做 evict 时，上个 graph 的所有 kernel (含 victim 最后一次使用) 必已完成。
-    //   所以插 marker + clWaitForEvents 是纯 overhead。
-    //   GGML_ELASTIC_EVICT_WAIT=1 恢复保守等待 (无 sampling barrier 的场景 / 调试)。
+    // evict 前是否等 queue drain。默认等待以避免 Adreno 在动态切换后释放/复用
+    // 仍被 driver 内部线程引用的 cl_mem。GGML_ELASTIC_EVICT_WAIT=0 可恢复激进路径。
     static const bool s_evict_wait = []() {
         const char *e = std::getenv("GGML_ELASTIC_EVICT_WAIT");
-        return e && *e && *e != '0';
+        return !(e && *e && *e == '0');
     }();
     if (s_evict_wait) {
         // in-order queue 顺序保证：queue 末尾插 marker，等它 = 等所有 prior kernel

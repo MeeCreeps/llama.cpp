@@ -58,6 +58,22 @@ def default_libomp_path() -> Path | None:
     return None
 
 
+def default_libcxx_path() -> Path | None:
+    candidates: list[Path] = []
+    for env_name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"):
+        ndk = os.environ.get(env_name)
+        if ndk:
+            candidates += sorted(Path(ndk).glob("toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"))
+    candidates += [
+        Path("/home/myid/hz85760/env/android-sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"),
+        Path("/home/myid/hz85760/ndk/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 @dataclass
 class TraceWindow:
     source: Path
@@ -496,6 +512,7 @@ def main() -> None:
     ap.add_argument("--model-host-path", type=Path, default=DEFAULT_MODEL_HOST_PATH)
     ap.add_argument("--llama-cli", type=Path, default=ROOT / "build-android-llama/bin/llama-cli")
     ap.add_argument("--libomp-path", type=Path, default=None)
+    ap.add_argument("--libcxx-path", type=Path, default=None)
     ap.add_argument("--model-meta", type=Path, default=ROOT / "runtime/plan/model_meta/Meta-Llama-3-8B-Instruct-Q4_0.weights_ops.json")
     ap.add_argument("--cost-dir", type=Path, default=ROOT / "runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01")
     ap.add_argument("--trace-glob", default="trace/traces_9g/trace_*.csv")
@@ -540,6 +557,8 @@ def main() -> None:
     args.phone_cost_dir = f"{args.remote_dir}/cost_matrix10min"
     if args.libomp_path is None:
         args.libomp_path = default_libomp_path()
+    if args.libcxx_path is None:
+        args.libcxx_path = default_libcxx_path()
     if args.bench_seconds is None:
         args.bench_seconds = args.window_sec / args.replay_speedup
 
@@ -602,6 +621,10 @@ def main() -> None:
                 adb(args.adb_serial, ["push", str(args.libomp_path), f"{args.remote_dir}/libomp.so"])
             else:
                 print("warning: libomp.so not found; set --libomp-path if llama-cli links OpenMP dynamically", flush=True)
+            if args.libcxx_path and args.libcxx_path.exists():
+                adb(args.adb_serial, ["push", str(args.libcxx_path), f"{args.remote_dir}/libc++_shared.so"])
+            else:
+                print("warning: libc++_shared.so not found; set --libcxx-path if llama-cli links libc++ dynamically", flush=True)
         if not args.skip_push_model:
             if not args.model_host_path.exists():
                 raise SystemExit(f"model host path not found: {args.model_host_path}")
