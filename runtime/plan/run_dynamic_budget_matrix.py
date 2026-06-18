@@ -423,6 +423,8 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         "GGML_ELASTIC_STAGE_DETAIL": "1",
         "GGML_ELASTIC_BUDGET_CSV": remote_trace,
         "GGML_ELASTIC_BUDGET_BUCKET_MB": str(args.bucket_mib),
+        "GGML_ELASTIC_KV_MB": str(args.kv_mib),
+        "GGML_ELASTIC_MISC_MB": str(args.misc_mib),
         "LLAMA_ELASTIC_DEFER_STAGE": "0",
     }
     if method in {"offline", "online", "mru"}:
