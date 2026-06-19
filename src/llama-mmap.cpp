@@ -740,6 +740,12 @@ std::vector<std::pair<llama_weight_movement_fn_t,  void *>>      g_weight_mov_pr
 std::vector<std::pair<llama_weight_stage_fn_t,     void *>>      g_weight_stage_providers;
 std::vector<std::pair<llama_weight_anchor_fn_t,    void *>>      g_weight_anchor_providers;
 std::vector<std::pair<llama_weight_transform_fn_t, void *>>      g_weight_transform_providers;
+struct llama_weight_runtime_record {
+    llama_weight_runtime_location desired = LLAMA_WEIGHT_RUNTIME_UNKNOWN;
+    bool cpu_compute_resident = false;
+    bool gpu_compute_resident = false;
+};
+std::unordered_map<std::string, llama_weight_runtime_record>      g_weight_runtime_state;
 // Budget provider: 单 slot (预算是全局值)。
 std::mutex                                                       g_budget_mtx;
 llama_budget_fn_t                                                g_budget_fn = nullptr;
@@ -848,13 +854,80 @@ uint32_t llama_weight_state_query(const char * name) {
     for (auto & p : snap) {
         if (p.first) flags |= p.first(name, p.second);
     }
+    flags |= llama_weight_runtime_state_query(name);
     return flags;
+}
+
+static uint32_t llama_weight_runtime_flags_locked(const llama_weight_runtime_record & r) {
+    uint32_t flags = 0;
+    if (r.cpu_compute_resident) flags |= LLAMA_WEIGHT_STATE_CPU_COMPUTE_RESIDENT;
+    if (r.gpu_compute_resident) flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+    return flags;
+}
+
+void llama_weight_runtime_mark_desired(const char * name, llama_weight_runtime_location loc) {
+    if (!name || !*name) return;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_runtime_state[name].desired = loc;
+}
+
+void llama_weight_runtime_mark_resident(const char * name, llama_weight_runtime_location loc) {
+    if (!name || !*name) return;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    auto & r = g_weight_runtime_state[name];
+    if (loc == LLAMA_WEIGHT_RUNTIME_CPU) {
+        r.cpu_compute_resident = true;
+        r.gpu_compute_resident = false;
+    } else if (loc == LLAMA_WEIGHT_RUNTIME_GPU) {
+        r.gpu_compute_resident = true;
+        r.cpu_compute_resident = false;
+    } else if (loc == LLAMA_WEIGHT_RUNTIME_DISK) {
+        r.cpu_compute_resident = false;
+        r.gpu_compute_resident = false;
+    }
+}
+
+void llama_weight_runtime_mark_evicted(const char * name, llama_weight_runtime_location loc) {
+    if (!name || !*name) return;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    auto & r = g_weight_runtime_state[name];
+    if (loc == LLAMA_WEIGHT_RUNTIME_CPU) {
+        r.cpu_compute_resident = false;
+    } else if (loc == LLAMA_WEIGHT_RUNTIME_GPU) {
+        r.gpu_compute_resident = false;
+    } else if (loc == LLAMA_WEIGHT_RUNTIME_DISK) {
+        r.cpu_compute_resident = false;
+        r.gpu_compute_resident = false;
+    }
+}
+
+uint32_t llama_weight_runtime_state_query(const char * name) {
+    if (!name || !*name) return 0;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    auto it = g_weight_runtime_state.find(name);
+    if (it == g_weight_runtime_state.end()) return 0;
+    return llama_weight_runtime_flags_locked(it->second);
 }
 int llama_weight_movement_request(const char * name, bool evict) {
     std::vector<std::pair<llama_weight_movement_fn_t, void *>> snap;
     {
         std::lock_guard<std::mutex> lk(g_weight_res_mtx);
         snap = g_weight_mov_providers;
+    }
+    if (evict) {
+        bool handled = false;
+        bool any_success = false;
+        int first_err = -2;
+        for (auto & p : snap) {
+            if (!p.first) continue;
+            int rc = p.first(name, true, p.second);
+            if (rc == -2) continue;
+            handled = true;
+            if (rc == 0) any_success = true;
+            if (rc != 0 && first_err == -2) first_err = rc;
+        }
+        if (!handled) return -2;
+        return any_success ? 0 : first_err;
     }
     for (auto & p : snap) {
         if (!p.first) continue;

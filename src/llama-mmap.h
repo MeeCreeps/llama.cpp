@@ -150,6 +150,21 @@ int  llama_weight_stage_request   (const char * name, const char * stage);
 int  llama_weight_anchor_request  (const char * anchor_name);
 int  llama_weight_transform_request(const char * name, llama_weight_transform_kind kind);
 
+// Canonical elastic runtime placement map. Backends still expose their own WBM
+// probes, but plan apply / staged movement update this shared map so online
+// planners can dump a stable CPU/GPU/DISK state instead of reconstructing it
+// only from backend-local query side effects.
+enum llama_weight_runtime_location {
+    LLAMA_WEIGHT_RUNTIME_UNKNOWN = 0,
+    LLAMA_WEIGHT_RUNTIME_DISK    = 1,
+    LLAMA_WEIGHT_RUNTIME_CPU     = 2,
+    LLAMA_WEIGHT_RUNTIME_GPU     = 3,
+};
+void llama_weight_runtime_mark_desired (const char * name, llama_weight_runtime_location loc);
+void llama_weight_runtime_mark_resident(const char * name, llama_weight_runtime_location loc);
+void llama_weight_runtime_mark_evicted (const char * name, llama_weight_runtime_location loc);
+uint32_t llama_weight_runtime_state_query(const char * name);
+
 // === Weight host (mmap) pointer query ===
 // elastic backends register: 给 name → host_ptr 查询 (mmap 区指针).
 // 用于跨 backend dispatch: weight 被 evict 时, 不走 cl_mem 而走 mmap 直接读.

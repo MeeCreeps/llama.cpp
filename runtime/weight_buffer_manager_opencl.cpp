@@ -299,6 +299,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         wbm_set_prefetch_event(octx->wbm, idx, nullptr);
         octx->bytes_uploaded_total += meta->byte_size;
         wbm_mark_resident(octx->wbm, idx, meta->backend_handle);
+        release_host_staging(octx, idx);
         return 0;
     }
 
@@ -605,15 +606,96 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
     const size_t nbytes = meta ? meta->byte_size : 0;
     const uint64_t t0 = now_us();
     octx->stage_transfer_calls++;
+
     int rc = 0;
-    if (octx && octx->soa_per_idx.find(idx) != octx->soa_per_idx.end()) {
+    if (!meta) {
+        rc = -2;
+    } else if (meta->resident || meta->prefetch_event) {
+        rc = 0;
+    } else if (octx->soa_per_idx.find(idx) != octx->soa_per_idx.end()) {
+        // SOA tensors still rely on their registered reload_fn because a raw
+        // host->GPU write is not sufficient to rebuild the device layout.
         rc = 0;
     } else {
-        rc = wbmcl_ensure_resident(octx, idx);
-        if (rc == 0) {
-            release_host_staging(octx, idx);
+        auto staged = octx->host_staging_by_idx.find(idx);
+        if (staged == octx->host_staging_by_idx.end() || staged->second.size() < meta->byte_size) {
+            // No preceding LOAD stage reached this tensor. Fall back to the
+            // correctness path, which may perform direct disk read + transfer
+            // synchronously.
+            rc = wbmcl_ensure_resident(octx, idx);
+            if (rc == 0) release_host_staging(octx, idx);
+        } else {
+            cl_int err = CL_SUCCESS;
+            cl_mem buf = nullptr;
+            if (octx->retain_cl_mem) {
+                auto it = octx->retained_buffers_by_size.find(meta->byte_size);
+                if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
+                    buf = static_cast<cl_mem>(it->second.back());
+                    it->second.pop_back();
+                    for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
+                        if (*lit == meta->byte_size) {
+                            octx->retain_order_sizes.erase(std::next(lit).base());
+                            break;
+                        }
+                    }
+                    octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
+                }
+            }
+            if (!buf) {
+                buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY, meta->byte_size, nullptr, &err);
+                if (err != CL_SUCCESS) {
+                    std::fprintf(stderr, "[wbmcl stage transfer] clCreateBuffer failed block %d size %zu: %s (%d)\n",
+                                 idx, meta->byte_size, cl_err(err), err);
+                    rc = -4;
+                } else {
+                    octx->n_creates += 1;
+                }
+            }
+            if (rc == 0) {
+                if (octx->xfer_queue) {
+                    cl_command_queue use_q = octx->xfer_queue;
+                    if (octx->n_xfer_extra > 0) {
+                        unsigned slot = octx->xfer_round_robin++ % (octx->n_xfer_extra + 1);
+                        if (slot > 0) use_q = octx->xfer_extra[slot - 1];
+                    }
+                    cl_event write_ev = nullptr;
+                    err = clEnqueueWriteBuffer(use_q, buf, CL_FALSE,
+                                               0, meta->byte_size, staged->second.data(),
+                                               0, nullptr, &write_ev);
+                    if (err != CL_SUCCESS) {
+                        std::fprintf(stderr, "[wbmcl stage transfer] async clEnqueueWriteBuffer failed block %d: %s (%d)\n",
+                                     idx, cl_err(err), err);
+                        clReleaseMemObject(buf);
+                        octx->n_releases += 1;
+                        rc = -5;
+                    } else {
+                        wbmcl_record_device_event(octx, write_ev,
+                                                  wbmcl_device_event_kind::TRANSFER_WRITE,
+                                                  meta->byte_size);
+                        clFlush(use_q);
+                        octx->wbm->blocks[static_cast<size_t>(idx)].backend_handle = static_cast<void *>(buf);
+                        wbm_set_prefetch_event(octx->wbm, idx, static_cast<void *>(write_ev));
+                    }
+                } else {
+                    err = clEnqueueWriteBuffer(octx->compute_queue, buf, CL_TRUE,
+                                               0, meta->byte_size, staged->second.data(),
+                                               0, nullptr, nullptr);
+                    if (err != CL_SUCCESS) {
+                        std::fprintf(stderr, "[wbmcl stage transfer] clEnqueueWriteBuffer failed block %d: %s (%d)\n",
+                                     idx, cl_err(err), err);
+                        clReleaseMemObject(buf);
+                        octx->n_releases += 1;
+                        rc = -5;
+                    } else {
+                        octx->bytes_uploaded_total += meta->byte_size;
+                        wbm_mark_resident(octx->wbm, idx, static_cast<void *>(buf));
+                        release_host_staging(octx, idx);
+                    }
+                }
+            }
         }
     }
+
     if (rc == 0) {
         octx->stage_transfer_ok++;
         octx->stage_transfer_bytes += nbytes;

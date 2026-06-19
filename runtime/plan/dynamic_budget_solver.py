@@ -33,6 +33,18 @@ from typing import Any
 MB = 1024 * 1024
 BACKENDS = ("CPU", "GPU")
 PLACEMENTS = ("cpu", "gpu", "disk_cpu", "disk_gpu")
+ENGINES = ("compute_cpu", "compute_gpu", "disk", "transfer", "xform_cpu", "xform_gpu", "sync")
+CP_OBJECTIVES = ("resource_makespan", "interval_makespan", "sum")
+
+
+def parse_allowed_placements(s: str | None) -> set[str]:
+    if not s:
+        return set(PLACEMENTS)
+    out = {p.strip() for p in s.split(",") if p.strip()}
+    bad = out.difference(PLACEMENTS)
+    if bad:
+        raise ValueError(f"unknown placement(s): {sorted(bad)}")
+    return out or set(PLACEMENTS)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -50,6 +62,7 @@ class CostModel:
     def __init__(self, cost_dir: Path):
         self.stage = load_cost_records(cost_dir, "stage_costs.json")
         self.ops = load_cost_records(cost_dir, "op_costs.json")
+        self.used_legacy_reload_ensure = False
 
     def measured_stage_ms(self, backend: str, kind: str, name: str, byte_size: int) -> float | None:
         best = None
@@ -79,6 +92,10 @@ class CostModel:
             return 0.05 + mb / 6000.0 * 1000.0
         if kind == "XFORM":
             return 0.10 + mb / 8000.0 * 1000.0
+        if kind == "SYNC":
+            return 0.03
+        if kind == "EVICT":
+            return 0.01
         return 0.0
 
     @staticmethod
@@ -157,29 +174,64 @@ class CostModel:
         return any(rec.get("backend") == backend and rec.get("kind") == kind for rec in self.stage)
 
     def gpu_reload_ms(self, name: str, byte_size: int) -> float:
-        measured = self.measured_stage_ms("OpenCL", "RELOAD_ENSURE", name, byte_size)
-        if measured is not None:
-            return measured
-        return (
-            self.stage_ms("OpenCL", "LOAD", name, byte_size)
-            + self.stage_ms("OpenCL", "TRANSFER", name, byte_size)
-            + self.stage_ms("OpenCL", "XFORM", name, byte_size)
-        )
+        return self.path_sum_ms("GPU", "disk", "gpu", name, byte_size)
 
     def cpu_reload_ms(self, name: str, byte_size: int) -> float:
-        measured = self.measured_stage_ms("CPU_Elastic", "RELOAD_ENSURE", name, byte_size)
-        if measured is not None:
-            return measured
-        return (
-            self.stage_ms("CPU_Elastic", "LOAD", name, byte_size)
-            + self.stage_ms("CPU_Elastic", "XFORM", name, byte_size)
-        )
+        return self.path_sum_ms("CPU", "disk", "cpu", name, byte_size)
 
     def cpu_to_gpu_ms(self, name: str, byte_size: int) -> float:
-        return (
-            self.stage_ms("OpenCL", "TRANSFER", name, byte_size)
-            + self.stage_ms("OpenCL", "XFORM", name, byte_size)
-        )
+        return self.path_sum_ms("GPU", "cpu", "gpu", name, byte_size)
+
+    def stage_path(self, backend: str, src: str, dst: str, name: str, byte_size: int) -> list[tuple[str, str, str, float]]:
+        """Return fine-grained stages as (kind, backend, engine, ms).
+
+        RELOAD_ENSURE deliberately is not part of the primary model: it is a
+        legacy black box and hides disk, transfer, transform and synchronization.
+        """
+        if dst == "disk" or src == dst:
+            return []
+        if backend == "GPU":
+            stages: list[tuple[str, str, str, float]] = []
+            if src == "disk":
+                stages.append(("LOAD", "OpenCL", "disk", self.stage_ms("OpenCL", "LOAD", name, byte_size)))
+            stages.append(("TRANSFER", "OpenCL", "transfer", self.stage_ms("OpenCL", "TRANSFER", name, byte_size)))
+            stages.append(("XFORM", "OpenCL", "gpu", self.stage_ms("OpenCL", "XFORM", name, byte_size)))
+            stages.append(("SYNC", "OpenCL", "gpu", self.stage_ms("OpenCL", "SYNC", name, byte_size)))
+            return stages
+        if src == "gpu":
+            # The runtime does not have GPU->CPU readback for model weights.
+            # Represent this as evict + reload from the disk-backed source.
+            return [
+                ("EVICT", "OpenCL", "cpu", self.stage_ms("OpenCL", "EVICT", name, byte_size)),
+                ("LOAD", "CPU_Elastic", "disk", self.stage_ms("CPU_Elastic", "LOAD", name, byte_size)),
+                ("XFORM", "CPU_Elastic", "cpu", self.stage_ms("CPU_Elastic", "XFORM", name, byte_size)),
+            ]
+        return [
+            ("LOAD", "CPU_Elastic", "disk", self.stage_ms("CPU_Elastic", "LOAD", name, byte_size)),
+            ("XFORM", "CPU_Elastic", "cpu", self.stage_ms("CPU_Elastic", "XFORM", name, byte_size)),
+        ]
+
+    def legacy_reload_ensure_ms(self, backend: str, name: str, byte_size: int) -> float | None:
+        measured = self.measured_stage_ms("OpenCL" if backend == "GPU" else "CPU_Elastic",
+                                          "RELOAD_ENSURE", name, byte_size)
+        if measured is not None:
+            self.used_legacy_reload_ensure = True
+        return measured
+
+    def path_sum_ms(self, backend: str, src: str, dst: str, name: str, byte_size: int) -> float:
+        return sum(stage[3] for stage in self.stage_path(backend, src, dst, name, byte_size))
+
+    def path_pipeline_ms(self, backend: str, src: str, dst: str, name: str, byte_size: int,
+                         compute_ms: float, overlap_model: str, stage_multiplier: float = 1.0) -> float:
+        stages = self.stage_path(backend, src, dst, name, byte_size)
+        if not stages:
+            return compute_ms
+        if overlap_model == "none":
+            return compute_ms + stage_multiplier * sum(stage[3] for stage in stages)
+        by_engine: dict[str, float] = {"compute": compute_ms}
+        for _, _, engine, ms in stages:
+            by_engine[engine] = by_engine.get(engine, 0.0) + stage_multiplier * ms
+        return max(by_engine.values())
 
     def compute_backend_ms(self, backend: str, name: str, byte_size: int, allow_cpu_fallback: bool) -> float:
         if backend == "CPU":
@@ -330,26 +382,114 @@ def transition_ms(choice: str, name: str, size: int, row: dict[str, Any] | None,
     return cm.cpu_reload_ms(name, size)
 
 
-def steady_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu_fallback: bool) -> float:
+def steady_engine_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu_fallback: bool,
+                     disk_reload_multiplier: float = 1.0) -> dict[str, float]:
     backend = placement_backend(choice)
     compute = cm.compute_backend_ms(backend, name, size, allow_cpu_fallback)
     if math.isinf(compute):
-        return math.inf
+        return {engine: math.inf for engine in ENGINES}
+    out = {engine: 0.0 for engine in ENGINES}
+    out["compute_gpu" if backend == "GPU" else "compute_cpu"] += compute
     if choice == "disk_gpu":
-        return compute + cm.gpu_reload_ms(name, size)
-    if choice == "disk_cpu":
-        return compute + cm.cpu_reload_ms(name, size)
-    return compute
+        for kind, _, engine, ms in cm.stage_path("GPU", "disk", "gpu", name, size):
+            key = {
+                "disk": "disk",
+                "transfer": "transfer",
+                "gpu": "xform_gpu" if kind == "XFORM" else "sync",
+                "cpu": "xform_cpu",
+            }.get(engine, engine)
+            out[key] = out.get(key, 0.0) + disk_reload_multiplier * ms
+    elif choice == "disk_cpu":
+        for kind, _, engine, ms in cm.stage_path("CPU", "disk", "cpu", name, size):
+            key = "disk" if engine == "disk" else "xform_cpu"
+            out[key] = out.get(key, 0.0) + disk_reload_multiplier * ms
+    return out
+
+
+def engine_makespan_ms(engine_ms: dict[str, float]) -> float:
+    return max(engine_ms.values()) if engine_ms else 0.0
+
+
+def steady_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu_fallback: bool,
+              disk_reload_multiplier: float = 1.0, overlap_model: str = "pipeline") -> float:
+    engine_ms = steady_engine_ms(choice, name, size, cm, allow_cpu_fallback, disk_reload_multiplier)
+    if any(math.isinf(v) for v in engine_ms.values()):
+        return math.inf
+    if overlap_model == "none":
+        return sum(engine_ms.values())
+    return engine_makespan_ms(engine_ms)
+
+
+def transition_engine_ms(choice: str, name: str, size: int, row: dict[str, Any] | None,
+                         cm: CostModel) -> dict[str, float]:
+    src = current_location(row)
+    dst = placement_location(choice)
+    backend = placement_backend(choice)
+    out = {engine: 0.0 for engine in ENGINES}
+    if src == dst or dst == "disk":
+        return out
+    for kind, _, engine, ms in cm.stage_path(backend, src, dst, name, size):
+        key = {
+            "disk": "disk",
+            "transfer": "transfer",
+            "gpu": "xform_gpu" if kind == "XFORM" else "sync",
+            "cpu": "xform_cpu",
+        }.get(engine, engine)
+        out[key] = out.get(key, 0.0) + ms
+    return out
+
+
+def stage_engine_key(kind: str, engine: str, backend: str) -> str:
+    if engine == "disk":
+        return "disk"
+    if engine == "transfer":
+        return "transfer"
+    if kind == "SYNC":
+        return "sync"
+    if engine == "gpu" or backend == "OpenCL":
+        return "xform_gpu"
+    return "xform_cpu"
+
+
+def selected_choice_intervals(choice: str, name: str, size: int, cm: CostModel,
+                              allow_cpu_fallback: bool,
+                              disk_reload_multiplier: float) -> list[dict[str, Any]]:
+    backend = placement_backend(choice)
+    compute = cm.compute_backend_ms(backend, name, size, allow_cpu_fallback)
+    if math.isinf(compute):
+        return []
+    out: list[dict[str, Any]] = []
+    if choice == "disk_gpu":
+        for kind, stage_backend, engine, ms in cm.stage_path("GPU", "disk", "gpu", name, size):
+            out.append({
+                "kind": kind.lower(),
+                "engine": stage_engine_key(kind, engine, stage_backend),
+                "ms": disk_reload_multiplier * ms,
+            })
+    elif choice == "disk_cpu":
+        for kind, stage_backend, engine, ms in cm.stage_path("CPU", "disk", "cpu", name, size):
+            out.append({
+                "kind": kind.lower(),
+                "engine": stage_engine_key(kind, engine, stage_backend),
+                "ms": disk_reload_multiplier * ms,
+            })
+    out.append({
+        "kind": "compute",
+        "engine": "compute_gpu" if backend == "GPU" else "compute_cpu",
+        "ms": compute,
+    })
+    return out
 
 
 def placement_costs(weight: dict[str, Any], cm: CostModel, state: dict[str, dict[str, Any]],
-                    allow_cpu_fallback: bool, transition_weight: float) -> dict[str, float]:
+                    allow_cpu_fallback: bool, transition_weight: float,
+                    disk_reload_multiplier: float, overlap_model: str) -> dict[str, float]:
     name = str(weight["name"])
     size = int(weight.get("byte_size", 0))
     row = state.get(name)
     out: dict[str, float] = {}
     for choice in PLACEMENTS:
-        steady = steady_ms(choice, name, size, cm, allow_cpu_fallback)
+        steady = steady_ms(choice, name, size, cm, allow_cpu_fallback, disk_reload_multiplier, overlap_model)
         if math.isinf(steady):
             out[choice] = math.inf
             continue
@@ -357,8 +497,30 @@ def placement_costs(weight: dict[str, Any], cm: CostModel, state: dict[str, dict
     return out
 
 
-def select_placements_cp(items: list[tuple[int, int, dict[str, float]]], budget_bytes: int,
-                         time_limit_ms: int) -> dict[int, str] | None:
+def placement_engine_costs(weight: dict[str, Any], cm: CostModel, state: dict[str, dict[str, Any]],
+                           allow_cpu_fallback: bool, transition_weight: float,
+                           disk_reload_multiplier: float) -> dict[str, dict[str, float]]:
+    name = str(weight["name"])
+    size = int(weight.get("byte_size", 0))
+    row = state.get(name)
+    out: dict[str, dict[str, float]] = {}
+    for choice in PLACEMENTS:
+        engines = steady_engine_ms(choice, name, size, cm, allow_cpu_fallback, disk_reload_multiplier)
+        if any(math.isinf(v) for v in engines.values()):
+            out[choice] = {engine: math.inf for engine in ENGINES}
+            continue
+        if transition_weight > 0.0:
+            trans = transition_engine_ms(choice, name, size, row, cm)
+            for engine, ms in trans.items():
+                engines[engine] = engines.get(engine, 0.0) + transition_weight * ms
+        out[choice] = engines
+    return out
+
+
+def select_placements_cp(items: list[tuple[int, int, int, str, dict[str, float], dict[str, dict[str, float]], dict[str, list[dict[str, Any]]]]],
+                         budget_bytes: int, time_limit_ms: int,
+                         objective: str = "resource_makespan",
+                         prefetch_distance: int = 1) -> dict[str, Any] | None:
     try:
         from ortools.sat.python import cp_model  # type: ignore
     except Exception:
@@ -366,7 +528,7 @@ def select_placements_cp(items: list[tuple[int, int, dict[str, float]]], budget_
 
     model = cp_model.CpModel()
     x: dict[tuple[int, str], Any] = {}
-    for wid, _, costs in items:
+    for wid, _, _, _, costs, _, _ in items:
         feasible = [choice for choice in PLACEMENTS if not math.isinf(costs.get(choice, math.inf))]
         if not feasible:
             feasible = ["disk_gpu"]
@@ -375,37 +537,171 @@ def select_placements_cp(items: list[tuple[int, int, dict[str, float]]], budget_
         model.Add(sum(x[(wid, choice)] for choice in feasible) == 1)
     model.Add(
         sum(size * x[(wid, choice)]
-            for wid, size, costs in items
+            for wid, size, _, _, costs, _, _ in items
             for choice in PLACEMENTS
             if (wid, choice) in x and placement_resident_bytes(choice, size) > 0) <= budget_bytes
     )
-    model.Minimize(
-        sum(int(max(0.0, costs.get(choice, math.inf)) * 1000.0) * x[(wid, choice)]
-            for wid, _, costs in items
-            for choice in PLACEMENTS
-            if (wid, choice) in x)
-    )
+    total_cost_terms = [
+        int(max(0.0, costs.get(choice, math.inf)) * 1000.0) * x[(wid, choice)]
+        for wid, _, _, _, costs, _, _ in items
+        for choice in PLACEMENTS
+        if (wid, choice) in x
+    ]
+    if objective == "sum":
+        model.Minimize(sum(total_cost_terms))
+    else:
+        engine_loads = []
+        total_engine_work_terms = []
+        total_compute_work_terms = []
+        for engine in ENGINES:
+            terms = []
+            for wid, _, _, _, _, engine_costs, _ in items:
+                for choice in PLACEMENTS:
+                    if (wid, choice) not in x:
+                        continue
+                    ms = engine_costs.get(choice, {}).get(engine, math.inf)
+                    if math.isinf(ms):
+                        continue
+                    terms.append(int(max(0.0, ms) * 1000.0) * x[(wid, choice)])
+            load = model.NewIntVar(0, 10**12, f"load_{engine}")
+            model.Add(load == sum(terms))
+            engine_loads.append(load)
+            total_engine_work_terms.extend(terms)
+            if engine in ("compute_cpu", "compute_gpu"):
+                total_compute_work_terms.extend(terms)
+        if objective == "resource_makespan":
+            makespan = model.NewIntVar(0, 10**12, "resource_makespan")
+            for load in engine_loads:
+                model.Add(makespan >= load)
+            # Primary objective is overlapped resource makespan. Tie-break first
+            # on compute work, then on total work. This avoids systematically
+            # choosing disk_cpu over disk_gpu when disk load dominates both paths
+            # but GPU compute is measured faster and transfer/xform can overlap.
+            model.Minimize(makespan * 1000000 + sum(total_compute_work_terms) * 1000 + sum(total_engine_work_terms) + sum(total_cost_terms))
+        else:
+            resource_intervals: dict[str, list[Any]] = {engine: [] for engine in ENGINES}
+            interval_meta: dict[tuple[int, str, int], dict[str, Any]] = {}
+            compute_vars: dict[tuple[int, str], tuple[int, Any, Any]] = {}
+            horizon = max(1, sum(
+                int(max(1.0, op.get("ms", 0.0) * 1000.0))
+                for _, _, _, _, _, _, choice_ops in items
+                for ops in choice_ops.values()
+                for op in ops
+            ) + 1)
+            for wid, _, order, name, _, _, choice_ops in items:
+                for choice, ops in choice_ops.items():
+                    if (wid, choice) not in x:
+                        continue
+                    prev_end = None
+                    for idx, op in enumerate(ops):
+                        dur = int(max(1.0, float(op.get("ms", 0.0)) * 1000.0))
+                        start = model.NewIntVar(0, horizon, f"s_{wid}_{choice}_{idx}")
+                        end = model.NewIntVar(0, horizon, f"e_{wid}_{choice}_{idx}")
+                        interval = model.NewOptionalIntervalVar(
+                            start, dur, end, x[(wid, choice)], f"iv_{wid}_{choice}_{idx}"
+                        )
+                        engine = str(op.get("engine", "compute_gpu"))
+                        resource_intervals.setdefault(engine, []).append(interval)
+                        if prev_end is not None:
+                            model.Add(start >= prev_end).OnlyEnforceIf(x[(wid, choice)])
+                        prev_end = end
+                        interval_meta[(wid, choice, idx)] = {
+                            "weight_id": wid,
+                            "anchor_op_id": order,
+                            "weight_name": name,
+                            "choice": choice,
+                            "kind": op.get("kind"),
+                            "engine": engine,
+                            "duration_ms": dur / 1000.0,
+                            "start": start,
+                            "end": end,
+                        }
+                        if op.get("kind") == "compute":
+                            compute_vars[(wid, choice)] = (order, start, end)
+            for intervals in resource_intervals.values():
+                if intervals:
+                    model.AddNoOverlap(intervals)
+            ordered_items = sorted(items, key=lambda item: item[2])
+            for prev_item, next_item in zip(ordered_items, ordered_items[1:]):
+                prev_wid = prev_item[0]
+                next_wid = next_item[0]
+                for prev_choice in PLACEMENTS:
+                    prev_key = (prev_wid, prev_choice)
+                    if prev_key not in compute_vars or prev_key not in x:
+                        continue
+                    for next_choice in PLACEMENTS:
+                        next_key = (next_wid, next_choice)
+                        if next_key not in compute_vars or next_key not in x:
+                            continue
+                        _, _, prev_end = compute_vars[prev_key]
+                        _, next_start, _ = compute_vars[next_key]
+                        # Approximate llama graph dependency: op i+1 cannot
+                        # start before op i finishes. This is conditional on
+                        # the two placement choices actually being selected.
+                        model.Add(next_start >= prev_end).OnlyEnforceIf([x[prev_key], x[next_key]])
+            makespan = model.NewIntVar(0, horizon, "interval_makespan")
+            for _, _, end in compute_vars.values():
+                model.Add(makespan >= end)
+            model.Minimize(makespan * 1000000 + sum(total_compute_work_terms) * 1000 + sum(total_engine_work_terms) + sum(total_cost_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(time_limit_ms, 1) / 1000.0
     solver.parameters.num_search_workers = 1
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {}
+        return {"placements": {}, "schedule": [], "objective_ms": None, "status": solver.StatusName(status)}
     out: dict[int, str] = {}
-    for wid, _, _ in items:
+    for wid, _, _, _, _, _, _ in items:
         for choice in PLACEMENTS:
             if (wid, choice) in x and solver.Value(x[(wid, choice)]) == 1:
                 out[wid] = choice
                 break
-    return out
+    schedule = []
+    if objective == "interval_makespan":
+        raw_schedule = []
+        for (wid, choice, _), meta in interval_meta.items():
+            if out.get(wid) != choice:
+                continue
+            raw_schedule.append({
+                "weight_id": wid,
+                "anchor_op_id": int(meta.get("anchor_op_id", wid)),
+                "weight_name": meta["weight_name"],
+                "choice": choice,
+                "kind": meta["kind"],
+                "engine": meta["engine"],
+                "start_ms": solver.Value(meta["start"]) / 1000.0,
+                "end_ms": solver.Value(meta["end"]) / 1000.0,
+                "duration_ms": meta["duration_ms"],
+            })
+        # Runtime execution is index based.  Each non-compute stage is
+        # anchored relative to the true consumer op of that weight, not to the
+        # virtual interval start.  start_ms/end_ms are diagnostic CP-SAT
+        # coordinates only; runtime never waits for virtual time.
+        lead = max(0, int(prefetch_distance))
+        stage_leads = {
+            "load": lead * 2,
+            "transfer": lead,
+            "xform": lead,
+            "sync": 0,
+        }
+        for row in raw_schedule:
+            consumer = int(row.get("anchor_op_id", row.get("weight_id", 0)))
+            if row.get("kind") == "compute":
+                row["consumer_op_id"] = consumer
+                continue
+            row["consumer_op_id"] = consumer
+            row["anchor_op_id"] = max(0, consumer - int(stage_leads.get(str(row.get("kind")), lead)))
+        schedule = raw_schedule
+        schedule.sort(key=lambda row: (row["anchor_op_id"], row["start_ms"], row["end_ms"], row["weight_id"], row["kind"]))
+    objective_ms = solver.ObjectiveValue() / 1000000.0 if objective == "interval_makespan" else None
+    return {"placements": out, "schedule": schedule, "objective_ms": objective_ms, "status": solver.StatusName(status)}
 
 
-def select_placements_greedy(items: list[tuple[int, int, dict[str, float]]], budget_bytes: int) -> dict[int, str]:
+def select_placements_greedy(items: list[tuple[int, int, int, str, dict[str, float], dict[str, dict[str, float]], dict[str, list[dict[str, Any]]]]], budget_bytes: int) -> dict[int, str]:
     out: dict[int, str] = {}
     used = 0
     upgrades = []
-    for wid, size, costs in items:
+    for wid, size, _, _, costs, _, _ in items:
         disk_choices = [c for c in ("disk_cpu", "disk_gpu") if not math.isinf(costs.get(c, math.inf))]
         base = min(disk_choices or ["disk_gpu"], key=lambda c: costs.get(c, math.inf))
         out[wid] = base
@@ -438,31 +734,63 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(args.state)
     cm = CostModel(args.cost_dir)
     has_state = args.state is not None
+    allowed_placements = parse_allowed_placements(getattr(args, "allowed_placements", None))
 
     budget_bytes = max(0, (args.budget_mib - args.kv_mib - args.misc_mib - args.safety_mib) * MB)
     objective_transition_weight = float(args.transition_weight) if has_state else 0.0
-    items = []
-    for w in weights:
-        wid = int(w["weight_id"])
-        size = int(w.get("byte_size", 0))
-        costs = placement_costs(
-            w, cm, state,
-            allow_cpu_fallback=bool(args.allow_cpu_fallback),
-            transition_weight=objective_transition_weight,
-        )
-        items.append((wid, size, costs))
-
-    placements = select_placements_cp(items, budget_bytes, args.time_limit_ms)
-    solver_kind = "cp_sat"
-    if placements is None:
-        placements = select_placements_greedy(items, budget_bytes)
-        solver_kind = "greedy"
-
     by_id = {int(w["weight_id"]): w for w in weights}
     first_consumer: dict[int, int] = {}
     for op in ops:
         wid = int(op.get("weight_id", -1))
         first_consumer.setdefault(wid, int(op["op_id"]))
+    items = []
+    for w in weights:
+        wid = int(w["weight_id"])
+        size = int(w.get("byte_size", 0))
+        name = str(w["name"])
+        costs = placement_costs(
+            w, cm, state,
+            allow_cpu_fallback=bool(args.allow_cpu_fallback),
+            transition_weight=objective_transition_weight,
+            disk_reload_multiplier=float(args.disk_reload_multiplier),
+            overlap_model=str(args.overlap_model),
+        )
+        for choice in PLACEMENTS:
+            if choice not in allowed_placements:
+                costs[choice] = math.inf
+        engine_costs = placement_engine_costs(
+            w, cm, state,
+            allow_cpu_fallback=bool(args.allow_cpu_fallback),
+            transition_weight=objective_transition_weight,
+            disk_reload_multiplier=float(args.disk_reload_multiplier),
+        )
+        for choice in PLACEMENTS:
+            if choice not in allowed_placements:
+                engine_costs[choice] = {engine: math.inf for engine in ENGINES}
+        choice_ops = {
+            choice: selected_choice_intervals(
+                choice, name, size, cm, bool(args.allow_cpu_fallback), float(args.disk_reload_multiplier)
+            )
+            for choice in PLACEMENTS
+            if choice in allowed_placements and not math.isinf(costs.get(choice, math.inf))
+        }
+        items.append((wid, size, first_consumer.get(wid, wid), name, costs, engine_costs, choice_ops))
+
+    cp_result = select_placements_cp(
+        items, budget_bytes, args.time_limit_ms, str(args.cp_objective), int(args.prefetch_distance)
+    )
+    solver_kind = "cp_sat"
+    cp_schedule: list[dict[str, Any]] = []
+    cp_objective_ms = None
+    cp_status = None
+    placements = cp_result.get("placements", {}) if cp_result else None
+    if cp_result:
+        cp_schedule = list(cp_result.get("schedule", []))
+        cp_objective_ms = cp_result.get("objective_ms")
+        cp_status = cp_result.get("status")
+    if not placements:
+        placements = select_placements_greedy(items, budget_bytes)
+        solver_kind = "greedy"
 
     plan_weights = []
     timeline = []
@@ -491,7 +819,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         src = current_location(row)
         consumer = first_consumer.get(wid, 0)
         anchor = consumer if consumer <= args.prefetch_distance else max(0, consumer - args.prefetch_distance)
-        pred_ms += steady_ms(choice, name, size, cm, bool(args.allow_cpu_fallback))
+        pred_ms += steady_ms(choice, name, size, cm, bool(args.allow_cpu_fallback),
+                             float(args.disk_reload_multiplier), str(args.overlap_model))
 
         if location == "disk":
             if state_any_resident(row):
@@ -548,17 +877,29 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "weights": plan_weights,
         "ops": plan_ops,
         "timeline": timeline,
+        "schedule": {
+            "kind": "interval_cp_sat" if str(args.cp_objective) == "interval_makespan" and cp_schedule else "none",
+            "objective_ms": cp_objective_ms,
+            "status": cp_status,
+            "events": cp_schedule,
+        },
         "pred_per_token_ms": pred_ms,
         "bottleneck": solver_kind,
         "cost_model": {
             "backend_choice": "multi_backend_placement",
-            "gpu_movement_cost": "reload_ensure" if cm.has_measured_stage_kind("OpenCL", "RELOAD_ENSURE") else "load_transfer_xform",
+            "movement_cost": "fine_stage_path",
+            "legacy_reload_ensure_available": cm.has_measured_stage_kind("OpenCL", "RELOAD_ENSURE") or cm.has_measured_stage_kind("CPU_Elastic", "RELOAD_ENSURE"),
+            "legacy_reload_ensure_used": cm.used_legacy_reload_ensure,
+            "overlap_model": str(args.overlap_model),
+            "cp_objective": str(args.cp_objective),
             "opencl_compute_measured": cm.has_measured_backend_compute("OpenCL"),
             "cpu_elastic_compute_measured": cm.has_measured_backend_compute("CPU_Elastic"),
             "opencl_stage_measured": cm.has_measured_stage_backend("OpenCL"),
             "cpu_elastic_stage_measured": cm.has_measured_stage_backend("CPU_Elastic"),
             "cpu_fallback_enabled": bool(args.allow_cpu_fallback),
+            "allowed_placements": sorted(allowed_placements),
             "transition_weight": objective_transition_weight,
+            "disk_reload_multiplier": float(args.disk_reload_multiplier),
         },
     }
 
@@ -576,8 +917,16 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true",
                     help="allow estimated CPU per-op compute when measured CPU_Elastic COMPUTE rows are unavailable")
+    ap.add_argument("--allowed-placements", default=",".join(PLACEMENTS),
+                    help=f"comma-separated placement choices to allow; valid={','.join(PLACEMENTS)}")
     ap.add_argument("--transition-weight", type=float, default=1.0,
                     help="weight applied to current-state transition/migration cost in the online objective")
+    ap.add_argument("--disk-reload-multiplier", type=float, default=1.0,
+                    help="multiplier applied to steady-state disk/on-demand reload cost")
+    ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline",
+                    help="pipeline uses max per engine for disk/transfer/xform/compute; none sums all stages")
+    ap.add_argument("--cp-objective", choices=CP_OBJECTIVES, default="resource_makespan",
+                    help="CP-SAT objective: interval_makespan uses optional intervals and NoOverlap resources")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 

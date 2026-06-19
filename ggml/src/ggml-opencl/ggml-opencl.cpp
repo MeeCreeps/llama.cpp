@@ -2972,6 +2972,7 @@ struct ggml_opencl_elastic_state {
     // === Runtime scheduler 集成: tensor name → wbm_idx ===
     std::mutex                              sched_mtx;
     std::unordered_map<std::string, int>    name_to_wbm;
+    std::unordered_map<int, std::string>    wbm_to_name;
     bool                                    sched_registered = false;
 };
 
@@ -2983,6 +2984,13 @@ static ggml_opencl_elastic_state * ggml_opencl_elastic() {
 static void opencl_profile_stage(const char *kind, const char *name, int idx,
                                  size_t bytes, double ms, int ok,
                                  const char *extra = "");
+
+static std::string opencl_name_for_idx(ggml_opencl_elastic_state *s, int idx) {
+    if (!s || idx < 0) return {};
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto it = s->wbm_to_name.find(idx);
+    return it == s->wbm_to_name.end() ? std::string{} : it->second;
+}
 
 // === Runtime scheduler handlers (registered with llama-mmap registry) ===
 static bool opencl_sched_residency_query(const char *name, void * /*ud*/) {
@@ -3038,10 +3046,12 @@ static int opencl_sched_movement_request(const char *name, bool evict, void * /*
         if (!bm->resident) return 0;
         int rc = elastic::wbmcl_evict_batch(&s->octx, &idx, 1);
         s->n_evicts_total += rc > 0 ? 1 : 0;
+        if (rc > 0) llama_weight_runtime_mark_evicted(name, LLAMA_WEIGHT_RUNTIME_GPU);
         return 0;
     }
     if (bm->resident) return 0;
     int rc = elastic::wbmcl_ensure_resident(&s->octx, idx);
+    if (rc == 0) llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_GPU);
     return rc == 0 ? 0 : -4;
 }
 
@@ -3061,7 +3071,10 @@ static int opencl_sched_stage_request(const char *name, const char *stage, void 
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
     int rc = -3;
-    if (strcmp(stage, "load") == 0) {
+    if (strcmp(stage, "load_cpu") == 0) {
+        return -2;
+    }
+    if (strcmp(stage, "load") == 0 || strcmp(stage, "load_gpu") == 0) {
         rc = elastic::wbmcl_load_host(&s->octx, idx);
         if (s->profile_csv) {
             const auto t1 = std::chrono::steady_clock::now();
@@ -3100,6 +3113,7 @@ static int opencl_sched_transform_request(const char *name, llama_weight_transfo
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
     const int rc = elastic::wbmcl_transform_backend(&s->octx, idx);
+    if (rc == 0) llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_GPU);
     if (s->profile_csv) {
         const auto t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3660,6 +3674,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                                                                   /*exclude=*/src_wbm_idx, &victims);
                         if (n > 0) {
                             int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
+                            for (int i = 0; i < released && i < n; ++i) {
+                                const std::string name = opencl_name_for_idx(est, victims[i]);
+                                if (!name.empty()) {
+                                    llama_weight_runtime_mark_evicted(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                                }
+                            }
                             est->n_evicts_total += released;
                         }
                     }
@@ -3683,6 +3703,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     GGML_LOG_ERROR("ggml_opencl elastic: ensure_resident 失败 idx=%d rc=%d\n",
                                    src_wbm_idx, rc);
                     return false;
+                }
+                {
+                    const std::string name = opencl_name_for_idx(est, src_wbm_idx);
+                    if (!name.empty()) {
+                        llama_weight_runtime_mark_resident(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                    }
                 }
                 if (est->profile || est->timing || csv_profile) {
                     auto rl_t1 = std::chrono::steady_clock::now();
@@ -3821,6 +3847,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                                                               /*exclude=*/-1, &victims);
                     if (n > 0) {
                         int released = elastic::wbmcl_evict_batch(&est->octx, victims.data(), n);
+                        for (int i = 0; i < released && i < n; ++i) {
+                            const std::string name = opencl_name_for_idx(est, victims[i]);
+                            if (!name.empty()) {
+                                llama_weight_runtime_mark_evicted(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                            }
+                        }
                         est->n_evicts_total += released;
                     }
                 }
@@ -4649,6 +4681,10 @@ static void ggml_opencl_elastic_register_soa(
     if (tensor && tensor->name[0]) {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
         s->name_to_wbm[tensor->name] = idx;
+        s->wbm_to_name[idx] = tensor->name;
+    }
+    if (tensor && tensor->name[0]) {
+        llama_weight_runtime_mark_resident(tensor->name, LLAMA_WEIGHT_RUNTIME_GPU);
     }
     opencl_sched_register_once();
 
@@ -5703,6 +5739,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (tensor && tensor->name[0]) {
                         std::lock_guard<std::mutex> lk(s->sched_mtx);
                         s->name_to_wbm[tensor->name] = idx;
+                        s->wbm_to_name[idx] = tensor->name;
+                    }
+                    if (tensor && tensor->name[0]) {
+                        llama_weight_runtime_mark_resident(tensor->name, LLAMA_WEIGHT_RUNTIME_GPU);
                     }
                     opencl_sched_register_once();
                     // 同步 slot → wbm_idx，析构时能识别 WBM 已 evict 的 dead slot

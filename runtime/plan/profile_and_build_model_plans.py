@@ -63,6 +63,147 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def write_stage_probe_plan(meta_path: Path, out_path: Path, backend: str, budget_mib: int,
+                           samples_per_size: int) -> None:
+    meta = read_json(meta_path)
+    all_weights = list(meta.get("weights", []))
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for w in all_weights:
+        key = (int(w.get("byte_size", w.get("bytes", 0))), str(w.get("quant", "")))
+        grouped.setdefault(key, []).append(w)
+
+    weights = []
+    for _, group in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        weights.extend(group[:max(1, samples_per_size)])
+
+    # Reindex the compact probe plan densely. ExecPlan::weight_by_id expects a
+    # vector index, so sparse original model ids would be unsafe here.
+    for i, w in enumerate(weights):
+        w = dict(w)
+        w["weight_id"] = i
+        weights[i] = w
+
+    ops = [
+        {
+            "op_id": i,
+            "name": w.get("name", f"weight_{i}"),
+            "layer": w.get("layer", -1),
+            "weight_id": i,
+        }
+        for i, w in enumerate(weights)
+    ]
+
+    first_consumer: dict[int, int] = {}
+    for i, op in enumerate(ops):
+        wid = int(op.get("weight_id", i))
+        first_consumer.setdefault(wid, int(op.get("op_id", i)))
+
+    be = backend.lower()
+    if be not in {"gpu", "cpu"}:
+        raise ValueError(f"unsupported stage probe backend: {backend}")
+
+    plan_weights = []
+    timeline = []
+    for i, w in enumerate(weights):
+        wid = int(w.get("weight_id", i))
+        name = str(w.get("name", f"weight_{wid}"))
+        byte_size = int(w.get("byte_size", w.get("bytes", 0)))
+        anchor = first_consumer.get(wid, 0)
+        plan_weights.append(
+            {
+                "weight_id": wid,
+                "name": name,
+                "layer": int(w.get("layer", -1)),
+                "byte_size": byte_size,
+                "location": "disk",
+                "pinned": False,
+                "xform": "none",
+            }
+        )
+        timeline.append(
+            {
+                "kind": "load",
+                "weight_id": wid,
+                "from_loc": "disk",
+                "to_loc": "cpu",
+                "engine": "disk",
+                "anchor_op_id": anchor,
+                "overlap_group": -1,
+            }
+        )
+        if be == "gpu":
+            timeline.append(
+                {
+                    "kind": "transfer",
+                    "weight_id": wid,
+                    "from_loc": "cpu",
+                    "to_loc": "gpu",
+                    "engine": "transfer",
+                    "anchor_op_id": anchor,
+                    "overlap_group": -1,
+                }
+            )
+            timeline.append(
+                {
+                    "kind": "xform",
+                    "weight_id": wid,
+                    "from_loc": "gpu",
+                    "to_loc": "gpu",
+                    "engine": "gpu",
+                    "anchor_op_id": anchor,
+                    "overlap_group": -1,
+                }
+            )
+        else:
+            timeline.append(
+                {
+                    "kind": "xform",
+                    "weight_id": wid,
+                    "from_loc": "cpu",
+                    "to_loc": "cpu",
+                    "engine": "cpu",
+                    "anchor_op_id": anchor,
+                    "overlap_group": -1,
+                }
+            )
+
+    plan_ops = []
+    for i, op in enumerate(ops):
+        wid = int(op.get("weight_id", i))
+        plan_ops.append(
+            {
+                "op_id": int(op.get("op_id", i)),
+                "name": op.get("name", weights[wid].get("name", f"weight_{wid}") if 0 <= wid < len(weights) else f"op_{i}"),
+                "layer": int(op.get("layer", -1)),
+                "compute_backend": be,
+                "weight_id": wid,
+                "dispatch": "static",
+                "migrate": False,
+                "migrate_from": be,
+                "migrate_xform": "none",
+            }
+        )
+
+    write_json(
+        out_path,
+        {
+            "schema_version": 1,
+            "budget_mib": budget_mib,
+            "kv_bytes": 0,
+            "misc_bytes": 0,
+            "weights": plan_weights,
+            "ops": plan_ops,
+            "timeline": timeline,
+            "pred_per_token_ms": 0.0,
+            "bottleneck": f"{be}_stage_probe",
+            "cost_model": {
+                "purpose": "fine_stage_profile_probe",
+                "backend": be,
+            },
+        },
+    )
+
+
 def csv_rows(path: Path) -> int:
     if not path.exists():
         return 0
@@ -82,10 +223,10 @@ def profile_command(
     threads: int,
     mode: str,
     remote_trace: str | None,
+    remote_plan: str | None = None,
 ) -> str:
     env = {
         "LD_LIBRARY_PATH": remote_dir,
-        "GGML_ELASTIC_PROFILE": "1",
         "GGML_ELASTIC_PROFILE_CSV": f"{remote_dir}/{csv_name}",
     }
 
@@ -113,6 +254,7 @@ def profile_command(
     if mode == "opencl-compute":
         env.update(
             {
+                "GGML_ELASTIC_PROFILE": "1",
                 "GGML_OPENCL_DISABLE_ALLOC_HOST_PTR": "1",
                 "GGML_OPENCL_USE_SVM": "1",
                 "GGML_OPENCL_ELASTIC": "1",
@@ -122,6 +264,7 @@ def profile_command(
     elif mode == "opencl-reload":
         env.update(
             {
+                "GGML_ELASTIC_PROFILE": "1",
                 "GGML_OPENCL_DISABLE_ALLOC_HOST_PTR": "1",
                 "GGML_OPENCL_USE_SVM": "1",
                 "GGML_OPENCL_ELASTIC": "1",
@@ -133,11 +276,36 @@ def profile_command(
         if remote_trace:
             env["GGML_ELASTIC_BUDGET_CSV"] = remote_trace
         argv += ["-ngl", "99", "-fa", "on"]
+    elif mode == "opencl-stage":
+        if not remote_plan:
+            raise ValueError("opencl-stage requires remote_plan")
+        env.update(
+            {
+                "GGML_OPENCL_DISABLE_ALLOC_HOST_PTR": "1",
+                "GGML_OPENCL_USE_SVM": "1",
+                "GGML_OPENCL_ELASTIC": "1",
+                "GGML_ELASTIC_TIMING": "1",
+                "GGML_ELASTIC_STAGE_DETAIL": "1",
+                "LLAMA_ELASTIC_APPLY": remote_plan,
+                "LLAMA_ELASTIC_DEFER_STAGE": "0",
+            }
+        )
+        argv += ["-ngl", "99", "-fa", "on"]
     elif mode == "cpu-compute":
         env.update(
             {
                 "GGML_ELASTIC_CHUNK_SIZE": "1",
                 "GGML_ELASTIC_PROFILE": "1",
+            }
+        )
+        argv += ["-ngl", "0", "-dev", "CPU_Elastic"]
+    elif mode == "cpu-stage":
+        if not remote_plan:
+            raise ValueError("cpu-stage requires remote_plan")
+        env.update(
+            {
+                "LLAMA_ELASTIC_APPLY": remote_plan,
+                "LLAMA_ELASTIC_DEFER_STAGE": "0",
             }
         )
         argv += ["-ngl", "0", "-dev", "CPU_Elastic"]
@@ -164,11 +332,14 @@ def main() -> None:
     ap.add_argument("--n-opencl", type=int, default=16)
     ap.add_argument("--n-reload", type=int, default=16)
     ap.add_argument("--n-cpu", type=int, default=4)
+    ap.add_argument("--stage-samples-per-size", type=int, default=4,
+                    help="number of representative weights per byte-size/quant group in stage probe plans")
     ap.add_argument("--ctx-size", type=int, default=512)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog.")
     ap.add_argument("--allow-cpu-fallback", action="store_true", help="allow solver synthetic CPU cost if CPU profile is incomplete")
+    ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--skip-phone-profile", action="store_true", help="build from existing local CSVs in out-root/model-tag/csv")
     ap.add_argument("--push-plan-dir", action="store_true", help="push generated offline table back to remote-dir/plans_<model-tag>")
     ap.add_argument("--dry-run", action="store_true")
@@ -182,6 +353,9 @@ def main() -> None:
     cost_dir = ROOT / "runtime" / "plan" / "profiles" / "android-opencl" / args.model_tag
     table_dir = artifact_root / "offline_table"
     manifest_path = artifact_root / "manifest.json"
+    probe_dir = artifact_root / "stage_probe"
+    opencl_stage_plan = probe_dir / "opencl_stage_probe.json"
+    cpu_stage_plan = probe_dir / "cpu_stage_probe.json"
     csv_dir.mkdir(parents=True, exist_ok=True)
 
     remote_trace = None
@@ -195,12 +369,42 @@ def main() -> None:
             remote_trace = f"{args.remote_dir}/{args.trace.name}"
             adb(args.adb_serial, ["push", str(args.trace), remote_trace], dry_run=args.dry_run)
 
+        remote_opencl_stage_plan = None
+        remote_cpu_stage_plan = None
+        if args.model_meta:
+            write_stage_probe_plan(
+                meta_path,
+                opencl_stage_plan,
+                "gpu",
+                max(int(args.budgets.split(",")[0]), args.kv_mib + args.misc_mib + args.safety_mib),
+                args.stage_samples_per_size,
+            )
+            write_stage_probe_plan(
+                meta_path,
+                cpu_stage_plan,
+                "cpu",
+                max(int(args.budgets.split(",")[0]), args.kv_mib + args.misc_mib + args.safety_mib),
+                args.stage_samples_per_size,
+            )
+            remote_opencl_stage_plan = f"{args.remote_dir}/{opencl_stage_plan.name}"
+            remote_cpu_stage_plan = f"{args.remote_dir}/{cpu_stage_plan.name}"
+            adb(args.adb_serial, ["push", str(opencl_stage_plan), remote_opencl_stage_plan], dry_run=args.dry_run)
+            adb(args.adb_serial, ["push", str(cpu_stage_plan), remote_cpu_stage_plan], dry_run=args.dry_run)
+        else:
+            print("warning: --model-meta not provided; skipping fine-stage probe profiles in the first pass", file=sys.stderr)
+
         profiles = [
             ("opencl_compute.csv", "opencl-compute", args.n_opencl),
-            ("opencl_reload.csv", "opencl-reload", args.n_reload),
+            ("opencl_stage.csv", "opencl-stage", args.n_reload),
+            ("opencl_reload_legacy.csv", "opencl-reload", args.n_reload),
             ("cpu_compute.csv", "cpu-compute", args.n_cpu),
+            ("cpu_stage.csv", "cpu-stage", args.n_cpu),
         ]
         for csv_name, mode, n_predict in profiles:
+            if mode == "opencl-stage" and not remote_opencl_stage_plan:
+                continue
+            if mode == "cpu-stage" and not remote_cpu_stage_plan:
+                continue
             script = profile_command(
                 remote_dir=args.remote_dir,
                 model=model_remote,
@@ -212,6 +416,7 @@ def main() -> None:
                 threads=args.threads,
                 mode=mode,
                 remote_trace=remote_trace,
+                remote_plan=remote_opencl_stage_plan if mode == "opencl-stage" else remote_cpu_stage_plan if mode == "cpu-stage" else None,
             )
             commands.append({"phase": mode, "remote_shell": script})
             proc = adb_shell(args.adb_serial, script, dry_run=args.dry_run, check=False)
@@ -223,7 +428,13 @@ def main() -> None:
                 print(proc.stdout)
                 adb(args.adb_serial, ["pull", f"{args.remote_dir}/{csv_name}", str(csv_dir / csv_name)], check=False)
 
-    csv_paths = [csv_dir / "opencl_compute.csv", csv_dir / "opencl_reload.csv", csv_dir / "cpu_compute.csv"]
+    csv_paths = [
+        csv_dir / "opencl_compute.csv",
+        csv_dir / "opencl_stage.csv",
+        csv_dir / "opencl_reload_legacy.csv",
+        csv_dir / "cpu_compute.csv",
+        csv_dir / "cpu_stage.csv",
+    ]
     existing_csvs = [p for p in csv_paths if p.exists() and csv_rows(p) > 0]
     if args.dry_run:
         existing_csvs = csv_paths
@@ -276,6 +487,8 @@ def main() -> None:
         str(args.safety_mib),
         "--time-limit-ms",
         str(args.time_limit_ms),
+        "--cp-objective",
+        str(args.cp_objective),
     ]
     if args.allow_cpu_fallback:
         build_table_cmd.append("--allow-cpu-fallback")

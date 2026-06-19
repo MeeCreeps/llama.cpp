@@ -17,7 +17,16 @@ from statistics import median
 from typing import Any
 
 
-STAGE_KINDS = {"LOAD", "TRANSFER", "XFORM", "RELOAD_ENSURE"}
+STAGE_KINDS = {
+    # Fine-grained planner stages. These are the preferred inputs for the
+    # multi-backend cost model.
+    "LOAD",
+    "TRANSFER",
+    "XFORM",
+    # Legacy combined path kept only for backward compatibility with older
+    # profiles. The solver treats it as a fallback, not as the primary model.
+    "RELOAD_ENSURE",
+}
 COMPUTE_KINDS = {"COMPUTE", "COMPUTE_GRAPH"}
 BOUNDARY_KINDS = {"BOUNDARY"}
 
@@ -156,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

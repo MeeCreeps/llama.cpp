@@ -113,23 +113,32 @@ elastic_state * get_state() {
     return &s;
 }
 
+static int lookup_wbm_idx_locked(elastic_state *s, const char *name) {
+    if (!s || !name || !*name) return -1;
+    auto it = s->name_to_wbm.find(name);
+    if (it != s->name_to_wbm.end()) return it->second;
+    std::string cpu_wrapped = std::string("CPU_Elastic#") + name + "#0";
+    it = s->name_to_wbm.find(cpu_wrapped);
+    if (it != s->name_to_wbm.end()) return it->second;
+    return -1;
+}
+
 // === Static handlers exposed to llama-mmap registry (called by llama_context) ===
 // 单例 state 假设: 一个进程内仅有一个 elastic-cpu backend.
 bool elastic_sched_residency_query(const char *name, void * /*ud*/) {
     auto *s = get_state();
     std::lock_guard<std::mutex> lk(s->sched_mtx);
-    auto it = s->name_to_wbm.find(name ? name : "");
-    if (it == s->name_to_wbm.end()) return false;
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
+    int idx = lookup_wbm_idx_locked(s, name);
+    if (idx < 0) return false;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     return bm && bm->resident;
 }
 
 uint32_t elastic_sched_state_query(const char *name, void * /*ud*/) {
     auto *s = get_state();
     std::lock_guard<std::mutex> lk(s->sched_mtx);
-    auto it = s->name_to_wbm.find(name ? name : "");
-    if (it == s->name_to_wbm.end()) return 0;
-    const int idx = it->second;
+    const int idx = lookup_wbm_idx_locked(s, name);
+    if (idx < 0) return 0;
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     uint32_t flags = 0;
     if (bm && bm->host_ptr) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
@@ -194,9 +203,8 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     void *fixed_handle = nullptr;
     {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;
-        idx = it->second;
+        idx = lookup_wbm_idx_locked(s, name);
+        if (idx < 0) return -2;
         auto bit = s->bctx_by_idx.find(idx);
         if (bit != s->bctx_by_idx.end()) bctx = bit->second;
         auto hit = s->backend_handle_by_idx.find(idx);
@@ -209,6 +217,7 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
         if (!bctx)         return -4;
         evict_blocks(s, bctx, {idx});
         s->n_evicts_total += 1;
+        llama_weight_runtime_mark_evicted(name, LLAMA_WEIGHT_RUNTIME_CPU);
         return 0;
     }
     // prefetch
@@ -216,6 +225,7 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     void *target = bm->backend_handle ? bm->backend_handle : fixed_handle;
     if (!target) return -5;
     ensure_block_resident(s, idx, target);
+    llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_CPU);
     return 0;
 }
 
@@ -225,11 +235,13 @@ int elastic_sched_stage_request(const char *name, const char *stage, void * /*ud
     int idx = -1;
     {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;
-        idx = it->second;
+        idx = lookup_wbm_idx_locked(s, name);
+        if (idx < 0) return -2;
     }
-    if (std::strcmp(stage, "load") == 0) {
+    if (std::strcmp(stage, "load_gpu") == 0) {
+        return -2;
+    }
+    if (std::strcmp(stage, "load") == 0 || std::strcmp(stage, "load_cpu") == 0) {
         const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
         if (!bm) return -3;
         if (bm->resident) return 0;
@@ -271,9 +283,8 @@ int elastic_sched_transform_request(const char *name, llama_weight_transform_kin
     void *fixed_handle = nullptr;
     {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;
-        idx = it->second;
+        idx = lookup_wbm_idx_locked(s, name);
+        if (idx < 0) return -2;
         auto hit = s->backend_handle_by_idx.find(idx);
         if (hit != s->backend_handle_by_idx.end()) fixed_handle = hit->second;
     }
@@ -310,6 +321,7 @@ int elastic_sched_transform_request(const char *name, llama_weight_transform_kin
     s->n_reloads_total += 1;
     s->bytes_reloaded_total += bm->byte_size;
     elastic::wbm_mark_resident(&s->wbm, idx, target);
+    llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_CPU);
     if (s->profile_csv) {
         cpu_profile_record("XFORM", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
     }
@@ -322,9 +334,8 @@ void * elastic_sched_host_ptr_query(const char *name, void * /*ud*/) {
     int idx = -1;
     {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return nullptr;
-        idx = it->second;
+        idx = lookup_wbm_idx_locked(s, name);
+        if (idx < 0) return nullptr;
     }
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     return bm ? bm->host_ptr : nullptr;
@@ -480,6 +491,7 @@ void ensure_block_resident(elastic_state *s, int wbm_idx, void *backend_handle) 
     s->n_reloads_total += 1;
     s->bytes_reloaded_total += bm->byte_size;
     elastic::wbm_mark_resident(&s->wbm, wbm_idx, backend_handle);
+    llama_weight_runtime_mark_resident(name_for_idx(s, wbm_idx), LLAMA_WEIGHT_RUNTIME_CPU);
     if (s->profile_csv) {
         cpu_profile_record("RELOAD_ENSURE", name_for_idx(s, wbm_idx), wbm_idx,
                            bm->byte_size, dt / 1000.0, 1, "decode_ensure");
@@ -511,6 +523,7 @@ void evict_blocks(elastic_state *s, elastic_buffer_ctx *bctx,
         }
         s->bytes_evicted_total += bm->byte_size;
         elastic::wbm_mark_evicted(&s->wbm, v);
+        llama_weight_runtime_mark_evicted(name_for_idx(s, v), LLAMA_WEIGHT_RUNTIME_CPU);
         // mark_evicted 把 backend_handle 清掉了，但我们需要它保留（地址永不变）
         // 重新设上去：直接修改 blocks[]（注意是 hack——绕过 mark_evicted 的清零）
         // 更干净的做法是不调 mark_evicted，自己更新字段，避免清 backend_handle
@@ -995,6 +1008,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                 const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
                 if (bm && bm->backend_handle) {
                     elastic::wbm_mark_resident(&s->wbm, idx, bm->backend_handle);
+                    llama_weight_runtime_mark_resident(name_for_idx(s, idx), LLAMA_WEIGHT_RUNTIME_CPU);
                     s->n_reloads_total += 1;
                     s->bytes_reloaded_total += pending[i].second;
                 }

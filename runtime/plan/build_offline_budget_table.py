@@ -40,8 +40,13 @@ def main() -> None:
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
     ap.add_argument("--time-limit-ms", type=int, default=20)
+    ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
     ap.add_argument("--transition-weight", type=float, default=1.0)
+    ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
+    ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
+    ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
     ap.add_argument("--chain-state", action="store_true",
                     help="build each budget using the previous lower-budget plan as current state")
     args = ap.parse_args()
@@ -68,7 +73,12 @@ def main() -> None:
                 "--misc-mib", str(args.misc_mib),
                 "--safety-mib", str(args.safety_mib),
                 "--time-limit-ms", str(args.time_limit_ms),
+                "--prefetch-distance", str(args.prefetch_distance),
                 "--transition-weight", str(args.transition_weight),
+                "--disk-reload-multiplier", str(args.disk_reload_multiplier),
+                "--overlap-model", str(args.overlap_model),
+                "--cp-objective", str(args.cp_objective),
+                "--allowed-placements", str(args.allowed_placements),
                 "--out", str(out),
             ]
             if args.chain_state and prev_state is not None:

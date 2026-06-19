@@ -61,6 +61,8 @@ struct ReconcileStats {
     int n_load_events    = 0;  // LOAD stage 数
     int n_transfer_events = 0;  // TRANSFER stage 数
     int n_xform_events   = 0;  // XFORM stage 数
+    int n_schedule_events = 0;  // interval schedule projected event 数
+    bool used_interval_schedule = false;
 };
 
 class PlanExecutor {
@@ -86,10 +88,12 @@ public:
 
 private:
     void build_anchor_index();
+    bool use_interval_schedule() const;
 
     ExecSinks       sinks_;
     const ExecPlan *plan_ = nullptr;
     std::unordered_map<int, std::vector<const PlanEvent *>> anchor_index_;
+    std::vector<PlanEvent> projected_schedule_events_;
     static const std::vector<const PlanEvent *>            empty_events_;
 };
 

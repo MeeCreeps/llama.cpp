@@ -124,8 +124,13 @@ struct elastic_online_solver_state {
     int misc_mib = 256;
     int safety_mib = 64;
     int time_limit_ms = 20;
+    int prefetch_distance = 1;
     bool allow_cpu_fallback = false;
     double transition_weight = 1.0;
+    double disk_reload_multiplier = 1.0;
+    std::string overlap_model = "pipeline";
+    std::string cp_objective = "resource_makespan";
+    std::string allowed_placements = "cpu,gpu,disk_cpu,disk_gpu";
     uint64_t calls = 0;
     uint64_t failures = 0;
     double remote_wall_ms_total = 0.0;
@@ -212,16 +217,16 @@ static double elastic_stage_cost(elastic_online_solver_state * s, const std::str
     if (kind == "LOAD" || kind == "RELOAD_ENSURE") fb = 0.15 + mb / 1800.0 * 1000.0;
     else if (kind == "TRANSFER") fb = 0.05 + mb / 6000.0 * 1000.0;
     else if (kind == "XFORM") fb = 0.10 + mb / 8000.0 * 1000.0;
+    else if (kind == "SYNC") fb = 0.03;
+    else if (kind == "EVICT") fb = 0.01;
     return elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
 }
 
 static double elastic_gpu_reload_cost(elastic_online_solver_state * s, const std::string & name, size_t bytes) {
-    if (elastic_has_measured_stage_kind(s, "OpenCL", "RELOAD_ENSURE")) {
-        return elastic_stage_cost(s, "OpenCL", "RELOAD_ENSURE", name, bytes);
-    }
     return elastic_stage_cost(s, "OpenCL", "LOAD", name, bytes) +
            elastic_stage_cost(s, "OpenCL", "TRANSFER", name, bytes) +
-           elastic_stage_cost(s, "OpenCL", "XFORM", name, bytes);
+           elastic_stage_cost(s, "OpenCL", "XFORM", name, bytes) +
+           elastic_stage_cost(s, "OpenCL", "SYNC", name, bytes);
 }
 
 static double elastic_compute_cost(elastic_online_solver_state * s, const std::string & backend,
@@ -419,7 +424,8 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
             {"migrate_xform", "none"},
         });
         if (!resident) {
-            const int anchor_id = it.id > 1 ? it.id - 1 : it.id;
+            const int lead = std::max(1, s->prefetch_distance);
+            const int anchor_id = it.id > lead ? it.id - lead : 0;
             if (elastic_state_any_resident(it.flags)) {
                 plan["timeline"].push_back({
                     {"kind", "evict"},
@@ -493,8 +499,13 @@ static bool elastic_online_generate_remote(elastic_online_solver_state * s, int6
     req["misc_mib"] = s->misc_mib;
     req["safety_mib"] = s->safety_mib;
     req["time_limit_ms"] = s->time_limit_ms;
+    req["prefetch_distance"] = s->prefetch_distance;
     req["allow_cpu_fallback"] = s->allow_cpu_fallback;
     req["transition_weight"] = s->transition_weight;
+    req["disk_reload_multiplier"] = s->disk_reload_multiplier;
+    req["overlap_model"] = s->overlap_model;
+    req["cp_objective"] = s->cp_objective;
+    req["allowed_placements"] = s->allowed_placements;
     {
         std::ifstream sf(state_path);
         if (!sf) return false;
@@ -553,6 +564,7 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
             << " --misc-mib " << s->misc_mib
             << " --safety-mib " << s->safety_mib
             << " --time-limit-ms " << s->time_limit_ms
+            << " --prefetch-distance " << s->prefetch_distance
             << " --out " << shell_quote(plan_path)
             << " >/dev/null";
         int rc = std::system(cmd.str().c_str());
@@ -763,8 +775,13 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_MISC_MB")) online.misc_mib = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_SAFETY_MB")) online.safety_mib = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS")) online.time_limit_ms = std::atoi(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_PREFETCH_DISTANCE")) online.prefetch_distance = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOW_CPU_FALLBACK")) online.allow_cpu_fallback = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOWED_PLACEMENTS")) online.allowed_placements = e;
 
         if (online.model_meta_path.empty() || online.cost_dir.empty()) {
             LOG_ERR("[elastic-online] LLAMA_ELASTIC_MODEL_META and LLAMA_ELASTIC_COST_DIR are required\n");
@@ -793,8 +810,12 @@ int main(int argc, char ** argv) {
                     b.layer = w.value("layer", -1);
                     b.bytes = (size_t) w.value("byte_size", 0);
                     b.quant = w.value("quant", std::string());
-                    const double gpu = elastic_backend_path_cost(&online, "GPU", b.name, b.bytes);
-                    const double cpu = elastic_backend_path_cost(&online, "CPU", b.name, b.bytes);
+                    // Native MRU is an eviction baseline, not a placement optimizer.
+                    // Pick the target backend from measured compute cost only; otherwise
+                    // cold reload/transform cost biases every weight toward CPU and the
+                    // baseline degenerates into CPU-only execution.
+                    const double gpu = elastic_compute_cost(&online, "OpenCL", b.name, b.bytes);
+                    const double cpu = elastic_compute_cost(&online, "CPU_Elastic", b.name, b.bytes);
                     b.backend = gpu <= cpu ? "GPU" : "CPU";
                     b.resident_value_gpu =
                         elastic_gpu_reload_cost(&online, b.name, b.bytes);

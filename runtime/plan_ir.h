@@ -87,6 +87,22 @@ struct PlanEvent {
     int      overlap_group = -1;  // 同 group 可并发;-1 = 串行屏障
 };
 
+// Optional interval schedule emitted by the CP-SAT planner.  The solver may
+// use interval variables internally, but runtime execution is driven by
+// anchor_op_id: the graph op index where this stage should be triggered.
+// start_ms/end_ms are diagnostic cost-model coordinates only.
+struct ScheduleEvent {
+    int         weight_id   = -1;
+    int         anchor_op_id = -1;
+    std::string weight_name;
+    std::string choice;
+    std::string kind;       // load / transfer / xform / sync / compute
+    std::string engine;     // disk / transfer / xform_cpu / xform_gpu / compute_cpu / compute_gpu / sync
+    double      start_ms    = 0.0;
+    double      end_ms      = 0.0;
+    double      duration_ms = 0.0;
+};
+
 // ── 整个 plan ──
 struct ExecPlan {
     int         schema_version = 1;
@@ -97,6 +113,11 @@ struct ExecPlan {
     std::vector<WeightPlan> weights;   // 按 weight_id 索引
     std::vector<OpPlan>     ops;       // 按 op_id 索引
     std::vector<PlanEvent>  timeline;  // 按执行顺序
+    std::vector<ScheduleEvent> schedule_events; // optional interval CP-SAT schedule
+
+    std::string schedule_kind;
+    std::string schedule_status;
+    double      schedule_objective_ms = 0.0;
 
     // 预测指标(求解器填,执行端只读;用于日志/对比)
     double      pred_per_token_ms = 0.0;

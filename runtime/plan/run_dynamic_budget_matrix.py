@@ -308,10 +308,13 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         "anchor_xform": "",
         "anchor_failures": "",
         "reload_host_issue_ms": "",
+        "reload_host_issue_ms_per_forward": "",
         "reload_calls": "",
         "direct_read_ms": "",
+        "direct_read_ms_per_forward": "",
         "direct_read_calls": "",
         "direct_read_mb": "",
+        "direct_read_mb_per_forward": "",
         "online_calls": "",
         "online_failures": "",
     }
@@ -341,9 +344,10 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         remote_server = max(remote_server, float(summary.group(2)))
     result["remote_wall_ms"] = remote_wall
     result["remote_server_ms"] = remote_server
-    if method == "online" and result["eval_ms_total"] != "" and result["eval_runs"]:
-        adjusted_total = max(0.0, float(result["eval_ms_total"]) - remote_wall)
-        result["decode_ms_per_token"] = adjusted_total / int(result["eval_runs"])
+    # Keep decode_ms_per_token equal to llama's eval timer. Remote CP-SAT and
+    # provider overheads are reported separately; subtracting remote_wall_ms here
+    # can double-discount because parts of the provider path are outside the eval
+    # timer or overlap with timed execution.
 
     for m in re.finditer(r"provider_get_ms=([0-9.]+)\s+apply_ms=([0-9.]+)", text):
         result["provider_get_ms_total"] += float(m.group(1))
@@ -375,6 +379,15 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         result["direct_read_calls"] = int(m.group(1))
         result["direct_read_ms"] = float(m.group(2))
         result["direct_read_mb"] = float(m.group(3))
+    if result["eval_runs"]:
+        runs = int(result["eval_runs"])
+        if runs > 0:
+            if result["reload_host_issue_ms"] != "":
+                result["reload_host_issue_ms_per_forward"] = float(result["reload_host_issue_ms"]) / runs
+            if result["direct_read_ms"] != "":
+                result["direct_read_ms_per_forward"] = float(result["direct_read_ms"]) / runs
+            if result["direct_read_mb"] != "":
+                result["direct_read_mb_per_forward"] = float(result["direct_read_mb"]) / runs
     m = re.search(r"\[elastic-online\] calls=(\d+) failures=(\d+)", text)
     if m:
         result["online_calls"] = int(m.group(1))
@@ -443,7 +456,7 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         "",
         "## Results",
         "",
-        "`decode ms/token` excludes remote solver wall time for `online`; for other baselines it equals raw eval ms/token.",
+        "`decode ms/token` is llama's eval timer. Remote solver/provider time is reported separately in `remote wall ms` and CSV provider columns.",
         "",
         "| trace | method | status | raw ms/token | decode ms/token | thermal before/after C | remote wall ms | apply count | planned evict/load/xfer/xform | direct read ms | direct read calls | failures |",
         "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|",
@@ -494,6 +507,15 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         "GGML_ELASTIC_MISC_MB": str(args.misc_mib),
         "LLAMA_ELASTIC_DEFER_STAGE": "0",
     }
+    use_interval_schedule = (
+        args.use_interval_schedule == "1"
+        or (args.use_interval_schedule == "auto" and args.cp_objective == "interval_makespan")
+    )
+    if use_interval_schedule:
+        common["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "1"
+        common["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
+        if args.interval_stage_kinds:
+            common["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = str(args.interval_stage_kinds)
     if method in {"offline", "online", "mru"}:
         common["GGML_ELASTIC_DYNAMIC"] = "1"
     if method == "offline":
@@ -513,7 +535,12 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE_MISC_MB": str(args.misc_mib),
                 "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(args.safety_mib),
                 "LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS": str(args.time_limit_ms),
+                "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
                 "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
+                "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
+                "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
+                "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
+                "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
             }
         )
     elif method == "mru":
@@ -531,6 +558,14 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         )
     else:
         raise ValueError(f"unknown method: {method}")
+    for item in args.extra_env:
+        if "=" not in item:
+            raise ValueError(f"--extra-env must be KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--extra-env has empty key: {item}")
+        common[key] = value
     return common
 
 
@@ -550,6 +585,26 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
         str(args.model_meta),
         "--cost-dir",
         str(args.cost_dir),
+        "--kv-mib",
+        str(args.kv_mib),
+        "--misc-mib",
+        str(args.misc_mib),
+        "--safety-mib",
+        str(args.safety_mib),
+        "--time-limit-ms",
+        str(args.time_limit_ms),
+        "--prefetch-distance",
+        str(args.prefetch_distance),
+        "--transition-weight",
+        str(args.transition_weight),
+        "--disk-reload-multiplier",
+        str(args.disk_reload_multiplier),
+        "--overlap-model",
+        str(args.overlap_model),
+        "--cp-objective",
+        str(args.cp_objective),
+        "--allowed-placements",
+        str(args.allowed_placements),
     ]
     print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
     proc = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=log, stderr=subprocess.STDOUT)
@@ -598,7 +653,19 @@ def main() -> None:
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
     ap.add_argument("--time-limit-ms", type=int, default=250)
+    ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--transition-weight", type=float, default=0.1)
+    ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
+    ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
+    ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu",
+                    help="comma-separated solver placement choices")
+    ap.add_argument("--use-interval-schedule", choices=("auto", "0", "1"), default="auto",
+                    help="whether runtime uses schedule.events anchors; auto enables it for interval_makespan")
+    ap.add_argument("--interval-stage-kinds", default="load",
+                    help="comma-separated interval stages to trigger at runtime, e.g. load or load,transfer")
+    ap.add_argument("--extra-env", action="append", default=[],
+                    help="additional Android env var as KEY=VALUE; may be repeated")
     ap.add_argument("--n-pred", type=int, default=96, help="used only when --bench-seconds 0 disables timed mode")
     ap.add_argument("--ctx-size", type=int, default=4096)
     ap.add_argument("--batch", type=int, default=32)
@@ -613,6 +680,8 @@ def main() -> None:
     ap.add_argument("--cooldown-timeout-s", type=float, default=1800.0)
     ap.add_argument("--port", type=int, default=18082)
     ap.add_argument("--no-resume", action="store_true", help="rerun rows already present in summary/results.csv")
+    ap.add_argument("--offline-chain-state", action="store_true",
+                    help="build offline budget table with previous bucket as synthetic state")
     ap.add_argument("--skip-build-table", action="store_true")
     ap.add_argument("--skip-push", action="store_true")
     ap.add_argument("--skip-push-binary", action="store_true")
@@ -676,10 +745,21 @@ def main() -> None:
             str(args.safety_mib),
             "--time-limit-ms",
             str(args.time_limit_ms),
+            "--prefetch-distance",
+            str(args.prefetch_distance),
             "--transition-weight",
             str(args.transition_weight),
-            "--chain-state",
+            "--disk-reload-multiplier",
+            str(args.disk_reload_multiplier),
+            "--overlap-model",
+            str(args.overlap_model),
+            "--cp-objective",
+            str(args.cp_objective),
+            "--allowed-placements",
+            str(args.allowed_placements),
         ]
+        if args.offline_chain_state:
+            cmd.append("--chain-state")
         if not args.dry_run:
             run(cmd)
         else:

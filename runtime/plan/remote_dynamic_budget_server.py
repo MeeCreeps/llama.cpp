@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,9 +65,52 @@ class SolverHTTPServer(ThreadingHTTPServer):
         super().__init__(addr, SolverHandler)
         self.args = args
         self.verbose = args.verbose
+        self._state_lock = threading.Lock()
+        self._last_cpu_resident: set[str] = set()
+
+    def _augment_cpu_residency(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Carry CPU placements returned by the previous solve.
+
+        This is a legacy/debug fallback. Normal online planning should use the
+        canonical runtime placement map reported by the phone.
+        """
+        if not self.args.carry_cpu_residency:
+            return state
+        with self._state_lock:
+            last_cpu = set(self._last_cpu_resident)
+        if not last_cpu:
+            return state
+
+        rows = state.get("weights", [])
+        if not isinstance(rows, list):
+            return state
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("name") not in last_cpu:
+                continue
+            flags = row.setdefault("flags", [])
+            if not isinstance(flags, list):
+                continue
+            has_gpu = any("gpu_compute_resident" == str(f).lower() for f in flags)
+            has_cpu = any("cpu_compute_resident" == str(f).lower() for f in flags)
+            if not has_gpu and not has_cpu:
+                flags.append("cpu_compute_resident")
+        return state
+
+    def _remember_cpu_residency(self, plan: dict[str, Any]) -> None:
+        if not self.args.carry_cpu_residency:
+            return
+        cpu = {
+            str(w.get("name"))
+            for w in plan.get("weights", [])
+            if isinstance(w, dict) and str(w.get("location", "")).lower() == "cpu"
+        }
+        with self._state_lock:
+            self._last_cpu_resident = cpu
 
     def solve(self, req: dict[str, Any]) -> tuple[dict[str, Any], float]:
-        state = req.get("state", {"weights": []})
+        state = self._augment_cpu_residency(req.get("state", {"weights": []}))
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(state, f)
             state_path = Path(f.name)
@@ -83,11 +127,16 @@ class SolverHTTPServer(ThreadingHTTPServer):
                 time_limit_ms=int(req.get("time_limit_ms", self.args.time_limit_ms)),
                 allow_cpu_fallback=bool(req.get("allow_cpu_fallback", self.args.allow_cpu_fallback)),
                 transition_weight=float(req.get("transition_weight", self.args.transition_weight)),
+                disk_reload_multiplier=float(req.get("disk_reload_multiplier", self.args.disk_reload_multiplier)),
+                overlap_model=str(req.get("overlap_model", self.args.overlap_model)),
+                cp_objective=str(req.get("cp_objective", self.args.cp_objective)),
+                allowed_placements=str(req.get("allowed_placements", self.args.allowed_placements)),
                 out=Path("/dev/null"),
             )
             t0 = time.perf_counter()
             plan = dynamic_budget_solver.build_plan(ns)
             solve_ms = (time.perf_counter() - t0) * 1000.0
+            self._remember_cpu_residency(plan)
             return plan, solve_ms
         finally:
             try:
@@ -109,6 +158,12 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
     ap.add_argument("--transition-weight", type=float, default=1.0)
+    ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
+    ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
+    ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
+    ap.add_argument("--carry-cpu-residency", action="store_true",
+                    help="legacy debug fallback: infer CPU residency from the previous returned plan")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

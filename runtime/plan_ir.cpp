@@ -172,6 +172,28 @@ bool plan_to_json_string(const ExecPlan & plan, std::string & out) {
     j["misc_bytes"]        = plan.misc_bytes;
     j["pred_per_token_ms"] = plan.pred_per_token_ms;
     j["bottleneck"]        = plan.bottleneck;
+    if (!plan.schedule_kind.empty() || !plan.schedule_events.empty()) {
+        json js;
+        js["kind"]         = plan.schedule_kind;
+        js["status"]       = plan.schedule_status;
+        js["objective_ms"] = plan.schedule_objective_ms;
+        json je = json::array();
+        for (const auto & e : plan.schedule_events) {
+            je.push_back({
+                {"weight_id",   e.weight_id},
+                {"anchor_op_id", e.anchor_op_id},
+                {"weight_name", e.weight_name},
+                {"choice",      e.choice},
+                {"kind",        e.kind},
+                {"engine",      e.engine},
+                {"start_ms",    e.start_ms},
+                {"end_ms",      e.end_ms},
+                {"duration_ms", e.duration_ms},
+            });
+        }
+        js["events"] = std::move(je);
+        j["schedule"] = std::move(js);
+    }
 
     json jw = json::array();
     for (const auto & w : plan.weights) {
@@ -246,6 +268,25 @@ bool plan_from_json_string(const std::string & s, ExecPlan & out, std::string * 
         out.misc_bytes        = j.value("misc_bytes", (size_t) 0);
         out.pred_per_token_ms = j.value("pred_per_token_ms", 0.0);
         out.bottleneck        = j.value("bottleneck", std::string());
+        if (j.contains("schedule") && j["schedule"].is_object()) {
+            const auto & js = j["schedule"];
+            out.schedule_kind         = js.value("kind", std::string());
+            out.schedule_status       = js.value("status", std::string());
+            out.schedule_objective_ms = js.value("objective_ms", 0.0);
+            for (const auto & je : js.value("events", json::array())) {
+                ScheduleEvent e;
+                e.weight_id   = je.value("weight_id", -1);
+                e.anchor_op_id = je.value("anchor_op_id", -1);
+                e.weight_name = je.value("weight_name", std::string());
+                e.choice      = je.value("choice", std::string());
+                e.kind        = je.value("kind", std::string());
+                e.engine      = je.value("engine", std::string());
+                e.start_ms    = je.value("start_ms", 0.0);
+                e.end_ms      = je.value("end_ms", 0.0);
+                e.duration_ms = je.value("duration_ms", 0.0);
+                out.schedule_events.push_back(std::move(e));
+            }
+        }
 
         for (const auto & jw : j.value("weights", json::array())) {
             WeightPlan w;

@@ -1,0 +1,13 @@
+{
+  "device": "android-opencl",
+  "input_rows": 8221,
+  "model": "Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/.wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/generated_profiles/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/.wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/generated_profiles/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage/csv/opencl_stage.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/.wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/generated_profiles/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/.wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/generated_profiles/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage/csv/cpu_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/.wiki/elastic_memory/feature_elastic-plan-framework/dynamic_budget_cp_baselines/artifacts/generated_profiles/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01_fine_stage/csv/cpu_stage.csv"
+  ]
+}
