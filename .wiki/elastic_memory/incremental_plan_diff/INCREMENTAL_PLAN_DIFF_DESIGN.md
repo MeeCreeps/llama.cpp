@@ -1066,3 +1066,64 @@ The remaining provider time is dominated by the first few calls, which still
 load/cache candidate plan data lazily.  A future improvement is to prewarm the
 candidate table before timed decode starts.
 ```
+
+## Candidate prewarm
+
+The provider-cache run reduced online calls from about 150 to 13, but the
+remaining provider time was still high because the first calls lazily loaded:
+
+```text
+candidate index/json plans
+candidate llama_plan handles
+```
+
+The runtime now supports:
+
+```text
+LLAMA_ELASTIC_CANDIDATE_PREWARM=1
+```
+
+When enabled for `candidate-select` or `diff-graph-expand`, initialization
+loads the candidate table and all candidate plan handles before timed decode.
+
+Prewarm result on the same 60-second oscillating window:
+
+```text
+candidate-select:
+    transition_weight:       0.5
+    keep_current_margin:     50 ms
+    provider result cache:   on
+    candidate event logs:    off
+    candidate prewarm:       on
+
+    raw ms/token:            224.12
+    exec ms/token:           229.54
+    provider_get_ms_total:   36.67
+    online calls:            13
+    apply_count:             2
+    planned load/xform:      34 / 34
+    direct_read:             989.35 ms, 34 calls, 1012.5 MiB
+```
+
+The log confirmed:
+
+```text
+cached 36 plans
+prewarmed 36 plan handles
+```
+
+Compared with no-prewarm:
+
+```text
+provider_get_ms_total:
+    no prewarm: 143.96 ms
+    prewarm:     36.67 ms
+```
+
+This moves the online provider overhead back to the same scale as offline while
+preserving the lower movement count:
+
+```text
+offline load/xform:     208 / 208
+candidate load/xform:    34 / 34
+```

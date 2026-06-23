@@ -130,6 +130,7 @@ struct elastic_online_solver_state {
     std::unordered_set<std::string> keep_current_fast_cache;
     bool log_candidate_scores = false;
     bool log_candidate_events = true;
+    bool prewarm_candidate_cache = false;
     std::string last_candidate_file;
     int64_t last_candidate_budget_mib = 0;
     double keep_current_margin_ms = 0.0;
@@ -502,6 +503,18 @@ static llama_plan * elastic_candidate_load_plan_handle(elastic_online_solver_sta
     s->candidate_loaded_plan_cache.emplace(file, plan);
     s->plans.push_back(plan);
     return plan;
+}
+
+static bool elastic_candidate_prewarm(elastic_online_solver_state * s) {
+    if (!elastic_candidate_cache_load(s)) return false;
+    size_t handles = 0;
+    for (const auto & kv : s->candidate_plan_cache) {
+        if (!elastic_candidate_load_plan_handle(s, kv.first)) return false;
+        handles++;
+    }
+    LOG_INF("[elastic-candidate] prewarmed %zu plan handles from %s\n",
+            handles, s->candidate_dir.c_str());
+    return true;
 }
 
 static std::string elastic_current_loc_from_flags(uint32_t flags) {
@@ -1381,6 +1394,7 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_SCORES")) online.log_candidate_scores = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_EVENTS")) online.log_candidate_events = std::atoi(e) != 0;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_PREWARM")) online.prewarm_candidate_cache = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_KEEP_CURRENT_MARGIN_MS")) online.keep_current_margin_ms = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;
@@ -1429,6 +1443,10 @@ int main(int argc, char ** argv) {
                 }
                 if (!mkdir_p_local(online.work_dir)) {
                     LOG_ERR("[elastic-online] failed to create work_dir %s\n", online.work_dir.c_str());
+                }
+                if ((online.mode == "candidate-select" || online.mode == "diff-graph-expand") &&
+                    online.prewarm_candidate_cache && !elastic_candidate_prewarm(&online)) {
+                    LOG_ERR("[elastic-online] candidate prewarm failed dir=%s\n", online.candidate_dir.c_str());
                 }
 
 #if defined(_WIN32)
