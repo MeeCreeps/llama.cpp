@@ -551,6 +551,43 @@ JSON profile records for every candidate weight.  With it, the first call fills
 the cache and later candidate scoring is mostly O(K * N_weights) arithmetic and
 state-bit checks.
 
+Top-K generation now supports distance-based candidate diversity:
+
+```text
+dynamic_budget_solver.py:
+    --exclude-plan <plan.json>
+    --min-placement-distance <N>
+
+build_offline_budget_table.py:
+    --candidate-min-distance 32
+```
+
+For candidate `k > 0`, the offline builder excludes all previous candidates
+under the same budget by requiring a placement Hamming distance of at least
+`candidate_min_distance`.  This keeps all candidates in the same allowed
+placement space and avoids the older behavior where diversity was created by
+forbidding placement classes such as `disk_cpu` or `disk_gpu`.
+
+Local top-K smoke with `candidate_min_distance=32`:
+
+```text
+budget 4096:
+    pairwise placement distances: all 32
+    pred_per_token_ms: 542.395, 542.450, 542.423, 542.624
+
+budget 4352:
+    pairwise placement distances: all 32
+    pred_per_token_ms: 401.323, 401.502, 401.858, 401.697
+
+budget 4608:
+    pairwise placement distances: all 32
+    pred_per_token_ms: 259.896, 261.043, 261.401, 261.419
+```
+
+This is the desired candidate shape: meaningfully different placements with
+small steady-cost gaps, instead of candidates that are diverse only because
+some placement classes were disabled.
+
 Second implementation:
 
 ```text
@@ -677,3 +714,46 @@ later calls:
 This confirms that the online incremental path no longer depends on remote
 CP-SAT solve time.  The remaining large runtime cost is plan application and
 actual load/prepare/evict work, not online decision overhead.
+
+Distance-topK score-log smoke:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/distance32_scores_20s_candidate
+
+env:
+    LLAMA_ELASTIC_CANDIDATE_LOG_SCORES=1
+
+candidate-select:
+    provider_get_ms_total: 213.39
+    online calls: 1
+```
+
+The first budget switch selected candidate 0:
+
+```text
+budget=4096
+candidate 0: steady=542.395 transition=114.290 score=553.824
+candidate 1: steady=542.450 transition=114.290 score=553.879
+candidate 2: steady=542.423 transition=114.290 score=553.852
+candidate 3: steady=542.624 transition=120.665 score=554.690
+```
+
+Interpretation:
+
+```text
+On the first apply, runtime residency is almost equally far from all candidates,
+so the transition term cannot distinguish the diverse placements.  Candidate 0
+wins because it has the best steady cost.
+```
+
+To show the incremental advantage clearly, the evaluation trace should include
+multiple budget changes after a previous plan has already been materialized.
+The useful regime is:
+
+```text
+P_prev is already partially resident/transformed
+budget changes to B_t
+candidate j reuses more of S_runtime than offline P0
+candidate j wins despite a slightly higher steady cost
+```

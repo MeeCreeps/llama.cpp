@@ -763,6 +763,8 @@ def main() -> None:
                     help="number of candidate plans per budget for candidate-select / diff-graph-expand")
     ap.add_argument("--candidate-placement-specs", default="",
                     help="semicolon-separated allowed-placement specs for offline candidate diversity")
+    ap.add_argument("--candidate-min-distance", type=int, default=32,
+                    help="minimum weight-placement Hamming distance between top-k candidates")
     ap.add_argument("--use-interval-schedule", choices=("auto", "0", "1"), default="auto",
                     help="whether runtime uses schedule.events anchors; auto enables it for interval_makespan")
     ap.add_argument("--interval-stage-kinds", default="load,prepare",
@@ -871,6 +873,7 @@ def main() -> None:
         ]
         if args.candidate_placement_specs:
             cmd.extend(["--candidate-placement-specs", str(args.candidate_placement_specs)])
+        cmd.extend(["--candidate-min-distance", str(args.candidate_min_distance)])
         if args.offline_chain_state:
             cmd.append("--chain-state")
         if not args.dry_run:

@@ -632,7 +632,9 @@ def placement_engine_costs(weight: dict[str, Any], cm: CostModel, state: dict[st
 def select_placements_cp(items: list[tuple[int, int, int, str, dict[str, float], dict[str, dict[str, float]], dict[str, list[dict[str, Any]]]]],
                          budget_bytes: int, time_limit_ms: int,
                          objective: str = "resource_makespan",
-                         prefetch_distance: int = 1) -> dict[str, Any] | None:
+                         prefetch_distance: int = 1,
+                         exclude_placements: list[dict[int, str]] | None = None,
+                         min_placement_distance: int = 0) -> dict[str, Any] | None:
     try:
         from ortools.sat.python import cp_model  # type: ignore
     except Exception:
@@ -653,6 +655,19 @@ def select_placements_cp(items: list[tuple[int, int, int, str, dict[str, float],
             for choice in PLACEMENTS
             if (wid, choice) in x and placement_resident_bytes(choice, size) > 0) <= budget_bytes
     )
+    if exclude_placements and min_placement_distance > 0:
+        all_wids = [wid for wid, _, _, _, _, _, _ in items]
+        for idx, prev in enumerate(exclude_placements):
+            same_terms = []
+            for wid in all_wids:
+                old = prev.get(wid)
+                if old and (wid, old) in x:
+                    same_terms.append(x[(wid, old)])
+            # Hamming distance from the previous placement must be at least
+            # min_placement_distance. If the previous choice is now infeasible,
+            # that weight is already different.
+            max_same = max(0, len(all_wids) - int(min_placement_distance))
+            model.Add(sum(same_terms) <= max_same).WithName(f"exclude_plan_{idx}")
     total_cost_terms = [
         int(max(0.0, costs.get(choice, math.inf)) * 1000.0) * x[(wid, choice)]
         for wid, _, _, _, costs, _, _ in items
@@ -832,6 +847,34 @@ def select_placements_greedy(items: list[tuple[int, int, int, str, dict[str, flo
     return out
 
 
+def plan_placements(path: Path) -> dict[int, str]:
+    data = load_json(path)
+    op_backend: dict[int, str] = {}
+    for op in data.get("ops", []):
+        if not isinstance(op, dict):
+            continue
+        wid = int(op.get("weight_id", -1))
+        if wid >= 0:
+            op_backend.setdefault(wid, str(op.get("compute_backend", "gpu")).lower())
+    out: dict[int, str] = {}
+    for w in data.get("weights", []):
+        if not isinstance(w, dict):
+            continue
+        wid = int(w.get("weight_id", -1))
+        if wid < 0:
+            continue
+        loc = str(w.get("location", "disk")).lower()
+        if loc == "gpu":
+            out[wid] = "gpu"
+        elif loc == "cpu":
+            out[wid] = "cpu"
+        elif op_backend.get(wid, "gpu") == "gpu":
+            out[wid] = "disk_gpu"
+        else:
+            out[wid] = "disk_cpu"
+    return out
+
+
 def xform_for_backend(backend: str, quant: str) -> str:
     if backend == "GPU":
         return "gpu_convert" if quant in ("Q4_0", "Q8_0", "MXFP4", "2", "8") else "none"
@@ -845,6 +888,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     cm = CostModel(args.cost_dir)
     has_state = args.state is not None
     allowed_placements = parse_allowed_placements(getattr(args, "allowed_placements", None))
+    exclude_placements = [
+        plan_placements(Path(path))
+        for path in getattr(args, "exclude_plan", [])
+        if Path(path).exists()
+    ]
 
     budget_bytes = max(0, (args.budget_mib - args.kv_mib - args.misc_mib - args.safety_mib) * MB)
     objective_transition_weight = float(args.transition_weight) if has_state else 0.0
@@ -898,7 +946,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         items.append((wid, size, first_consumer.get(wid, wid), name, costs, engine_costs, choice_ops))
 
     cp_result = select_placements_cp(
-        items, budget_bytes, args.time_limit_ms, str(args.cp_objective), int(args.prefetch_distance)
+        items, budget_bytes, args.time_limit_ms, str(args.cp_objective), int(args.prefetch_distance),
+        exclude_placements=exclude_placements,
+        min_placement_distance=int(getattr(args, "min_placement_distance", 0)),
     )
     solver_kind = "cp_sat"
     cp_schedule: list[dict[str, Any]] = []
@@ -1033,6 +1083,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "transition_weight": objective_transition_weight,
             "disk_reload_multiplier": float(args.disk_reload_multiplier),
             "disk_gpu_reload_multiplier": float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
+            "exclude_plan_count": len(exclude_placements),
+            "min_placement_distance": int(getattr(args, "min_placement_distance", 0)),
         },
     }
 
@@ -1066,6 +1118,10 @@ def main() -> None:
                     help="pipeline uses max per engine for disk/prepare/compute; none sums all stages")
     ap.add_argument("--cp-objective", choices=CP_OBJECTIVES, default="resource_makespan",
                     help="CP-SAT objective: interval_makespan uses optional intervals and NoOverlap resources")
+    ap.add_argument("--exclude-plan", type=Path, action="append", default=[],
+                    help="existing plan whose placement should be excluded by --min-placement-distance; may be repeated")
+    ap.add_argument("--min-placement-distance", type=int, default=0,
+                    help="minimum weight-placement Hamming distance from each --exclude-plan")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 

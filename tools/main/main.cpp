@@ -127,6 +127,7 @@ struct elastic_online_solver_state {
     std::unordered_map<std::string, nlohmann::json> candidate_plan_cache;
     std::unordered_map<std::string, llama_plan *> candidate_loaded_plan_cache;
     std::unordered_map<std::string, double> cost_cache;
+    bool log_candidate_scores = false;
     std::string work_dir;
     int kv_mib = 128;
     int misc_mib = 256;
@@ -723,6 +724,11 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
                                                                     &load_mb, &prepare_mb, &evict_mb, &changed);
         const double steady = plan.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
         const double score = steady + s->transition_weight * transition;
+        if (s->log_candidate_scores) {
+            LOG_INF("[elastic-candidate-score] budget=%lld candidate=%d file=%s steady=%.3f transition=%.3f score=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
+                    (long long) budget_mib, cand.value("candidate_id", -1), file.c_str(),
+                    steady, transition, score, changed, load_mb, prepare_mb, evict_mb);
+        }
         if (score < best_score) {
             best_score = score;
             best_transition = transition;
@@ -1282,6 +1288,7 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOW_CPU_FALLBACK")) online.allow_cpu_fallback = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_SCORES")) online.log_candidate_scores = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOWED_PLACEMENTS")) online.allowed_placements = e;
