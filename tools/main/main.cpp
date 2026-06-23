@@ -142,6 +142,8 @@ struct elastic_online_solver_state {
     int prefetch_distance = 1;
     bool allow_cpu_fallback = false;
     double transition_weight = 1.0;
+    double high_budget_transition_weight = -1.0;
+    int64_t high_budget_transition_threshold_mib = 0;
     double disk_reload_multiplier = 1.0;
     std::string overlap_model = "pipeline";
     std::string cp_objective = "resource_makespan";
@@ -152,6 +154,15 @@ struct elastic_online_solver_state {
     double remote_server_ms_total = 0.0;
     std::vector<llama_plan *> plans;
 };
+
+static double elastic_effective_transition_weight(const elastic_online_solver_state * s, int64_t budget_mib) {
+    if (s && s->high_budget_transition_weight >= 0.0 &&
+        s->high_budget_transition_threshold_mib > 0 &&
+        budget_mib >= s->high_budget_transition_threshold_mib) {
+        return s->high_budget_transition_weight;
+    }
+    return s ? s->transition_weight : 1.0;
+}
 
 static double elastic_cost_lookup(const nlohmann::json & records, const std::string & backend,
                                   const std::string & kind, const std::string & name,
@@ -558,7 +569,7 @@ static void elastic_recompute_plan_events_from_weights(nlohmann::json & plan, in
     }
 }
 
-static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nlohmann::json & plan,
+static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, int64_t budget_mib, nlohmann::json & plan,
                                            const std::unordered_map<std::string, uint32_t> * state_flags) {
     struct node {
         std::string key;
@@ -580,6 +591,7 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
         const char * e = std::getenv("LLAMA_ELASTIC_DIFF_ACCEPT_MARGIN_MS");
         return e && *e ? std::atof(e) : 0.0;
     }();
+    const double transition_weight = elastic_effective_transition_weight(s, budget_mib);
 
     std::unordered_map<std::string, node> groups;
     std::unordered_map<int, std::string> current_loc_by_id;
@@ -631,7 +643,7 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
     nlohmann::json group_log = nlohmann::json::array();
     for (auto & kv : groups) {
         node & g = kv.second;
-        const double score = g.steady_gain_ms - s->transition_weight * g.transition_ms;
+        const double score = g.steady_gain_ms - transition_weight * g.transition_ms;
         const bool reject = score <= accept_margin;
         if (reject) {
             for (int id : g.weight_ids) reject_ids.insert(id);
@@ -651,8 +663,8 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
     }
     if (reject_ids.empty()) {
         plan["diff_graph"] = {{"mode", "expand_accept"}, {"groups", group_log}, {"rejected_weights", 0}};
-        LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=0 horizon=%.1f margin=%.3f\n",
-                groups.size(), horizon, accept_margin);
+        LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=0 horizon=%.1f margin=%.3f transition_weight=%.3f\n",
+                groups.size(), horizon, accept_margin, transition_weight);
         return;
     }
 
@@ -676,11 +688,12 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
         {"mode", "expand_accept"},
         {"horizon_tokens", horizon},
         {"accept_margin_ms", accept_margin},
+        {"transition_weight", transition_weight},
         {"groups", group_log},
         {"rejected_weights", (int) reject_ids.size()},
     };
-    LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=%zu horizon=%.1f margin=%.3f\n",
-            groups.size(), reject_ids.size(), horizon, accept_margin);
+    LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=%zu horizon=%.1f margin=%.3f transition_weight=%.3f\n",
+            groups.size(), reject_ids.size(), horizon, accept_margin, transition_weight);
 }
 
 static bool elastic_online_generate_candidate_select(elastic_online_solver_state * s, int64_t budget_mib,
@@ -724,6 +737,7 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     double best_load_mb = 0.0;
     double best_prepare_mb = 0.0;
     double best_evict_mb = 0.0;
+    const double transition_weight = elastic_effective_transition_weight(s, budget_mib);
     int best_changed = 0;
     int best_cid = -1;
     std::string best_file;
@@ -789,7 +803,7 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         const double transition = elastic_candidate_transition_cost(s, plan, &state_flags,
                                                                     &load_mb, &prepare_mb, &evict_mb, &changed);
         const double steady = plan.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
-        const double score = steady + s->transition_weight * transition;
+        const double score = steady + transition_weight * transition;
         if (s->log_candidate_scores) {
             LOG_INF("[elastic-candidate-score] budget=%lld candidate=%d file=%s steady=%.3f transition=%.3f score=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
                     (long long) budget_mib, cand.value("candidate_id", -1), file.c_str(),
@@ -840,10 +854,10 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     }
 
     if (s->mode == "diff-graph-expand") {
-        elastic_diff_graph_expand_plan(s, best_plan, &state_flags);
+        elastic_diff_graph_expand_plan(s, budget_mib, best_plan, &state_flags);
         best_transition = elastic_candidate_transition_cost(s, best_plan, &state_flags,
                                                             &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
-        best_score = best_plan.value("pred_per_token_ms", 0.0) + s->transition_weight * best_transition;
+        best_score = best_plan.value("pred_per_token_ms", 0.0) + transition_weight * best_transition;
     }
     if (selected_file) *selected_file = best_file;
 
@@ -855,7 +869,10 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             {"candidate_file", best_file},
             {"score_ms", best_score},
             {"transition_ms", best_transition},
-            {"transition_weight", s->transition_weight},
+            {"transition_weight", transition_weight},
+            {"base_transition_weight", s->transition_weight},
+            {"high_budget_transition_weight", s->high_budget_transition_weight},
+            {"high_budget_transition_threshold_mib", s->high_budget_transition_threshold_mib},
             {"diff_changed_weights", best_changed},
             {"diff_load_mb", best_load_mb},
             {"diff_prepare_mb", best_prepare_mb},
@@ -1391,6 +1408,8 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_PREFETCH_DISTANCE")) online.prefetch_distance = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOW_CPU_FALLBACK")) online.allow_cpu_fallback = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_WEIGHT")) online.high_budget_transition_weight = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_THRESHOLD_MIB")) online.high_budget_transition_threshold_mib = std::atoll(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_SCORES")) online.log_candidate_scores = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_EVENTS")) online.log_candidate_events = std::atoi(e) != 0;

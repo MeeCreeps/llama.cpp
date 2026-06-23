@@ -1550,3 +1550,91 @@ Step 4 to locally accept only the valuable sub-diffs from the CP-SAT target plan
 That should keep the current candidate-select latency profile while closing the
 quality gap to CP-SAT on difficult traces like trace_01.
 ```
+
+## Next-step first-two-trace optimization
+
+Goal:
+
+```text
+Use only the first two validation traces and improve the optimized online
+candidate path without paying CP-SAT solve time.
+```
+
+Tested variants:
+
+```text
+base50_tw05:
+    previous candidate-select setting:
+        transition_weight=0.5
+        keep_current_margin=50 ms
+
+diff-graph-expand:
+    current conservative graph reject implementation
+
+up1:
+    candidate-select plus LLAMA_ELASTIC_PLAN_UP_STEP_BUCKETS=1
+
+stable3:
+    candidate-select plus LLAMA_ELASTIC_PLAN_SWITCH_STABLE_STEPS=3
+
+tw01:
+    candidate-select with transition_weight=0.1
+
+adaptive:
+    candidate-select with pressure-aware transition weight:
+        LLAMA_ELASTIC_TRANSITION_WEIGHT=0.5
+        LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_WEIGHT=0.1
+        LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_THRESHOLD_MIB=4864
+```
+
+The motivation for the adaptive version is from the opposite behavior of the
+first two traces:
+
+```text
+trace_01:
+    Low budget / high pressure.  transition_weight=0.1 accepts too much
+    movement and regresses badly.
+
+trace_05:
+    Higher budget / lower pressure.  transition_weight=0.1 is much faster
+    because the extra movement buys a better steady plan.
+```
+
+Results:
+
+| variant | trace | raw ms/tok | exec ms/tok | tokens | provider ms | calls | apply | load/xform | read MB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base50_tw05 | trace_01_user_147 | 288.3 | 298.7 | 202 | 49.7 | 8 | 3 | 73/73 | 2166.8 |
+| adaptive | trace_01_user_147 | 279.1 | 290.7 | 208 | 50.6 | 8 | 3 | 73/73 | 2166.8 |
+| base50_tw05 | trace_05_user_74 | 173.6 | 175.1 | 343 | 23.4 | 4 | 2 | 19/19 | 501.8 |
+| adaptive | trace_05_user_74 | 172.3 | 175.0 | 342 | 57.9 | 6 | 5 | 45/45 | 1127.2 |
+| tw01 | trace_01_user_147 | 404.1 | 461.9 | 131 | 113.8 | 7 | 7 | 175/175 | 5224.5 |
+| tw01 | trace_05_user_74 | 152.5 | 154.5 | 388 | 37.1 | 6 | 5 | 45/45 | 1127.2 |
+| diff-graph-expand | trace_01_user_147 | 2203.2 | 2532.1 | 25 | 151.5 | 6 | 6 | 215/215 | 4722.8 |
+| diff-graph-expand | trace_05_user_74 | 210.7 | 215.8 | 277 | 170.6 | 8 | 8 | 116/116 | 2256.8 |
+
+Interpretation:
+
+```text
+adaptive improves the first two traces relative to the previous optimized
+candidate-select baseline:
+
+    trace_01 raw:  288.3 -> 279.1 ms/token
+    trace_01 exec: 298.7 -> 290.7 ms/token
+
+    trace_05 raw:  173.6 -> 172.3 ms/token
+    trace_05 exec: 175.1 -> 175.0 ms/token
+
+The improvement is modest but directionally useful.  More importantly, the
+experiment shows the cost-model shape needed for the next graph/tree version:
+transition penalties should depend on memory pressure.  Low-budget windows need
+resident-state preservation; high-budget windows can spend more movement to
+reach a faster steady plan.
+
+The current diff-graph-expand implementation is not usable yet.  It rejects
+promotion groups by rewriting them to disk/CPU and recomputing a broad load
+timeline, which creates too many load/xform events and destroys performance.
+The next graph implementation should accept/reject sub-diffs from the current
+resident plan directly, not rewrite rejected promotions into a new disk-heavy
+plan.
+```
