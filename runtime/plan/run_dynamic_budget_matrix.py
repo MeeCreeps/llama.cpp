@@ -556,7 +556,7 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
             if "prepare" in stage_kinds or "all" in stage_kinds:
                 common.setdefault("GGML_ELASTIC_ASYNC_STAGE_PREPARE", "1")
                 common.setdefault("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE", "1")
-    if method in {"offline", "online", "mru", "candidate-select", "diff-graph-expand"}:
+    if method in {"offline", "online", "mru", "candidate-select", "diff-graph-expand", "diff-tree-ideal"}:
         common["GGML_ELASTIC_DYNAMIC"] = "1"
     if method == "offline":
         common["LLAMA_ELASTIC_DIR"] = args.phone_plan_dir
@@ -595,7 +595,7 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
             }
         )
-    elif method in {"candidate-select", "diff-graph-expand"}:
+    elif method in {"candidate-select", "diff-graph-expand", "diff-tree-ideal"}:
         common.update(
             {
                 "LLAMA_ELASTIC_ONLINE": "1",
@@ -706,7 +706,7 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
 
 def methods_need_offline_table(methods: str) -> bool:
     selected = {m.strip() for m in methods.split(",") if m.strip()}
-    return bool(selected & {"offline", "static-min", "candidate-select", "diff-graph-expand"})
+    return bool(selected & {"offline", "static-min", "candidate-select", "diff-graph-expand", "diff-tree-ideal"})
 
 
 def stop_remote_server(args: argparse.Namespace, proc: subprocess.Popen[str] | None) -> None:
@@ -760,7 +760,7 @@ def main() -> None:
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu",
                     help="comma-separated solver placement choices")
     ap.add_argument("--top-k", type=int, default=1,
-                    help="number of candidate plans per budget for candidate-select / diff-graph-expand")
+                    help="number of candidate plans per budget for candidate-select / diff-graph-expand / diff-tree-ideal")
     ap.add_argument("--candidate-placement-specs", default="",
                     help="semicolon-separated allowed-placement specs for offline candidate diversity")
     ap.add_argument("--candidate-min-distance", type=int, default=32,
@@ -937,7 +937,7 @@ def main() -> None:
                 if (t.local.name, method) in completed:
                     print(f"=== skip existing trace={t.local.name} method={method} ===", flush=True)
                     continue
-                if method in {"online", "mru", "candidate-select", "diff-graph-expand"} and not args.dry_run:
+                if method in {"online", "mru", "candidate-select", "diff-graph-expand", "diff-tree-ideal"} and not args.dry_run:
                     adb_shell_retry(
                         args.adb_serial,
                         f"rm -rf {shell_quote(work)} && mkdir -p {shell_quote(work)}",

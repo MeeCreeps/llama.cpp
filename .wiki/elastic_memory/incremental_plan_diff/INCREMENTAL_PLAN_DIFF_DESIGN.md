@@ -1638,3 +1638,113 @@ The next graph implementation should accept/reject sub-diffs from the current
 resident plan directly, not rewrite rejected promotions into a new disk-heavy
 plan.
 ```
+
+## Idealized diff-tree prototype
+
+Implementation:
+
+```text
+LLAMA_ELASTIC_ONLINE_MODE=diff-tree-ideal
+```
+
+Code path:
+
+```text
+tools/main/main.cpp
+    elastic_online_generate_candidate_select(...)
+        select target top-k candidate under current budget
+        choose base plan:
+            previous adjusted diff-tree plan if it is still budget-feasible
+            otherwise previous selected candidate if feasible
+            otherwise bootstrap from target candidate
+        elastic_diff_tree_ideal_plan(base, target)
+```
+
+This is intentionally an idealized research prototype.  It changes the
+semantics of reject:
+
+```text
+old diff-graph-expand:
+    reject target promotion -> rewrite the weight to disk/CPU
+
+diff-tree-ideal:
+    reject target promotion -> keep the base/current placement
+```
+
+Tree structure:
+
+```text
+root: Diff(P_base, P_target)
+    layer/component group:
+        layer:12/attn
+        layer:12/ffn
+        ...
+    leaf:
+        individual weight placement/backend change
+```
+
+Decision rule:
+
+```text
+group_score =
+    horizon_tokens * (base_path_cost - target_path_cost)
+    - transition_weight * target_transition_cost
+
+if group_score > LLAMA_ELASTIC_DIFF_ACCEPT_MARGIN_MS and budget fits:
+    accept whole group
+else:
+    expand to leaves
+
+if leaf_score > LLAMA_ELASTIC_DIFF_LEAF_ACCEPT_MARGIN_MS and budget fits:
+    accept leaf
+else:
+    reject leaf and keep base placement
+```
+
+The first bug found during implementation was exactly the semantic issue we
+wanted to avoid: when every group was rejected, the generated plan still changed
+budget/timeline and caused a runtime apply.  The prototype now has an explicit
+`no_accept keep_base` path that returns the base plan unchanged.
+
+Focused results on the two research traces:
+
+| trace | method | raw ms/tok | exec ms/tok | provider ms | calls | apply | load/xform | read MB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| trace_01 | offline | 356.9 | 395.5 | 34.0 |  | 8 | 187/187 | 5602.5 |
+| trace_01 | online CP-SAT | 194.1 | 191.7 | 6807.8 | 9 | 9 | 216/264 | 6480.0 |
+| trace_01 | candidate adaptive | 287.2 | 300.5 | 53.2 | 8 | 3 | 73/73 | 2166.8 |
+| trace_01 | diff-tree margin=0 | 385.3 | 443.4 | 207.0 | 7 | 7 | 175/175 | 5224.5 |
+| trace_01 | diff-tree margin=800 | 267.1 | 300.7 | 195.9 | 9 | 7 | 215/215 | 6315.8 |
+| oscillating trace06 | offline | 271.8 | 294.9 | 37.6 |  | 15 | 208/208 | 6507.0 |
+| oscillating trace06 | online CP-SAT | 183.6 | 141.1 | 14970.4 | 19 | 19 | 305/400 | 6581.2 |
+| oscillating trace06 | candidate adaptive | 192.7 | 199.1 | 53.5 | 10 | 4 | 53/53 | 1521.0 |
+| oscillating trace06 | diff-tree margin=0 | 300.5 | 327.8 | 288.3 | 19 | 15 | 208/208 | 6540.8 |
+| oscillating trace06 | diff-tree margin=800 | 216.8 | 235.0 | 309.3 | 19 | 15 | 240/240 | 7335.0 |
+
+Interpretation:
+
+```text
+The graph/tree structure now exists and executes on-device.
+
+It is not yet better than candidate-select.  The main remaining problem is that
+diff-tree still produces a new generated plan on many budget changes, so runtime
+apply_count stays close to offline.  candidate-select wins because its sticky
+plan identity path keeps apply_count low.
+
+However, the margin=800 run validates the research mechanism:
+    - group accept/reject is visible in logs
+    - no_accept keep_base works
+    - provider time is still far below CP-SAT
+
+Next step:
+    add plan-identity reuse for diff-tree:
+        if accepted diff set is empty or equivalent to the previous adjusted
+        plan, return the already loaded previous plan handle instead of writing
+        and applying a new JSON plan.
+
+    then add a transition-aware apply penalty to the tree objective:
+        score -= apply_overhead_if_plan_signature_changes
+
+This should preserve the tree research structure while recovering the low
+apply_count behavior that makes candidate-select fast.
+```
