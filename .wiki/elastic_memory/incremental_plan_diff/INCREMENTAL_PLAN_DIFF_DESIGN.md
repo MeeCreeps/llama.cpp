@@ -1748,3 +1748,150 @@ Next step:
 This should preserve the tree research structure while recovering the low
 apply_count behavior that makes candidate-select fast.
 ```
+
+## Plan-diff analysis: why online CP-SAT is fast
+
+To make the next tree version less heuristic, we added a placement-diff
+analyzer:
+
+```text
+runtime/plan/analyze_plan_diffs.py
+```
+
+It compares generated online plans against the offline table at the same budget
+and summarizes:
+
+```text
+location/backend changes:
+    cpu/cpu -> gpu/gpu
+    gpu/gpu -> cpu/cpu
+    disk/cpu -> gpu/gpu
+    ...
+
+component-level aggregation:
+    attention vs FFN vs output
+
+timeline differences:
+    load / xform / evict / transfer events
+```
+
+The important observation is that online CP-SAT is not fast merely because it
+moves less data.  In the hard windows, it often performs comparable or even
+more runtime movement than candidate-select, but it chooses a better placement
+under the same resident-memory budget.
+
+Online CP-SAT vs offline, same budget table:
+
+| trace | online plans | changed weights per switch | dominant diff | aggregate changed MB | component |
+|---|---:|---:|---|---:|---|
+| trace_01_user_147 | 9 | min/median/max = 56/60/65 | `cpu/cpu -> gpu/gpu` = 529 changes | 1197.0 MiB | almost all attention |
+| oscillating trace06 | 19 | min/median/max = 0/59/65 | `cpu/cpu -> gpu/gpu` = 828 changes | 2787.8 MiB | almost all attention |
+
+Concrete example at 4608 MiB:
+
+```text
+offline:
+    resident: 3366.0 MB
+    location: cpu=65, gpu=147, disk=12
+    backend:  cpu=77, gpu=147
+
+online CP-SAT:
+    resident: 3366.0 MB
+    location: gpu=212, disk=12
+    backend:  gpu=212, cpu=12
+
+diff:
+    65 attention weights move from cpu/cpu to gpu/gpu
+```
+
+This explains the gap between candidate-select and full online CP-SAT:
+
+```text
+candidate-select:
+    very fast online decision
+    low apply/load/xform because it preserves current plan identity
+    but target pool is still limited by offline top-k candidates
+
+online CP-SAT:
+    expensive online solve
+    may apply more changes
+    but finds a better compute placement, especially attention CPU -> GPU
+```
+
+The current `diff-tree-ideal` implementation has the graph structure, but it
+does not yet learn this CP-SAT behavior.  Its target is still selected from the
+offline candidate table, so the tree can only refine diffs that already exist
+in those candidates.  If the candidate table does not contain the attention
+promotion pattern, the tree cannot recover it by local accept/reject.
+
+Research implication for Step 4:
+
+```text
+The graph/tree diff should be built around the CP-SAT-like target difference,
+not only around offline candidate differences.
+```
+
+The next tree design should combine two properties:
+
+```text
+candidate-select property:
+    keep plan identity when the useful diff set is empty or too small
+    penalize every new plan application in the objective
+
+online CP-SAT property:
+    expose attention-promotion supernodes as first-class graph nodes
+    allow local CPU -> GPU promotion under the same resident budget
+    demote lower-value FFN or old GPU groups when needed to make room
+```
+
+Proposed graph root for the next prototype:
+
+```text
+root: Diff(P_current, P_online_target)
+
+children:
+    attn_promote(layer range)
+        cpu/cpu -> gpu/gpu for q/k/v/o-like attention weights
+
+    ffn_demote(layer range)
+        gpu/gpu -> cpu/cpu or disk/cpu to release memory
+
+    disk_recover(layer/component)
+        disk/cpu -> gpu/gpu when the weight is expected to be reused soon
+
+    keep_identity
+        reject all low-value diffs and return the previous plan handle
+```
+
+The accept rule should be plan-application aware:
+
+```text
+score(node) =
+    horizon * decode_gain(node)
+  - transition_weight * materialization_cost(node)
+  - apply_penalty_if_signature_changes
+  - memory_pressure_penalty
+```
+
+This gives a cleaner research story:
+
+```text
+offline:
+    budget-optimal but state-unaware
+
+candidate-select:
+    state-aware and fast, but plan-level coarse
+
+online CP-SAT:
+    high-quality state-aware target, but slow to solve
+
+tree diff:
+    approximate the CP-SAT target by accepting only high-value structured
+    sub-diffs, while preserving candidate-select's low apply overhead
+```
+
+One practical note: `candidate-select` currently does not emit generated plan
+JSONs for most decisions because it returns prewarmed plan handles directly.
+That is part of why it is fast.  For diff analysis, this means candidate-select
+must be inspected through runtime logs and counters, while `online` and
+`diff-tree-ideal` can be inspected through pulled `*_plan.json` files.
