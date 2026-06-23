@@ -17,7 +17,7 @@ SCORE_RE = re.compile(
     r"load=([0-9.]+)MB prepare=([0-9.]+)MB evict=([0-9.]+)MB"
 )
 SELECT_RE = re.compile(
-    r"\[elastic-candidate\] budget=(\d+) table_budget=(\d+) candidate=(\d+) file=([^ ]+) "
+    r"\[elastic-candidate\] budget=(\d+) table_budget=(\d+) candidate=(-?\d+) file=([^ ]+) "
     r"score=([0-9.]+) transition=([0-9.]+) changed=(\d+) "
     r"load=([0-9.]+)MB prepare=([0-9.]+)MB evict=([0-9.]+)MB"
 )
@@ -86,6 +86,8 @@ def parse_candidate_log(path: Path) -> dict[str, Any]:
     candidate_counts = Counter(sel["candidate"] for sel in selections)
     budget_counts = Counter(sel["budget"] for sel in selections)
     nonzero = [sel for sel in selections if sel["candidate"] != 0]
+    keep_count = sum(1 for sel in selections if sel["candidate"] == -2)
+    real_switch_count = sum(1 for sel in selections if sel["candidate"] not in (0, -2))
 
     margins: list[float] = []
     nonzero_score_events: list[str] = []
@@ -111,6 +113,8 @@ def parse_candidate_log(path: Path) -> dict[str, Any]:
         "candidate_counts": dict(sorted(candidate_counts.items())),
         "budget_counts": dict(sorted(budget_counts.items())),
         "nonzero_count": len(nonzero),
+        "keep_count": keep_count,
+        "real_switch_count": real_switch_count,
         "nonzero_events": nonzero_score_events[:12],
         "avg_transition_ms": avg("transition", selections),
         "avg_load_mb": avg("load_mb", selections),
@@ -171,14 +175,14 @@ def write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# Incremental Candidate Summary",
         "",
-        "| artifact | trace | raw ms/tok | provider ms | apply count | load/xform | direct read ms/calls/MB | online calls | selected candidates | nonzero | avg transition | avg load MB |",
-        "|---|---|---:|---:|---:|---|---|---:|---|---:|---:|---:|",
+        "| artifact | trace | raw ms/tok | provider ms | apply count | load/xform | direct read ms/calls/MB | online calls | selected candidates | keep | real switches | avg transition | avg load MB |",
+        "|---|---|---:|---:|---:|---|---|---:|---|---:|---:|---:|---:|",
     ]
     for row in rows:
         counts = ", ".join(f"c{k}={v}" for k, v in row.get("candidate_counts", {}).items())
         direct = f"{fmt_float(row.get('direct_read_ms'))}/{row.get('direct_read_calls', 'n/a')}/{fmt_float(row.get('direct_read_mb'))}"
         lines.append(
-            "| {artifact} | {trace} | {raw} | {provider} | {apply_count} | {load}/{xform} | {direct} | {online} | {counts} | {nonzero} | {avg_transition} | {avg_load} |".format(
+            "| {artifact} | {trace} | {raw} | {provider} | {apply_count} | {load}/{xform} | {direct} | {online} | {counts} | {keep} | {real_switches} | {avg_transition} | {avg_load} |".format(
                 artifact=Path(str(row.get("artifact", ""))).name,
                 trace=row.get("trace", ""),
                 raw=fmt_float(row.get("raw_ms_per_token", "")),
@@ -189,7 +193,8 @@ def write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
                 direct=direct,
                 online=row.get("online_calls", ""),
                 counts=counts,
-                nonzero=row.get("nonzero_count", 0),
+                keep=row.get("keep_count", 0),
+                real_switches=row.get("real_switch_count", 0),
                 avg_transition=fmt_float(row.get("avg_transition_ms", 0.0)),
                 avg_load=fmt_float(row.get("avg_load_mb", 0.0)),
             )

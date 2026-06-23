@@ -896,3 +896,94 @@ alpha around 0.25-0.5:
     current trace suggests the best trade-off between reuse and steady plan
     quality.
 ```
+
+## Sticky current-plan branch
+
+The first candidate-select implementation still made a fresh table choice at
+every budget tick.  That is useful for validating the transition cost, but it
+can overreact on traces where the budget oscillates upward after a low-budget
+event.  In that case the current resident/transformed plan is already feasible
+under the larger budget, and switching to the larger budget's steady-optimal
+candidate may pay load/transform cost that is not recovered before the next
+budget change.
+
+This motivates a conservative branch inside step 4:
+
+```text
+Given:
+    P_keep = currently applied candidate plan
+    P_best = best candidate under the current budget table
+
+If:
+    budget(P_keep) <= current_budget
+    steady_cost(P_keep) <= score(P_best) + keep_margin_ms
+
+Then:
+    reject the candidate diff and keep P_keep.
+```
+
+Runtime knob:
+
+```text
+LLAMA_ELASTIC_KEEP_CURRENT_MARGIN_MS=<margin>
+```
+
+This is a simple graph decision:
+
+```text
+root: compare current plan and candidate table winner
+edge accept:
+    apply diff(P_keep -> P_best)
+edge reject:
+    keep current residency and skip plan apply
+```
+
+The branch is deliberately one-sided:
+
+```text
+It only keeps a previous plan when that plan was built for a budget not larger
+than the current budget.  It does not keep an infeasible high-budget plan after
+a budget drop.
+```
+
+Smoke result on the oscillating trace:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_tw05_keep150_60s_candidate
+
+trace:
+    trace_06_user_204_10min_x1.csv
+
+settings:
+    candidate_min_distance=32
+    transition_weight=0.5
+    keep_current_margin_ms=150
+    bench_seconds=60
+```
+
+```text
+raw ms/token:            223.74
+exec ms/token:           227.48
+provider_get_ms_total:   146.03
+apply_count:             2
+planned load/xform:      34 / 34
+direct_read:             698.36 ms, 34 calls, 1012.5 MiB
+online calls:            156
+selected candidates:     c-2=154, c0=1, c3=1
+real switches:           1
+```
+
+Here `candidate=-2` means "keep current plan".  The online provider still
+receives many budget checks, but almost all of them are resolved by rejecting
+the diff and keeping the already materialized plan.  This is the first result
+where the mechanism strongly reduces load/transform instead of merely choosing
+among alternate steady plans.
+
+Current caveat:
+
+```text
+This is only a 60-second smoke run and not a cooled A/B comparison.  The next
+step is to sweep keep_margin_ms in {25, 50, 100, 150} and compare against
+offline on the same trace with cooldown/randomized order.
+```
