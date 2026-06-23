@@ -1127,3 +1127,63 @@ preserving the lower movement count:
 offline load/xform:     208 / 208
 candidate load/xform:    34 / 34
 ```
+
+## Cooled 60-second A/B
+
+Artifact:
+
+```text
+.wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_keep50_prewarm_cooled_ab_60s
+```
+
+Settings:
+
+```text
+trace:                   trace_06_user_204_10min_x1.csv
+source window:           180 s
+bench seconds:           60 s
+cooldown target:         42 C
+candidate_min_distance:  32
+transition_weight:       0.5
+keep_current_margin:     50 ms
+candidate prewarm:       on
+candidate event logs:    off
+```
+
+Results:
+
+```text
+offline:
+    raw ms/token:          255.88
+    exec ms/token:         283.10
+    provider_get_ms_total: 33.90
+    apply_count:           15
+    planned load/xform:    208 / 208
+    direct_read:           5593.18 ms, 257 calls, 6507.0 MiB
+    thermal CPU max:       38.7 -> 56.6 C
+
+candidate-select:
+    raw ms/token:          209.85
+    exec ms/token:         214.33
+    provider_get_ms_total: 26.83
+    online calls:          13
+    apply_count:           2
+    planned load/xform:    34 / 34
+    direct_read:           890.63 ms, 34 calls, 1012.5 MiB
+    thermal CPU max:       41.3 -> 60.5 C
+```
+
+Interpretation:
+
+```text
+This is the clearest current evidence for the research claim:
+
+    offline switches to the budget-optimal target plan and repeatedly pays
+    movement/materialization.
+
+    online candidate-select uses the previous/current resident plan as state,
+    accepts only high-value diffs, and rejects most budget-up oscillation diffs.
+
+In this window, online reduces load/xform by 6.1x and direct-read volume by
+6.4x, while raw decode improves by about 18%.
+```
