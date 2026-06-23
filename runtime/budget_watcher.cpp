@@ -200,6 +200,14 @@ size_t budget_watcher_get(const budget_watcher *bw) {
     return bw->current_budget_mb.load(std::memory_order_acquire);
 }
 
+void budget_watcher_reset_clock(budget_watcher *bw) {
+    if (!bw || bw->schedule.empty()) return;
+    bw->t0 = std::chrono::steady_clock::now();
+    bw->current_budget_mb.store(
+        budget_watcher_interp_at(bw->schedule, bw->mode, 0.0),
+        std::memory_order_release);
+}
+
 void budget_watcher_shutdown(budget_watcher *bw) {
     if (!bw) return;
     if (bw->thread_started) {

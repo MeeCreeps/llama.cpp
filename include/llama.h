@@ -400,6 +400,10 @@ extern "C" {
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
+    // Elastic runtime hook: reset the dynamic budget trace replay origin when a
+    // backend has registered a budget provider. No-op without elastic backend.
+    LLAMA_API void llama_budget_reset_clock(void);
+
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 

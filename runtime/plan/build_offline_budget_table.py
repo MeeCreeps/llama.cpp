@@ -42,8 +42,9 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
-    ap.add_argument("--transition-weight", type=float, default=1.0)
+    ap.add_argument("--transition-weight", type=float, default=0.1)
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
@@ -76,6 +77,7 @@ def main() -> None:
                 "--prefetch-distance", str(args.prefetch_distance),
                 "--transition-weight", str(args.transition_weight),
                 "--disk-reload-multiplier", str(args.disk_reload_multiplier),
+                "--disk-gpu-reload-multiplier", str(args.disk_gpu_reload_multiplier),
                 "--overlap-model", str(args.overlap_model),
                 "--cp-objective", str(args.cp_objective),
                 "--allowed-placements", str(args.allowed_placements),

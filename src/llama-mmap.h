@@ -163,6 +163,7 @@ enum llama_weight_runtime_location {
 void llama_weight_runtime_mark_desired (const char * name, llama_weight_runtime_location loc);
 void llama_weight_runtime_mark_resident(const char * name, llama_weight_runtime_location loc);
 void llama_weight_runtime_mark_evicted (const char * name, llama_weight_runtime_location loc);
+llama_weight_runtime_location llama_weight_runtime_desired_query(const char * name);
 uint32_t llama_weight_runtime_state_query(const char * name);
 
 // === Weight host (mmap) pointer query ===
@@ -178,8 +179,11 @@ void * llama_weight_host_ptr_query (const char * name);
 // evict target 同源, 可重现); 没注册时 fallback /proc/meminfo MemAvailable。
 // 单 slot (预算是全局值, 不 chain)。 返回 < 0 表示该 provider 当前无有效预算。
 typedef int64_t (*llama_budget_fn_t)(void * user_data);
+typedef void    (*llama_budget_reset_fn_t)(void * user_data);
 void    llama_budget_register(llama_budget_fn_t fn, void * user_data);
+void    llama_budget_reset_register(llama_budget_reset_fn_t fn, void * user_data);
 int64_t llama_budget_query(void);   // 返回当前预算 MB; 无 provider 或无效返 -1
+extern "C" void llama_budget_reset_clock(void); // reset trace replay origin when provider supports it
 
 // === Budget target hook (统一 scheduler 的 "留多少" 维度) ===
 // scheduler 决定"这一刻 GPU 上留多少字节 weight"。 给当前预算 b_t_mb + trace 最低

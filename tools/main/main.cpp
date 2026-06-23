@@ -307,11 +307,29 @@ static std::string elastic_backend_for_item(uint32_t flags, const std::string & 
 }
 
 
+static bool elastic_quant_needs_gpu_convert(const std::string & quant) {
+    return quant == "Q4_0" || quant == "Q8_0" || quant == "MXFP4" ||
+           quant == "2" || quant == "8";
+}
+
 static std::string elastic_xform_for(const std::string & be, const std::string & quant) {
     if (be == "GPU") {
-        return (quant == "Q4_0" || quant == "Q8_0" || quant == "MXFP4" || quant.empty()) ? "gpu_convert" : "none";
+        return elastic_quant_needs_gpu_convert(quant) ? "gpu_convert" : "none";
     }
-    return "cpu_repack";
+    return quant.empty() ? "none" : "cpu_repack";
+}
+
+static bool elastic_allowed_placement_has(const std::string & spec, const std::string & needle) {
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        size_t comma = spec.find(',', pos);
+        std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        item.erase(std::remove_if(item.begin(), item.end(), [](unsigned char c) { return std::isspace(c); }), item.end());
+        if (item == needle) return true;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
 }
 
 static bool elastic_online_generate_native(elastic_online_solver_state * s, int64_t budget_mib, const std::string & plan_path) {
@@ -328,7 +346,12 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
     };
     std::vector<item> items;
     items.reserve(s->item_bases.size());
+    const bool true_mru_cache_mode = s->mode == "mru-cache" || s->mode == "true-mru" || s->mode == "runtime-mru";
     const bool mru_mode = s->mode == "mru" || s->mode == "native-mru";
+    const bool allow_gpu = elastic_allowed_placement_has(s->allowed_placements, "gpu") ||
+                           elastic_allowed_placement_has(s->allowed_placements, "disk_gpu");
+    const bool allow_cpu = elastic_allowed_placement_has(s->allowed_placements, "cpu") ||
+                           elastic_allowed_placement_has(s->allowed_placements, "disk_cpu");
     for (const auto & b : s->item_bases) {
         item it;
         it.id = b.id;
@@ -344,6 +367,8 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
         // in a transient state dump pin online plans to an old resident set.
         it.manageable = true;
         it.backend = elastic_backend_for_item(it.flags, b.backend, it.quant);
+        if (!allow_cpu && allow_gpu) it.backend = "GPU";
+        if (!allow_gpu && allow_cpu) it.backend = "CPU";
         const double movement_value = it.backend == "GPU" ? b.resident_value_gpu : b.resident_value_cpu;
         if (elastic_state_has(it.flags, it.backend)) {
             // Finite churn bonus only. An infinite bonus makes online keep cheap
@@ -357,10 +382,18 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
 
     const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
     const size_t budget_bytes = usable_mib > 0 ? (size_t) usable_mib * 1024 * 1024 : 0;
-    if (mru_mode) {
+    if (true_mru_cache_mode) {
+        std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            if (a.id != b.id) return a.id < b.id;
+            return a.name < b.name;
+        });
+    } else if (mru_mode) {
         // MRU eviction baseline: after a completed decode step, later op ids are
         // treated as the most recently used weights, so pressure evicts them first.
         std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            if (a.name == "output.weight" || b.name == "output.weight") {
+                return a.name == "output.weight";
+            }
             if (a.id != b.id) return a.id < b.id;
             return a.name < b.name;
         });
@@ -398,7 +431,7 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
     plan["ops"] = nlohmann::json::array();
     plan["timeline"] = nlohmann::json::array();
     plan["pred_per_token_ms"] = 0.0;
-    plan["bottleneck"] = mru_mode ? "native_mru" : "native_greedy";
+    plan["bottleneck"] = true_mru_cache_mode ? "runtime_true_mru" : (mru_mode ? "native_mru" : "native_greedy");
 
     for (const auto & it : items) {
         const bool resident = keep.find(it.id) != keep.end();
@@ -423,7 +456,7 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
             {"migrate_from", "cpu"},
             {"migrate_xform", "none"},
         });
-        if (!resident) {
+        if (!true_mru_cache_mode && !resident) {
             const int lead = std::max(1, s->prefetch_distance);
             const int anchor_id = it.id > lead ? it.id - lead : 0;
             if (elastic_state_any_resident(it.flags)) {
@@ -1983,6 +2016,13 @@ int main(int argc, char ** argv) {
     int  elastic_bench_generated = 0;
     if (elastic_bench_seconds > 0.0) {
         LOG_INF("[elastic-bench] duration limit enabled: %.3f seconds\n", elastic_bench_seconds);
+    }
+    const bool elastic_reset_budget_on_start = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_RESET_BUDGET_ON_START");
+        return !e || !*e || *e != '0';
+    }();
+    if (elastic_reset_budget_on_start) {
+        llama_budget_reset_clock();
     }
 
     // single-token antiprompts

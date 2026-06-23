@@ -29,9 +29,17 @@
 #include <charconv>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 
 #include <sys/mman.h>   // posix_madvise
 #include <unistd.h>     // sysconf(_SC_PAGESIZE)
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 // Elastic baseline 集成：runtime/ 模块的头文件由 ggml-opencl CMakeLists.txt 的
 // target_include_directories 把 runtime/ 加入搜索路径。
@@ -2974,6 +2982,18 @@ struct ggml_opencl_elastic_state {
     std::unordered_map<std::string, int>    name_to_wbm;
     std::unordered_map<int, std::string>    wbm_to_name;
     bool                                    sched_registered = false;
+
+    std::mutex                              async_xform_mtx;
+    std::condition_variable                 async_xform_cv;
+    std::unordered_set<int>                 async_xform_inflight;
+    std::deque<int>                         async_xform_queue;
+    bool                                    async_xform_worker_started = false;
+    size_t                                  async_xform_max_inflight = 0;
+    uint64_t                                async_xform_enqueued = 0;
+    uint64_t                                async_xform_completed = 0;
+    uint64_t                                async_xform_waits = 0;
+    uint64_t                                async_xform_wait_us = 0;
+    size_t                                  async_xform_max_pending_seen = 0;
 };
 
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
@@ -2990,6 +3010,106 @@ static std::string opencl_name_for_idx(ggml_opencl_elastic_state *s, int idx) {
     std::lock_guard<std::mutex> lk(s->sched_mtx);
     auto it = s->wbm_to_name.find(idx);
     return it == s->wbm_to_name.end() ? std::string{} : it->second;
+}
+
+static void opencl_wait_async_xform(ggml_opencl_elastic_state *s, int idx) {
+    if (!s || idx < 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(s->async_xform_mtx);
+    if (s->async_xform_inflight.find(idx) != s->async_xform_inflight.end()) {
+        s->async_xform_waits++;
+    }
+    s->async_xform_cv.wait(lk, [s, idx]() {
+        return s->async_xform_inflight.find(idx) == s->async_xform_inflight.end();
+    });
+    const auto t1 = std::chrono::steady_clock::now();
+    s->async_xform_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+}
+
+static bool opencl_async_xform_contains(ggml_opencl_elastic_state *s, int idx) {
+    if (!s || idx < 0) return false;
+    std::lock_guard<std::mutex> lk(s->async_xform_mtx);
+    return s->async_xform_inflight.find(idx) != s->async_xform_inflight.end();
+}
+
+static int opencl_sched_transform_request(const char *name, llama_weight_transform_kind kind, void * /*ud*/);
+
+static void opencl_start_async_xform_worker(ggml_opencl_elastic_state *s) {
+    if (!s) return;
+    {
+        std::lock_guard<std::mutex> lk(s->async_xform_mtx);
+        if (s->async_xform_worker_started) return;
+        s->async_xform_worker_started = true;
+        const char *max_env = std::getenv("GGML_ELASTIC_ASYNC_XFORM_MAX_INFLIGHT");
+        long long max_v = max_env && *max_env ? atoll(max_env) : 1;
+        if (max_v < 1) max_v = 1;
+        s->async_xform_max_inflight = static_cast<size_t>(max_v);
+    }
+    std::thread([s]() {
+        for (;;) {
+            int idx = -1;
+            {
+                std::unique_lock<std::mutex> lk(s->async_xform_mtx);
+                s->async_xform_cv.wait(lk, [s]() { return !s->async_xform_queue.empty(); });
+                idx = s->async_xform_queue.front();
+                s->async_xform_queue.pop_front();
+            }
+            const std::string weight_name = opencl_name_for_idx(s, idx);
+            const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+            const int rc_bg = (bm && bm->resident) ? 0 : elastic::wbmcl_transform_backend(&s->octx, idx);
+            if (rc_bg == 0 && !weight_name.empty()) {
+                llama_weight_runtime_mark_resident(weight_name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+            }
+            {
+                std::lock_guard<std::mutex> lk(s->async_xform_mtx);
+                s->async_xform_inflight.erase(idx);
+                s->async_xform_completed++;
+            }
+            s->async_xform_cv.notify_all();
+        }
+    }).detach();
+}
+
+static int opencl_plan_aware_victim(const elastic::weight_buffer_manager *wbm,
+                                    int exclude_idx,
+                                    void *ud) {
+    auto *s = static_cast<ggml_opencl_elastic_state *>(ud);
+    if (!wbm || !s) return -1;
+    int victim = -1;
+    if (wbm->evict_mru) {
+        uint64_t newest = 0;
+        bool found = false;
+        for (const auto &b : wbm->blocks) {
+            if (!b.resident || b.is_pinned || b.block_idx == exclude_idx) continue;
+            if (opencl_async_xform_contains(s, b.block_idx)) continue;
+            const std::string name = opencl_name_for_idx(s, b.block_idx);
+            if (!name.empty() &&
+                llama_weight_runtime_desired_query(name.c_str()) == LLAMA_WEIGHT_RUNTIME_GPU) {
+                continue;
+            }
+            if (!found || b.last_used_token > newest) {
+                newest = b.last_used_token;
+                victim = b.block_idx;
+                found = true;
+            }
+        }
+    } else {
+        uint64_t oldest = static_cast<uint64_t>(-1);
+        for (const auto &b : wbm->blocks) {
+            if (!b.resident || b.is_pinned || b.block_idx == exclude_idx) continue;
+            if (opencl_async_xform_contains(s, b.block_idx)) continue;
+            const std::string name = opencl_name_for_idx(s, b.block_idx);
+            if (!name.empty() &&
+                llama_weight_runtime_desired_query(name.c_str()) == LLAMA_WEIGHT_RUNTIME_GPU) {
+                continue;
+            }
+            if (b.last_used_token < oldest) {
+                oldest = b.last_used_token;
+                victim = b.block_idx;
+            }
+        }
+    }
+    return victim;
 }
 
 // === Runtime scheduler handlers (registered with llama-mmap registry) ===
@@ -3009,10 +3129,18 @@ static uint32_t opencl_sched_state_query(const char *name, void * /*ud*/) {
     std::lock_guard<std::mutex> lk(s->sched_mtx);
     auto it = s->name_to_wbm.find(name);
     if (it == s->name_to_wbm.end()) return 0;
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
+    const int idx = it->second;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     uint32_t flags = 0;
     if (bm && bm->host_ptr) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
     if (bm && bm->resident) flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+    if (bm) {
+        std::lock_guard<std::mutex> staging_lock(s->octx.host_staging_mtx);
+        auto staged = s->octx.host_staging_by_idx.find(idx);
+        if (staged != s->octx.host_staging_by_idx.end() && staged->second.size() >= bm->byte_size) {
+            flags |= LLAMA_WEIGHT_STATE_CPU_RAW_RESIDENT;
+        }
+    }
     return flags;
 }
 
@@ -3043,7 +3171,11 @@ static int opencl_sched_movement_request(const char *name, bool evict, void * /*
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     if (!bm) return -3;
     if (evict) {
+        if (llama_weight_runtime_desired_query(name) == LLAMA_WEIGHT_RUNTIME_GPU) return 0;
         if (!bm->resident) return 0;
+        opencl_wait_async_xform(s, idx);
+        bm = elastic::wbm_get(&s->wbm, idx);
+        if (!bm || !bm->resident) return 0;
         int rc = elastic::wbmcl_evict_batch(&s->octx, &idx, 1);
         s->n_evicts_total += rc > 0 ? 1 : 0;
         if (rc > 0) llama_weight_runtime_mark_evicted(name, LLAMA_WEIGHT_RUNTIME_GPU);
@@ -3075,7 +3207,7 @@ static int opencl_sched_stage_request(const char *name, const char *stage, void 
         return -2;
     }
     if (strcmp(stage, "load") == 0 || strcmp(stage, "load_gpu") == 0) {
-        rc = elastic::wbmcl_load_host(&s->octx, idx);
+        rc = elastic::wbmcl_load_host_async(&s->octx, idx);
         if (s->profile_csv) {
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3089,6 +3221,25 @@ static int opencl_sched_stage_request(const char *name, const char *stage, void 
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             opencl_profile_stage("TRANSFER", name, idx, bytes, ms, rc == 0, "plan_stage");
+        }
+        return rc;
+    }
+    if (strcmp(stage, "prepare_cpu") == 0) {
+        return -2;
+    }
+    if (strcmp(stage, "prepare") == 0 || strcmp(stage, "prepare_gpu") == 0 ||
+        strcmp(stage, "materialize") == 0) {
+        // Route plan-level PREPARE through the paced transform worker instead
+        // of the lower-level async SOA reload queue.  The lower queue is still
+        // the correctness primitive, but it can accept many reloads at once;
+        // the transform worker gives the runtime a small in-flight window so
+        // conversion work does not flood the device while decode kernels are
+        // trying to make forward progress.
+        rc = opencl_sched_transform_request(name, LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT, nullptr);
+        if (s->profile_csv) {
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            opencl_profile_stage("PREPARE", name, idx, bytes, ms, rc == 0, "plan_stage");
         }
         return rc;
     }
@@ -3109,6 +3260,38 @@ static int opencl_sched_transform_request(const char *name, llama_weight_transfo
     }
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     const size_t bytes = bm ? bm->byte_size : 0;
+    static const bool s_async_xform_stage = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+        if (e && *e) return *e != '0';
+        e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_STAGE");
+        return e && *e && *e != '0';
+    }();
+    if (s_async_xform_stage) {
+        if (bm && bm->resident) return 0;
+        opencl_start_async_xform_worker(s);
+        {
+            std::lock_guard<std::mutex> lk(s->async_xform_mtx);
+            if (s->async_xform_inflight.find(idx) != s->async_xform_inflight.end()) return 0;
+            static const size_t s_max_pending = []() {
+                const char *e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_MAX_PENDING");
+                long long v = e && *e ? atoll(e) : 0;
+                return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(0);
+            }();
+            if (s_max_pending > 0 && s->async_xform_inflight.size() >= s_max_pending) {
+                return 0;
+            }
+            s->async_xform_inflight.insert(idx);
+            s->async_xform_queue.push_back(idx);
+            s->async_xform_enqueued++;
+            s->async_xform_max_pending_seen = std::max(s->async_xform_max_pending_seen,
+                                                       s->async_xform_inflight.size());
+        }
+        s->async_xform_cv.notify_all();
+        if (s->profile_csv) {
+            opencl_profile_stage("XFORM", name, idx, bytes, 0.0, 1, "plan_stage_async_submit");
+        }
+        return 0;
+    }
     const auto t0 = s->profile_csv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
@@ -3131,6 +3314,14 @@ static int64_t opencl_sched_budget_query(void * /*ud*/) {
     return (int64_t) elastic::budget_watcher_get(&s->bw);
 }
 
+static void opencl_sched_budget_reset(void * /*ud*/) {
+    auto *s = ggml_opencl_elastic();
+    if (!s->bw_inited) return;
+    elastic::budget_watcher_reset_clock(&s->bw);
+    GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher replay clock reset, B(t)=%zu MB\n",
+                  elastic::budget_watcher_get(&s->bw));
+}
+
 static void opencl_sched_register_once() {
     auto *s = ggml_opencl_elastic();
     if (s->sched_registered) return;
@@ -3142,6 +3333,7 @@ static void opencl_sched_register_once() {
     llama_weight_transform_register(opencl_sched_transform_request, nullptr);
     llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
     llama_budget_register          (opencl_sched_budget_query,    nullptr);
+    llama_budget_reset_register    (opencl_sched_budget_reset,    nullptr);
 }
 
 // 提取 tensor 名后缀用于 profile 聚合：blk.<N>.<X>.weight → X
@@ -3217,6 +3409,8 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbm_init 失败\n");
         return;
     }
+    s->wbm.victim_fn = opencl_plan_aware_victim;
+    s->wbm.victim_ud = s;
     // GGML_ELASTIC_EVICT_POLICY=mru|lru（默认 mru）。LLM decode 是 round-robin
     // 访问，cache < model 时 LRU 会 100% miss（每次 evict 的恰好是即将再用的），
     // MRU 反而能让命中率随 cache/model 比例线性提升。wbm.evict_mru 默认已 true，
@@ -3495,6 +3689,16 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                              (unsigned long long) st->octx.direct_read_ok,
                              (unsigned long long) st->octx.direct_read_fail,
                              ms, avg, mb, mbps);
+                const double async_ms = st->octx.async_load_direct_read_us / 1000.0;
+                const double async_mb = st->octx.async_load_direct_read_bytes / 1024.0 / 1024.0;
+                const double fg_ms = st->octx.foreground_direct_read_us / 1000.0;
+                const double fg_mb = st->octx.foreground_direct_read_bytes / 1024.0 / 1024.0;
+                std::fprintf(stderr,
+                             "direct read split: async_load calls=%llu total=%.2f ms MB=%.1f; foreground calls=%llu total=%.2f ms MB=%.1f\n",
+                             (unsigned long long) st->octx.async_load_direct_read_calls,
+                             async_ms, async_mb,
+                             (unsigned long long) st->octx.foreground_direct_read_calls,
+                             fg_ms, fg_mb);
             }
             {
                 const double create_ms = st->octx.parent_create_us / 1000.0;
@@ -3507,6 +3711,20 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                              (unsigned long long) st->octx.parent_pool_miss,
                              (unsigned long long) st->octx.parent_create_calls,
                              create_ms, create_mb);
+            }
+            {
+                std::lock_guard<std::mutex> lk(st->async_xform_mtx);
+                const double wait_ms = st->async_xform_wait_us / 1000.0;
+                const double avg_wait = st->async_xform_waits ? wait_ms / st->async_xform_waits : 0.0;
+                std::fprintf(stderr,
+                             "async xform worker enqueued=%llu completed=%llu inflight=%zu queue=%zu max_pending_seen=%zu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms\n",
+                             (unsigned long long) st->async_xform_enqueued,
+                             (unsigned long long) st->async_xform_completed,
+                             st->async_xform_inflight.size(),
+                             st->async_xform_queue.size(),
+                             st->async_xform_max_pending_seen,
+                             (unsigned long long) st->async_xform_waits,
+                             wait_ms, avg_wait);
             }
             elastic::wbmcl_dump_device_timing(&st->octx, stderr);
             elastic::wbmcl_dump_stage_detail(&st->octx, stderr);
@@ -3636,6 +3854,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             const elastic::block_meta *bm =
                 elastic::wbm_get(&est->wbm, src_wbm_idx);
             if (bm && !bm->resident) {
+                opencl_wait_async_xform(est, src_wbm_idx);
+                bm = elastic::wbm_get(&est->wbm, src_wbm_idx);
+            }
+            if (bm && !bm->resident) {
                 // 预先 evict：保证 reload 之后 resident_bytes <= target，避免
                 // "reload 一个 → resident 涨 → 下次周期 evict 之前违反预算" 的
                 // 短暂超额。spec §5 第 7 条要求每个 step 都满足合规。
@@ -3695,7 +3917,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                                        src_wbm_idx, src->name);
                         return false;
                     }
-                    rc = cit->second.reload_fn();
+                    rc = elastic::wbmcl_wait_soa_reload(&est->octx, src_wbm_idx);
+                    bm = elastic::wbm_get(&est->wbm, src_wbm_idx);
+                    if (rc == 0 && bm && bm->resident) {
+                        rc = 0;
+                    } else {
+                        rc = cit->second.reload_fn();
+                    }
                 } else {
                     rc = elastic::wbmcl_ensure_resident(&est->octx, src_wbm_idx);
                 }
@@ -3854,6 +4082,35 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                             }
                         }
                         est->n_evicts_total += released;
+                    }
+                }
+            }
+        }
+
+        // Async disk->host load lookahead: this is the runtime half of the
+        // overlapping pipeline. The CP schedule can still place explicit LOAD
+        // anchors, but this fallback keeps decode from doing a synchronous
+        // direct-read when a future SOA weight was missed by the schedule.
+        if (elastic_active && est->octx.async_stage_load) {
+            static const int s_async_load_lookahead = []() {
+                const char *e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD");
+                return e ? std::max(0, atoi(e)) : 0;
+            }();
+            if (s_async_load_lookahead > 0) {
+                const int max_j = std::min(i + 1 + s_async_load_lookahead, cgraph->n_nodes);
+                for (int j = i + 1; j < max_j; ++j) {
+                    ggml_tensor *nj = cgraph->nodes[j];
+                    if (!nj) continue;
+                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                        ggml_tensor *src = nj->src[k];
+                        if (!src) continue;
+                        const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
+                        if (se_wbm_idx < 0) continue;
+                        const elastic::block_meta *bm =
+                            elastic::wbm_get(&est->wbm, se_wbm_idx);
+                        if (!bm || bm->resident || bm->prefetch_event) continue;
+                        if (!bm->host_ptr || bm->byte_size == 0) continue;
+                        elastic::wbmcl_load_host_async(&est->octx, se_wbm_idx);
                     }
                 }
             }
@@ -4715,6 +4972,26 @@ static void ggml_opencl_elastic_register_soa(
         s->static_target_bytes += nbytes;
         s->extra_target_bytes  += nbytes;   // dynamic 路径用 (跟 static 平行累加)
     }
+    static const bool s_pin_unplanned_output = []() {
+        const char *e = std::getenv("GGML_ELASTIC_PIN_UNPLANNED_OUTPUT");
+        return !(e && *e == "0"[0]);
+    }();
+    static const bool s_unplanned_output_counts_budget = []() {
+        const char *e = std::getenv("GGML_ELASTIC_PIN_UNPLANNED_OUTPUT_COUNTS_BUDGET");
+        return e && *e && *e != '0';
+    }();
+    if (s_pin_unplanned_output && ggml_opencl_tensor_suffix(tensor->name) == "output") {
+        elastic::wbm_set_pinned(&s->wbm, idx, true);
+        if (!s_unplanned_output_counts_budget) {
+            s->static_target_bytes += nbytes;
+            s->extra_target_bytes  += nbytes;
+            GGML_LOG_INFO("ggml_opencl elastic: pin unplanned output (%zu MB) outside budget -> target=%zu MB\n",
+                          nbytes / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
+        } else {
+            GGML_LOG_INFO("ggml_opencl elastic: pin unplanned output (%zu MB) inside budget -> target=%zu MB\n",
+                          nbytes / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
+        }
+    }
 }
 
 // 公共 reload helper：pool 命中复用 parent / 否则 alloc。
@@ -4787,22 +5064,49 @@ static void ggml_opencl_elastic_evict_parent_pool_or_release(
     elastic::wbm_mark_evicted(octx->wbm, idx);
 }
 
-// 公共 staging buffer 复用：跨所有 SOA reload 共享一块，容量不够 2× growth。
+// SOA staging buffer pool：多个 slot 轮转，避免所有 reload 被一个 staging buffer 串行化。
 static cl_mem ggml_opencl_elastic_get_staging(
         elastic::wbm_opencl_ctx *octx, cl_context cl_ctx, size_t nbytes) {
-    if (octx->soa_staging_capacity >= nbytes) return octx->soa_staging;
-    if (octx->soa_staging) {
-        clReleaseMemObject(octx->soa_staging);
+    static const size_t s_slots = []() {
+        const char *e = std::getenv("GGML_ELASTIC_SOA_STAGING_SLOTS");
+        long v = e && *e ? std::atol(e) : 4;
+        if (v < 1) v = 1;
+        if (v > 16) v = 16;
+        return (size_t) v;
+    }();
+    if (octx->soa_staging_slots.size() != s_slots) {
+        octx->soa_staging_slots.assign(s_slots, nullptr);
+        octx->soa_staging_slot_capacity.assign(s_slots, 0);
+        octx->soa_staging_slot_last_use_ev.assign(s_slots, nullptr);
+        octx->soa_staging_next_slot = 0;
+        octx->soa_staging_current_slot = 0;
+    }
+    const size_t slot = octx->soa_staging_next_slot++ % s_slots;
+    octx->soa_staging_current_slot = slot;
+    if (octx->soa_staging_slot_capacity[slot] >= nbytes) {
+        return octx->soa_staging_slots[slot];
+    }
+    if (octx->soa_staging_slot_last_use_ev[slot]) {
+        clWaitForEvents(1, &octx->soa_staging_slot_last_use_ev[slot]);
+        clReleaseEvent(octx->soa_staging_slot_last_use_ev[slot]);
+        octx->soa_staging_slot_last_use_ev[slot] = nullptr;
+    }
+    if (octx->soa_staging_slots[slot]) {
+        clReleaseMemObject(octx->soa_staging_slots[slot]);
         octx->n_releases += 1;
     }
-    size_t new_cap = octx->soa_staging_capacity ? octx->soa_staging_capacity * 2 : nbytes;
+    size_t new_cap = octx->soa_staging_slot_capacity[slot] ? octx->soa_staging_slot_capacity[slot] * 2 : nbytes;
     while (new_cap < nbytes) new_cap *= 2;
     cl_int err = CL_SUCCESS;
-    octx->soa_staging = clCreateBuffer(cl_ctx, CL_MEM_READ_WRITE, new_cap, nullptr, &err);
-    if (err != CL_SUCCESS) { octx->soa_staging = nullptr; octx->soa_staging_capacity = 0; return nullptr; }
-    octx->soa_staging_capacity = new_cap;
+    octx->soa_staging_slots[slot] = clCreateBuffer(cl_ctx, CL_MEM_READ_WRITE, new_cap, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        octx->soa_staging_slots[slot] = nullptr;
+        octx->soa_staging_slot_capacity[slot] = 0;
+        return nullptr;
+    }
+    octx->soa_staging_slot_capacity[slot] = new_cap;
     octx->n_creates += 1;
-    return octx->soa_staging;
+    return octx->soa_staging_slots[slot];
 }
 
 // Q4_0 Adreno transpose helper：被 set_tensor 首装路径 & elastic reload 路径共用。
@@ -5109,7 +5413,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_context cap_ctx = context;
             cl_command_queue cap_q = queue;
 
-            auto evict_fn = [octx, cap_extra, nbytes]() -> int {
+            auto evict_fn = [octx, cap_extra, cap_q, nbytes]() -> int {
                 int idx = cap_extra->wbm_idx;
                 // SOA pool: parent + d + q 一起入池，不 reset extra (sub-buffer 还活着)
                 if (octx->retain_cl_mem && cap_extra->parent_buffer) {
@@ -5122,6 +5426,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             auto pit = octx->soa_pool_by_size.find(old_sz);
                             if (pit != octx->soa_pool_by_size.end() && !pit->second.empty()) {
                                 auto e = pit->second.back(); pit->second.pop_back();
+                                if (e.ready_event) {
+                                    cl_event ready = (cl_event) e.ready_event;
+                                    clWaitForEvents(1, &ready);
+                                    clReleaseEvent(ready);
+                                }
                                 if (e.q) clReleaseMemObject((cl_mem)e.q);
                                 if (e.d) clReleaseMemObject((cl_mem)e.d);
                                 if (e.parent) clReleaseMemObject((cl_mem)e.parent);
@@ -5143,6 +5452,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     e.parent = cap_extra->parent_buffer;
                     e.d      = cap_extra->d;
                     e.q      = cap_extra->q;
+                    static const bool s_defer_reuse = []() {
+                        const char *defer = std::getenv("GGML_ELASTIC_EVICT_DEFER_REUSE");
+                        return defer && *defer && *defer != '0';
+                    }();
+                    if (s_defer_reuse) {
+                        cl_event ready = nullptr;
+                        if (clEnqueueMarkerWithWaitList(cap_q, 0, nullptr, &ready) == CL_SUCCESS && ready) {
+                            e.ready_event = ready;
+                        }
+                    }
                     // double-evict 检测: 该 parent 已在 pool 里? (= bug: 它仍被某 resident
                     // tensor 使用却被当成可复用) → 跳过 push 避免 double-handout。
                     if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
@@ -5185,6 +5504,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 auto detail_record = [&](elastic::wbmcl_stage_detail_kind kind, uint64_t t0, size_t bytes) {
                     elastic::wbmcl_record_stage_detail(octx, kind, detail_now_us() - t0, bytes);
                 };
+                std::lock_guard<std::mutex> staging_guard(octx->soa_staging_mtx);
                 // 诊断: GGML_ELASTIC_POOL_SYNC=1 → reload 前 drain compute queue,
                 // 确保被复用 buffer 上任何 in-flight GPU op 已完成 (验证 use-after-evict race)。
                 static const bool s_pool_sync = []() {
@@ -5208,6 +5528,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (it != octx->soa_pool_by_size.end() && !it->second.empty()) {
                         octx->soa_pool_hit++;
                         auto e = it->second.back(); it->second.pop_back();
+                        if (e.ready_event) {
+                            cl_event ready = (cl_event) e.ready_event;
+                            clWaitForEvents(1, &ready);
+                            clReleaseEvent(ready);
+                        }
                         new_parent     = (cl_mem)e.parent;
                         s_soa_pooled_parents.erase((cl_mem)e.parent);   // 出池
                         // 默认只复用 parent, q/d sub-buffer 每次 reload 重建。
@@ -5265,16 +5590,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         clWaitForEvents(1, &fev); clReleaseEvent(fev);
                     }
                 }
-                detail_t0 = detail_now_us();
-                cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
-                detail_record(elastic::wbmcl_stage_detail_kind::STAGING_ALLOC, detail_t0, nbytes);
-                if (!staging) { return -2; }
-                // Async pipeline: staging write 走 xfer_queue (跟 compute_queue 并行)，
-                // 但 staging 被复用 —— 必须 wait 前一次 reload 的 convert kernel 完成。
-                // 用 octx->soa_staging_last_use_ev 串行 staging 访问。
                 cl_event write_ev = nullptr;
                 cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
-                cl_event prev_use_ev = octx->soa_staging_last_use_ev;
+                static const bool s_reload_on_xfer = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_RELOAD_ON_XFER");
+                    return e && *e && *e != '0';
+                }();
+                cl_command_queue kernel_q = s_reload_on_xfer ? xfer_q : cap_q;
                 // 默认用 O_DIRECT pread 从 disk 真读 host_ptr 对应的 file 区域,
                 // 然后 transfer 到 staging. 设置 GGML_ELASTIC_DIRECT_IO=0 才回退 mmap.
                 static const bool s_direct_io = []() {
@@ -5284,9 +5606,23 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 static thread_local std::vector<char> direct_scratch;
                 const void *src_for_dma = host_ptr;
                 detail_t0 = detail_now_us();
-                auto staged = octx->host_staging_by_idx.find(idx);
-                if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
-                    src_for_dma = staged->second.data();
+                {
+                    std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+                    auto staged = octx->host_staging_by_idx.find(idx);
+                    if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
+                        src_for_dma = staged->second.data();
+                    }
+                }
+                if (src_for_dma == host_ptr) {
+                    elastic::wbmcl_wait_host_load(octx, idx);
+                    std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+                    auto staged = octx->host_staging_by_idx.find(idx);
+                    if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
+                        src_for_dma = staged->second.data();
+                    }
+                }
+                if (src_for_dma != host_ptr) {
+                    // Host staging was produced by an earlier LOAD stage.
                 } else if (s_direct_io) {
                     auto reg = llama_mmap_registry_find(host_ptr);
                     if (!reg.filename.empty()) {
@@ -5301,7 +5637,25 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         if (rc == 0) {
                             octx->direct_read_ok++;
                             octx->direct_read_bytes += nbytes;
+                            octx->foreground_direct_read_calls++;
+                            octx->foreground_direct_read_us += (uint64_t) direct_dt;
+                            octx->foreground_direct_read_bytes += nbytes;
                             src_for_dma = direct_scratch.data();
+                            static const bool s_cache_foreground_load = []() {
+                                const char *e = std::getenv("GGML_ELASTIC_CACHE_FOREGROUND_LOAD");
+                                return !(e && *e == "0"[0]);
+                            }();
+                            if (octx->async_stage_load && s_cache_foreground_load) {
+                                {
+                                    std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+                                    auto &staged = octx->host_staging_by_idx[idx];
+                                    staged.assign(direct_scratch.data(), direct_scratch.data() + nbytes);
+                                }
+                                {
+                                    std::lock_guard<std::mutex> load_lock(octx->async_load_mtx);
+                                    octx->async_load_state[idx] = 2;
+                                }
+                            }
                         } else {
                             octx->direct_read_fail++;
                             std::fprintf(stderr, "[direct-io] pread_direct rc=%d, fallback mmap\n", rc);
@@ -5309,19 +5663,6 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     }
                 }
                 detail_record(elastic::wbmcl_stage_detail_kind::HOST_SRC, detail_t0, nbytes);
-                detail_t0 = detail_now_us();
-                err = clEnqueueWriteBuffer(xfer_q, staging, CL_FALSE,
-                                           0, nbytes, src_for_dma,
-                                           prev_use_ev ? 1 : 0,
-                                           prev_use_ev ? &prev_use_ev : nullptr,
-                                           &write_ev);
-                detail_record(elastic::wbmcl_stage_detail_kind::WRITE_ENQUEUE, detail_t0, nbytes);
-                if (err != CL_SUCCESS) { return -3; }
-                elastic::wbmcl_record_device_event(octx, write_ev,
-                                                   elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
-                                                   nbytes);
-                if (xfer_q != cap_q) clFlush(xfer_q);
-                if (prev_use_ev) clReleaseEvent(prev_use_ev);
 
                 if (!soa_hit) {
                     detail_t0 = detail_now_us();
@@ -5337,15 +5678,171 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     cap_extra->size_d = cap_size_d;
                     detail_record(elastic::wbmcl_stage_detail_kind::SUBBUFFER, detail_t0, nbytes);
                 }
+
+                // Experimental split prepare path:
+                // raw q4_0 AOS -> q/d SOA is done on CPU, then q/d are written
+                // directly to the already-created GPU sub-buffers. This skips
+                // the GPU convert kernel so the CPU part can overlap decode GPU
+                // compute; upload + transpose remain GPU-side and still need
+                // pacing.
+                static const bool s_cpu_pretransform_q4_0 = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_CPU_PRETRANSFORM_Q4_0");
+                    return e && *e && *e != '0';
+                }();
+                if (s_cpu_pretransform_q4_0) {
+                    static thread_local std::vector<unsigned char> cpu_q;
+                    static thread_local std::vector<unsigned char> cpu_d;
+#ifndef __ARM_NEON
+                    static const std::vector<uint16_t> q4_0_reorder_lut = []() {
+                        std::vector<uint16_t> lut(65536);
+                        for (uint32_t v = 0; v < 65536; ++v) {
+                            const unsigned char x0 = (unsigned char) (v & 0xffu);
+                            const unsigned char x1 = (unsigned char) ((v >> 8) & 0xffu);
+                            const unsigned char lo = (unsigned char) ((x0 & 0x0f) | ((x1 & 0x0f) << 4));
+                            const unsigned char hi = (unsigned char) (((x0 & 0xf0) >> 4) | (x1 & 0xf0));
+                            lut[v] = (uint16_t) lo | ((uint16_t) hi << 8);
+                        }
+                        return lut;
+                    }();
+#endif
+                    detail_t0 = detail_now_us();
+                    cpu_q.resize(cap_size_q);
+                    cpu_d.resize(cap_size_d);
+                    const unsigned char *src = static_cast<const unsigned char *>(src_for_dma);
+#ifndef __ARM_NEON
+                    const uint16_t *lut = q4_0_reorder_lut.data();
+#endif
+                    for (size_t bi = 0; bi < cap_n_blocks; ++bi) {
+                        const unsigned char *block = src + bi * 18;
+                        cpu_d[2 * bi + 0] = block[0];
+                        cpu_d[2 * bi + 1] = block[1];
+                        const unsigned char *qs = block + 2;
+                        unsigned char *q = cpu_q.data() + bi * 16;
+#ifdef __ARM_NEON
+                        const uint8x16_t x = vld1q_u8(qs);
+                        const uint8x16_t lo = vandq_u8(x, vdupq_n_u8(0x0f));
+                        const uint8x16_t hi = vandq_u8(x, vdupq_n_u8(0xf0));
+                        const uint8x16_t lo_even_16 = vuzp1q_u8(lo, lo);
+                        const uint8x16_t lo_odd_16  = vuzp2q_u8(lo, lo);
+                        const uint8x16_t hi_even_16 = vuzp1q_u8(hi, hi);
+                        const uint8x16_t hi_odd_16  = vuzp2q_u8(hi, hi);
+                        const uint8x8_t lo_even = vget_low_u8(lo_even_16);
+                        const uint8x8_t lo_odd  = vget_low_u8(lo_odd_16);
+                        const uint8x8_t hi_even = vget_low_u8(hi_even_16);
+                        const uint8x8_t hi_odd  = vget_low_u8(hi_odd_16);
+                        const uint8x8_t q_low  = vorr_u8(lo_even, vshl_n_u8(lo_odd, 4));
+                        const uint8x8_t q_high = vorr_u8(vshr_n_u8(hi_even, 4), hi_odd);
+                        vst1_u8(q,     q_low);
+                        vst1_u8(q + 8, q_high);
+#else
+                        for (int j = 0; j < 8; ++j) {
+                            const uint16_t packed = lut[(uint16_t) qs[2 * j + 0] | ((uint16_t) qs[2 * j + 1] << 8)];
+                            q[j]     = (unsigned char) (packed & 0xffu);
+                            q[j + 8] = (unsigned char) (packed >> 8);
+                        }
+#endif
+                    }
+                    detail_record(elastic::wbmcl_stage_detail_kind::CPU_XFORM, detail_t0, nbytes);
+
+                    cl_event write_events[2] = { nullptr, nullptr };
+                    detail_t0 = detail_now_us();
+                    err = clEnqueueWriteBuffer(xfer_q, cap_extra->q, CL_FALSE,
+                                               0, cap_size_q, cpu_q.data(),
+                                               0, nullptr, &write_events[0]);
+                    if (err == CL_SUCCESS) {
+                        err = clEnqueueWriteBuffer(xfer_q, cap_extra->d, CL_FALSE,
+                                                   0, cap_size_d, cpu_d.data(),
+                                                   0, nullptr, &write_events[1]);
+                    }
+                    detail_record(elastic::wbmcl_stage_detail_kind::WRITE_ENQUEUE, detail_t0, nbytes);
+                    if (err != CL_SUCCESS) {
+                        if (write_events[0]) clReleaseEvent(write_events[0]);
+                        if (write_events[1]) clReleaseEvent(write_events[1]);
+                        std::fprintf(stderr, "[soa-reload-q4_0] CPU pretransform q/d write failed idx=%d size=%zu err=%d\n",
+                                     idx, nbytes, err);
+                        return -8;
+                    }
+                    elastic::wbmcl_record_device_event(octx, write_events[0],
+                                                       elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
+                                                       cap_size_q);
+                    elastic::wbmcl_record_device_event(octx, write_events[1],
+                                                       elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
+                                                       cap_size_d);
+                    if (xfer_q != cap_q) clFlush(xfer_q);
+
+                    if (!s_reload_on_xfer) {
+                        detail_t0 = detail_now_us();
+                        cl_int berr = clEnqueueBarrierWithWaitList(cap_q, 2, write_events, nullptr);
+                        detail_record(elastic::wbmcl_stage_detail_kind::BARRIER_ENQUEUE, detail_t0, nbytes);
+                        if (berr != CL_SUCCESS) clWaitForEvents(2, write_events);
+                    }
+                    clReleaseEvent(write_events[0]);
+                    clReleaseEvent(write_events[1]);
+
+                    if (need_transpose) {
+                        detail_t0 = detail_now_us();
+                        int rc = ggml_opencl_run_q4_0_adreno_transpose(
+                            cap_backend_ctx, kernel_q, cap_extra, cap_M, cap_K, /*sync_each=*/false, octx);
+                        detail_record(elastic::wbmcl_stage_detail_kind::TRANSPOSE_ENQUEUE, detail_t0, nbytes);
+                        if (rc != 0) {
+                            std::fprintf(stderr, "[soa-reload-q4_0] CPU pretransform adreno transpose failed idx=%d rc=%d\n",
+                                         idx, rc);
+                            return -9;
+                        }
+                    }
+                    if (s_reload_on_xfer && kernel_q != cap_q) {
+                        clFlush(kernel_q);
+                        cl_event final_ev = nullptr;
+                        if (clEnqueueMarkerWithWaitList(kernel_q, 0, nullptr, &final_ev) == CL_SUCCESS && final_ev) {
+                            cl_event wait_ev = nullptr;
+                            detail_t0 = detail_now_us();
+                            clEnqueueBarrierWithWaitList(cap_q, 1, &final_ev, &wait_ev);
+                            detail_record(elastic::wbmcl_stage_detail_kind::FINAL_WAIT_ENQUEUE, detail_t0, nbytes);
+                            elastic::wbmcl_record_device_event(octx, wait_ev,
+                                                               elastic::wbmcl_device_event_kind::COMPUTE_WAIT,
+                                                               nbytes);
+                            if (wait_ev) clReleaseEvent(wait_ev);
+                            clReleaseEvent(final_ev);
+                        }
+                    }
+                    octx->bytes_uploaded_total += nbytes;
+                    detail_t0 = detail_now_us();
+                    elastic::wbm_mark_resident(octx->wbm, idx, static_cast<void*>(new_parent));
+                    detail_record(elastic::wbmcl_stage_detail_kind::MARK_RESIDENT, detail_t0, nbytes);
+                    return 0;
+                }
+
+                detail_t0 = detail_now_us();
+                cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
+                detail_record(elastic::wbmcl_stage_detail_kind::STAGING_ALLOC, detail_t0, nbytes);
+                if (!staging) { return -2; }
+                // Async pipeline: staging write 走 xfer_queue (跟 compute_queue 并行)，
+                // 但 staging 被复用 —— 必须 wait 前一次 reload 的 convert kernel 完成。
+                // 用 octx->soa_staging_last_use_ev 串行 staging 访问。
+                cl_event prev_use_ev = octx->soa_staging_slot_last_use_ev.empty() ? nullptr : octx->soa_staging_slot_last_use_ev[octx->soa_staging_current_slot];
+
+                detail_t0 = detail_now_us();
+                err = clEnqueueWriteBuffer(xfer_q, staging, CL_FALSE,
+                                           0, nbytes, src_for_dma,
+                                           prev_use_ev ? 1 : 0,
+                                           prev_use_ev ? &prev_use_ev : nullptr,
+                                           &write_ev);
+                detail_record(elastic::wbmcl_stage_detail_kind::WRITE_ENQUEUE, detail_t0, nbytes);
+                if (err != CL_SUCCESS) {
+                    std::fprintf(stderr, "[soa-reload-q4_0] clEnqueueWriteBuffer failed idx=%d size=%zu err=%d\n",
+                                 idx, nbytes, err);
+                    return -3;
+                }
+                elastic::wbmcl_record_device_event(octx, write_ev,
+                                                   elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
+                                                   nbytes);
+                if (xfer_q != cap_q) clFlush(xfer_q);
+                if (prev_use_ev) clReleaseEvent(prev_use_ev);
+
                 // GGML_ELASTIC_RELOAD_ON_XFER=1: convert + transpose 也跑在
                 // xfer_queue 上, 不挤占 compute_queue. 需要的 barrier 改成
                 // "compute_queue 等最终 reload event"。默认关闭: 真机
                 // reload_chain_ab 显示无独立 compute 可 overlap 时通常持平或略慢。
-                static const bool s_reload_on_xfer = []() {
-                    const char *e = std::getenv("GGML_ELASTIC_RELOAD_ON_XFER");
-                    return e && *e && *e != '0';
-                }();
-                cl_command_queue kernel_q = s_reload_on_xfer ? xfer_q : cap_q;
                 if (!s_reload_on_xfer) {
                     // 原路径: compute_queue 等 write_ev 完成才能开 convert kernel
                     detail_t0 = detail_now_us();
@@ -5367,7 +5864,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 elastic::wbmcl_record_device_event(octx, convert_ev,
                                                    elastic::wbmcl_device_event_kind::XFORM_CONVERT,
                                                    nbytes);
-                octx->soa_staging_last_use_ev = convert_ev;
+                octx->soa_staging_slot_last_use_ev[octx->soa_staging_current_slot] = convert_ev;
                 // Adreno path: 转置 q/d. 也跑在 kernel_q 上.
                 if (need_transpose) {
                     detail_t0 = detail_now_us();
@@ -5596,6 +6093,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 auto detail_record = [&](elastic::wbmcl_stage_detail_kind kind, uint64_t t0, size_t bytes) {
                     elastic::wbmcl_record_stage_detail(octx, kind, detail_now_us() - t0, bytes);
                 };
+                std::lock_guard<std::mutex> staging_guard(octx->soa_staging_mtx);
                 uint64_t detail_t0 = detail_now_us();
                 cl_mem new_parent = ggml_opencl_elastic_alloc_or_pool_parent(octx, cap_ctx, nbytes);
                 detail_record(elastic::wbmcl_stage_detail_kind::PARENT_ALLOC, detail_t0, nbytes);
@@ -5611,12 +6109,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 // Async pipeline (Q8_0 同 Q4_0): xfer_queue staging write + 串行事件链
                 cl_event write_ev = nullptr;
                 cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
-                cl_event prev_use_ev = octx->soa_staging_last_use_ev;
+                cl_event prev_use_ev = octx->soa_staging_slot_last_use_ev.empty() ? nullptr : octx->soa_staging_slot_last_use_ev[octx->soa_staging_current_slot];
                 const void *src_for_dma = host_ptr;
                 detail_t0 = detail_now_us();
-                auto staged = octx->host_staging_by_idx.find(idx);
-                if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
-                    src_for_dma = staged->second.data();
+                elastic::wbmcl_wait_host_load(octx, idx);
+                {
+                    std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+                    auto staged = octx->host_staging_by_idx.find(idx);
+                    if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
+                        src_for_dma = staged->second.data();
+                    }
                 }
                 detail_record(elastic::wbmcl_stage_detail_kind::HOST_SRC, detail_t0, nbytes);
                 detail_t0 = detail_now_us();
@@ -5626,7 +6128,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                                            prev_use_ev ? &prev_use_ev : nullptr,
                                            &write_ev);
                 detail_record(elastic::wbmcl_stage_detail_kind::WRITE_ENQUEUE, detail_t0, nbytes);
-                if (err != CL_SUCCESS) { clReleaseMemObject(new_parent); return -3; }
+                if (err != CL_SUCCESS) {
+                    std::fprintf(stderr, "[soa-reload-q8_0] clEnqueueWriteBuffer failed idx=%d size=%zu err=%d\n",
+                                 idx, nbytes, err);
+                    clReleaseMemObject(new_parent);
+                    return -3;
+                }
                 elastic::wbmcl_record_device_event(octx, write_ev,
                                                    elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
                                                    nbytes);
@@ -5671,7 +6178,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 elastic::wbmcl_record_device_event(octx, convert_ev,
                                                    elastic::wbmcl_device_event_kind::XFORM_CONVERT,
                                                    nbytes);
-                octx->soa_staging_last_use_ev = convert_ev;
+                octx->soa_staging_slot_last_use_ev[octx->soa_staging_current_slot] = convert_ev;
                 if (s_reload_on_xfer && kernel_q != cap_q) {
                     clFlush(kernel_q);
                     cl_event final_ev = nullptr;
@@ -5816,6 +6323,26 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         s->extra_target_bytes  += size;   // dynamic 路径用
                         GGML_LOG_INFO("ggml_opencl elastic: pin token_embd (%zu MB) outside budget → target=%zu MB\n",
                                       size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
+                    }
+                    static const bool s_pin_unplanned_output_nonsoa = []() {
+                        const char *e = std::getenv("GGML_ELASTIC_PIN_UNPLANNED_OUTPUT");
+                        return !(e && *e == "0"[0]);
+                    }();
+                    static const bool s_unplanned_output_counts_budget_nonsoa = []() {
+                        const char *e = std::getenv("GGML_ELASTIC_PIN_UNPLANNED_OUTPUT_COUNTS_BUDGET");
+                        return e && *e && *e != '0';
+                    }();
+                    if (s_pin_unplanned_output_nonsoa && suffix == "output") {
+                        elastic::wbm_set_pinned(&s->wbm, idx, true);
+                        if (!s_unplanned_output_counts_budget_nonsoa) {
+                            s->static_target_bytes += size;
+                            s->extra_target_bytes  += size;
+                            GGML_LOG_INFO("ggml_opencl elastic: pin unplanned output (%zu MB) outside budget -> target=%zu MB\n",
+                                          size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
+                        } else {
+                            GGML_LOG_INFO("ggml_opencl elastic: pin unplanned output (%zu MB) inside budget -> target=%zu MB\n",
+                                          size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
+                        }
                     }
                 }
             }
@@ -8946,6 +9473,29 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             &img_desc_1d,
             NULL,
             &status);
+        if (status != CL_SUCCESS) {
+            static const bool s_elastic_q4_debug = []() {
+                const char * e = std::getenv("GGML_ELASTIC_Q4_IMAGE_DEBUG");
+                return e && *e && *e != '0';
+            }();
+            if (s_elastic_q4_debug) {
+                std::fprintf(stderr,
+                             "[elastic-q4-image] clCreateImage failed status=%d tensor=%s q=%p d=%p parent=%p "
+                             "wbm_idx=%d size_q=%zu size_d=%zu M=%d K=%d N=%d width=%zu\n",
+                             (int) status,
+                             src0 && src0->name[0] ? src0->name : "(unnamed)",
+                             (void *) extra0_q4_0->q,
+                             (void *) extra0_q4_0->d,
+                             (void *) extra0_q4_0->parent_buffer,
+                             extra0_q4_0->wbm_idx,
+                             extra0_q4_0->size_q,
+                             extra0_q4_0->size_d,
+                             (int) M,
+                             (int) K,
+                             (int) N,
+                             (size_t) img_desc_1d.image_width);
+            }
+        }
         CL_CHECK(status);
         // <--------------------------------------------> //
 

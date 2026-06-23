@@ -293,6 +293,7 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         "eval_runs": "",
         "raw_ms_per_token": "",
         "decode_ms_per_token": "",
+        "exec_ms_per_token": "",
         "remote_wall_ms": 0.0,
         "remote_server_ms": 0.0,
         "provider_get_ms_total": 0.0,
@@ -344,15 +345,23 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         remote_server = max(remote_server, float(summary.group(2)))
     result["remote_wall_ms"] = remote_wall
     result["remote_server_ms"] = remote_server
-    # Keep decode_ms_per_token equal to llama's eval timer. Remote CP-SAT and
-    # provider overheads are reported separately; subtracting remote_wall_ms here
-    # can double-discount because parts of the provider path are outside the eval
-    # timer or overlap with timed execution.
-
     for m in re.finditer(r"provider_get_ms=([0-9.]+)\s+apply_ms=([0-9.]+)", text):
         result["provider_get_ms_total"] += float(m.group(1))
         result["apply_ms_total"] += float(m.group(2))
         result["apply_count"] += 1
+    if result["eval_ms_total"] != "" and result["eval_runs"]:
+        runs = int(result["eval_runs"])
+        if runs > 0:
+            # Execution-only metric requested for online CP-SAT experiments:
+            # exclude provider lookup / remote solve time, but keep apply_ms
+            # because plan application performs real residency changes.
+            exec_total = max(
+                0.0,
+                float(result["eval_ms_total"])
+                - float(result["provider_get_ms_total"])
+                + float(result["apply_ms_total"]),
+            )
+            result["exec_ms_per_token"] = exec_total / runs
 
     for m in re.finditer(r"apply_exec_plan:.*?evict=(\d+).*?load=(\d+).*?transfer=(\d+).*?xform=(\d+)", text):
         result["evict_planned"] += int(m.group(1))
@@ -456,10 +465,10 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         "",
         "## Results",
         "",
-        "`decode ms/token` is llama's eval timer. Remote solver/provider time is reported separately in `remote wall ms` and CSV provider columns.",
+        "`raw ms/token` is llama's eval timer. `exec ms/token` subtracts provider_get/query time but keeps plan apply/movement time.",
         "",
-        "| trace | method | status | raw ms/token | decode ms/token | thermal before/after C | remote wall ms | apply count | planned evict/load/xfer/xform | direct read ms | direct read calls | failures |",
-        "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|",
+        "| trace | method | status | raw ms/token | exec ms/token | thermal before/after C | remote wall ms | provider get ms | apply count | planned evict/load/xfer/prepare | direct read ms | direct read calls | failures |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|",
     ]
     for r in rows:
         planned = f"{r.get('evict_planned', 0)}/{r.get('load_planned', 0)}/{r.get('transfer_planned', 0)}/{r.get('xform_planned', 0)}"
@@ -481,8 +490,8 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         thermal = "n/a" if before == 0.0 and after == 0.0 else f"{before:.1f}/{after:.1f}"
         lines.append(
             f"| {r['trace']} | {r['method']} | {r['status']} | {fmt(r.get('raw_ms_per_token', ''))} | "
-            f"{fmt(r.get('decode_ms_per_token', ''))} | {thermal} | {fmt(r.get('remote_wall_ms', ''))} | "
-            f"{fmt(r.get('apply_count', ''))} | {planned} | {fmt(r.get('direct_read_ms', ''))} | "
+            f"{fmt(r.get('exec_ms_per_token', ''))} | {thermal} | {fmt(r.get('remote_wall_ms', ''))} | "
+            f"{fmt(r.get('provider_get_ms_total', ''))} | {fmt(r.get('apply_count', ''))} | {planned} | {fmt(r.get('direct_read_ms', ''))} | "
             f"{fmt(r.get('direct_read_calls', ''))} | {fmt(failures)} |"
         )
     path.write_text("\n".join(lines) + "\n")
@@ -494,6 +503,7 @@ def remote_shell_env(remote_dir: str, env: dict[str, str], argv: list[str]) -> s
 
 
 def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, remote_trace: str, work_dir: str) -> dict[str, str]:
+    effective_safety_mib = args.safety_mib + args.pinned_extra_mib
     common = {
         "LD_LIBRARY_PATH": args.remote_dir,
         "GGML_OPENCL_DISABLE_ALLOC_HOST_PTR": "1",
@@ -505,8 +515,11 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         "GGML_ELASTIC_BUDGET_BUCKET_MB": str(args.bucket_mib),
         "GGML_ELASTIC_KV_MB": str(args.kv_mib),
         "GGML_ELASTIC_MISC_MB": str(args.misc_mib),
+        "GGML_ELASTIC_SAFETY_MB": str(effective_safety_mib),
         "LLAMA_ELASTIC_DEFER_STAGE": "0",
     }
+    if args.pinned_extra_mib > 0:
+        common["GGML_ELASTIC_PIN_UNPLANNED_OUTPUT_COUNTS_BUDGET"] = "1"
     use_interval_schedule = (
         args.use_interval_schedule == "1"
         or (args.use_interval_schedule == "auto" and args.cp_objective == "interval_makespan")
@@ -514,14 +527,52 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
     if use_interval_schedule:
         common["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "1"
         common["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
-        if args.interval_stage_kinds:
+        if args.overlap_model == "none":
+            common["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = "none"
+            common["GGML_ELASTIC_ASYNC_STAGE_LOAD"] = "0"
+            common["GGML_ELASTIC_ASYNC_STAGE_PREPARE"] = "0"
+            common["GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD"] = "0"
+            common["GGML_ELASTIC_RELOAD_ON_XFER"] = "0"
+            common["GGML_ELASTIC_XFER_EXTRA"] = "0"
+        else:
+            common.setdefault("GGML_ELASTIC_ASYNC_STAGE_LOAD", "1")
+            common.setdefault("GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD", str(max(4, args.prefetch_distance)))
+            common.setdefault("GGML_ELASTIC_RELOAD_ON_XFER", "1")
+            common.setdefault("GGML_ELASTIC_XFER_EXTRA", "1")
+            common.setdefault("LLAMA_ELASTIC_PREPARE_LEAD_OPS", "16")
+            common.setdefault("GGML_ELASTIC_ASYNC_XFORM_MAX_PENDING", "128")
+        common.setdefault("GGML_ELASTIC_NO_AUTO_EVICT", "1")
+        common.setdefault("LLAMA_ELASTIC_ANCHOR_REPEAT_PER_GRAPH", "1")
+        common.setdefault("LLAMA_ELASTIC_EVICT_DISK_WEIGHTS_PER_GRAPH", "0")
+        common.setdefault("LLAMA_ELASTIC_INTERVAL_INCLUDE_TRANSITIONS", "0")
+        common.setdefault("GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM", "0")
+        common.setdefault("GGML_ELASTIC_CACHE_FOREGROUND_LOAD", "1")
+        common.setdefault("GGML_ELASTIC_SOA_STAGING_SLOTS", "4")
+        common.setdefault("GGML_ELASTIC_CL_RETAIN", "1")
+        common.setdefault("GGML_ELASTIC_CL_RETAIN_MB", "1024")
+        if args.interval_stage_kinds and args.overlap_model != "none":
             common["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = str(args.interval_stage_kinds)
+            stage_kinds = {s.strip().lower() for s in str(args.interval_stage_kinds).split(",") if s.strip()}
+            if "prepare" in stage_kinds or "all" in stage_kinds:
+                common.setdefault("GGML_ELASTIC_ASYNC_STAGE_PREPARE", "1")
+                common.setdefault("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE", "1")
     if method in {"offline", "online", "mru"}:
         common["GGML_ELASTIC_DYNAMIC"] = "1"
     if method == "offline":
         common["LLAMA_ELASTIC_DIR"] = args.phone_plan_dir
     elif method == "static-min":
-        common["LLAMA_ELASTIC_APPLY"] = f"{args.phone_plan_dir}/plan_{trace.min_bucket_mib}MiB.json"
+        common.update(
+            {
+                "LLAMA_ELASTIC_APPLY": f"{args.phone_plan_dir}/plan_{trace.min_bucket_mib}MiB.json",
+                "LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE": "0",
+                "LLAMA_ELASTIC_DEFER_STAGE": "0",
+                "GGML_ELASTIC_ASYNC_STAGE_LOAD": "0",
+                "GGML_ELASTIC_ASYNC_STAGE_PREPARE": "0",
+                "GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD": "0",
+                "GGML_ELASTIC_RELOAD_ON_XFER": "0",
+                "GGML_ELASTIC_XFER_EXTRA": "0",
+            }
+        )
     elif method == "online":
         common.update(
             {
@@ -533,11 +584,12 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE_WORK_DIR": work_dir,
                 "LLAMA_ELASTIC_ONLINE_KV_MB": str(args.kv_mib),
                 "LLAMA_ELASTIC_ONLINE_MISC_MB": str(args.misc_mib),
-                "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(args.safety_mib),
+                "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(effective_safety_mib),
                 "LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS": str(args.time_limit_ms),
                 "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
                 "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
                 "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
+                "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
                 "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
                 "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
                 "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
@@ -547,13 +599,29 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         common.update(
             {
                 "LLAMA_ELASTIC_ONLINE": "1",
-                "LLAMA_ELASTIC_ONLINE_MODE": "mru",
+                "LLAMA_ELASTIC_ONLINE_MODE": "mru-cache",
+                "LLAMA_ELASTIC_RUNTIME_MRU_CACHE": "1",
+                "LLAMA_ELASTIC_MRU_EVICT_IMMEDIATE": "1",
+                "LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE": "0",
+                "LLAMA_ELASTIC_DEFER_STAGE": "0",
+                "GGML_ELASTIC_ASYNC_STAGE_LOAD": "0",
+                "GGML_ELASTIC_ASYNC_STAGE_PREPARE": "0",
+                "GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD": "0",
+                "GGML_ELASTIC_RELOAD_ON_XFER": "0",
+                "GGML_ELASTIC_XFER_EXTRA": "0",
                 "LLAMA_ELASTIC_MODEL_META": args.phone_model_meta,
                 "LLAMA_ELASTIC_COST_DIR": args.phone_cost_dir,
                 "LLAMA_ELASTIC_ONLINE_WORK_DIR": work_dir,
                 "LLAMA_ELASTIC_ONLINE_KV_MB": str(args.kv_mib),
                 "LLAMA_ELASTIC_ONLINE_MISC_MB": str(args.misc_mib),
-                "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(args.safety_mib),
+                "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(effective_safety_mib),
+                "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
+                "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
+                "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
+                "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
+                "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
+                "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
+                "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": "cpu,disk_cpu",
             }
         )
     else:
@@ -590,7 +658,7 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
         "--misc-mib",
         str(args.misc_mib),
         "--safety-mib",
-        str(args.safety_mib),
+        str(args.effective_safety_mib),
         "--time-limit-ms",
         str(args.time_limit_ms),
         "--prefetch-distance",
@@ -599,6 +667,8 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
         str(args.transition_weight),
         "--disk-reload-multiplier",
         str(args.disk_reload_multiplier),
+        "--disk-gpu-reload-multiplier",
+        str(args.disk_gpu_reload_multiplier),
         "--overlap-model",
         str(args.overlap_model),
         "--cp-objective",
@@ -611,6 +681,11 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
     time.sleep(1.0)
     adb(args.adb_serial, ["reverse", f"tcp:{args.port}", f"tcp:{args.port}"], check=False, timeout=args.adb_timeout_s)
     return proc
+
+
+def methods_need_offline_table(methods: str) -> bool:
+    selected = {m.strip() for m in methods.split(",") if m.strip()}
+    return bool(selected & {"offline", "static-min"})
 
 
 def stop_remote_server(args: argparse.Namespace, proc: subprocess.Popen[str] | None) -> None:
@@ -652,20 +727,25 @@ def main() -> None:
     ap.add_argument("--kv-mib", type=int, default=512)
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
+    ap.add_argument("--pinned-extra-mib", type=int, default=410,
+                    help="extra pinned non-planned model bytes counted inside the budget, e.g. output.weight for Llama-3 8B Q4_0")
     ap.add_argument("--time-limit-ms", type=int, default=250)
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--transition-weight", type=float, default=0.1)
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu",
                     help="comma-separated solver placement choices")
     ap.add_argument("--use-interval-schedule", choices=("auto", "0", "1"), default="auto",
                     help="whether runtime uses schedule.events anchors; auto enables it for interval_makespan")
-    ap.add_argument("--interval-stage-kinds", default="load",
-                    help="comma-separated interval stages to trigger at runtime, e.g. load or load,transfer")
+    ap.add_argument("--interval-stage-kinds", default="load,prepare",
+                    help="comma-separated interval stages to trigger at runtime, e.g. load or load,prepare")
     ap.add_argument("--extra-env", action="append", default=[],
                     help="additional Android env var as KEY=VALUE; may be repeated")
+    ap.add_argument("--llama-extra-arg", action="append", default=[],
+                    help="extra llama-cli argument appended verbatim; repeat for option/value pairs")
     ap.add_argument("--n-pred", type=int, default=96, help="used only when --bench-seconds 0 disables timed mode")
     ap.add_argument("--ctx-size", type=int, default=4096)
     ap.add_argument("--batch", type=int, default=32)
@@ -703,6 +783,7 @@ def main() -> None:
         args.libcxx_path = default_libcxx_path()
     if args.bench_seconds is None:
         args.bench_seconds = args.window_sec / args.replay_speedup
+    args.effective_safety_mib = args.safety_mib + args.pinned_extra_mib
 
     source_name_re = re.compile(r"^trace_\d+_user_\d+\.csv$")
     sources = sorted((ROOT / p).resolve() for p in Path(ROOT).glob(args.trace_glob))
@@ -725,7 +806,8 @@ def main() -> None:
     ]
     budgets = build_budget_list(traces, args.bucket_mib, args.extra_max_budget_mib)
 
-    if not args.skip_build_table:
+    need_offline_table = methods_need_offline_table(args.methods)
+    if not args.skip_build_table and need_offline_table:
         cmd = [
             sys.executable,
             str(PLAN_DIR / "build_offline_budget_table.py"),
@@ -742,7 +824,7 @@ def main() -> None:
             "--misc-mib",
             str(args.misc_mib),
             "--safety-mib",
-            str(args.safety_mib),
+            str(args.effective_safety_mib),
             "--time-limit-ms",
             str(args.time_limit_ms),
             "--prefetch-distance",
@@ -751,6 +833,8 @@ def main() -> None:
             str(args.transition_weight),
             "--disk-reload-multiplier",
             str(args.disk_reload_multiplier),
+            "--disk-gpu-reload-multiplier",
+            str(args.disk_gpu_reload_multiplier),
             "--overlap-model",
             str(args.overlap_model),
             "--cp-objective",
@@ -764,6 +848,8 @@ def main() -> None:
             run(cmd)
         else:
             print("+ " + " ".join(shlex.quote(c) for c in cmd))
+    elif not need_offline_table:
+        print("skip offline table build: selected methods do not require it", flush=True)
 
     if not args.skip_push and not args.dry_run:
         adb(args.adb_serial, ["devices"], timeout=args.adb_timeout_s)
@@ -793,13 +879,14 @@ def main() -> None:
             retries=args.adb_retries,
         )
         adb(args.adb_serial, ["push", str(args.cost_dir) + "/.", args.phone_cost_dir + "/"])
-        adb_shell_retry(
-            args.adb_serial,
-            f"rm -rf {shell_quote(args.phone_plan_dir)} && mkdir -p {shell_quote(args.phone_plan_dir)}",
-            timeout=args.adb_timeout_s,
-            retries=args.adb_retries,
-        )
-        adb(args.adb_serial, ["push", str(table_dir) + "/.", args.phone_plan_dir + "/"])
+        if need_offline_table:
+            adb_shell_retry(
+                args.adb_serial,
+                f"rm -rf {shell_quote(args.phone_plan_dir)} && mkdir -p {shell_quote(args.phone_plan_dir)}",
+                timeout=args.adb_timeout_s,
+                retries=args.adb_retries,
+            )
+            adb(args.adb_serial, ["push", str(table_dir) + "/.", args.phone_plan_dir + "/"])
         for t in traces:
             adb(args.adb_serial, ["push", str(t.local), f"{args.remote_dir}/{t.remote_name}"])
 
@@ -851,6 +938,7 @@ def main() -> None:
                     "on",
                     "-no-cnv",
                 ]
+                argv.extend(args.llama_extra_arg)
                 if timed_mode:
                     env["LLAMA_ELASTIC_BENCH_SECONDS"] = f"{args.bench_seconds:.3f}".rstrip("0").rstrip(".")
                 if timed_mode:

@@ -117,7 +117,7 @@ EvKind evkind_from_string(const std::string & s) {
     if (s == "load")  return EvKind::LOAD;
     if (s == "evict") return EvKind::EVICT;
     if (s == "transfer" || s == "dma") return EvKind::TRANSFER;
-    if (s == "xform") return EvKind::XFORM;
+    if (s == "xform" || s == "prepare" || s == "materialize") return EvKind::XFORM;
     return EvKind::PREFETCH;
 }
 
@@ -272,7 +272,8 @@ bool plan_from_json_string(const std::string & s, ExecPlan & out, std::string * 
             const auto & js = j["schedule"];
             out.schedule_kind         = js.value("kind", std::string());
             out.schedule_status       = js.value("status", std::string());
-            out.schedule_objective_ms = js.value("objective_ms", 0.0);
+            out.schedule_objective_ms = (js.contains("objective_ms") and not js["objective_ms"].is_null())
+                                      ? js["objective_ms"].get<double>() : 0.0;
             for (const auto & je : js.value("events", json::array())) {
                 ScheduleEvent e;
                 e.weight_id   = je.value("weight_id", -1);

@@ -41,6 +41,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <chrono>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -106,6 +107,25 @@ struct elastic_state {
     std::unordered_map<int, void *>         backend_handle_by_idx;
     std::unordered_map<int, std::vector<uint8_t>> staged_raw_by_idx;
     bool                                    sched_registered = false;
+
+    // CPU stage pipeline state.  State values: 1=in-flight, 2=ok, <0=error.
+    bool                                    async_load_worker_started = false;
+    std::condition_variable                 async_load_cv;
+    std::deque<int>                         async_load_queue;
+    std::unordered_map<int, int>            async_load_state;
+    uint64_t                                async_load_enqueued = 0;
+    uint64_t                                async_load_completed = 0;
+    uint64_t                                async_load_waits = 0;
+    uint64_t                                async_load_wait_us = 0;
+
+    bool                                    async_prepare_worker_started = false;
+    std::condition_variable                 async_prepare_cv;
+    std::deque<int>                         async_prepare_queue;
+    std::unordered_map<int, int>            async_prepare_state;
+    uint64_t                                async_prepare_enqueued = 0;
+    uint64_t                                async_prepare_completed = 0;
+    uint64_t                                async_prepare_waits = 0;
+    uint64_t                                async_prepare_wait_us = 0;
 };
 
 elastic_state * get_state() {
@@ -195,6 +215,86 @@ int read_block_direct_or_mmap(elastic_state *s, const elastic::block_meta *bm, v
     return 0;
 }
 
+static bool cpu_async_stage_load_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_LOAD");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+static bool cpu_async_stage_prepare_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+static size_t cpu_async_prepare_max_pending() {
+    static const size_t max_pending = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_PREPARE_MAX_PENDING");
+        long long v = e && *e ? atoll(e) : 0;
+        if (v < 0) v = 0;
+        return static_cast<size_t>(v);
+    }();
+    return max_pending;
+}
+
+static uint64_t cpu_now_us() {
+    using clock = std::chrono::steady_clock;
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now().time_since_epoch()).count();
+}
+
+static void * cpu_fixed_handle_for_idx(elastic_state *s, int idx) {
+    if (!s) return nullptr;
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto hit = s->backend_handle_by_idx.find(idx);
+    return hit == s->backend_handle_by_idx.end() ? nullptr : hit->second;
+}
+
+static std::string cpu_name_for_idx_copy(elastic_state *s, int idx) {
+    if (!s) return {};
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto it = s->wbm_to_name.find(idx);
+    return it == s->wbm_to_name.end() ? std::string{} : it->second;
+}
+
+static int elastic_cpu_stage_load_sync(elastic_state *s, const char *name, int idx) {
+    if (!s || !name) return -1;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -3;
+    if (bm->resident) return 0;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        if (s->staged_raw_by_idx.find(idx) != s->staged_raw_by_idx.end()) return 0;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    s->stage_load_calls++;
+    std::vector<uint8_t> staging(bm->byte_size);
+    int rc = read_block_direct_or_mmap(s, bm, staging.data());
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    s->stage_load_us += (uint64_t) dt;
+    if (rc != 0) {
+        if (s->profile_csv) {
+            cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 0, "plan_stage");
+        }
+        return rc;
+    }
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        s->staged_raw_by_idx[idx] = std::move(staging);
+    }
+    s->stage_load_ok++;
+    s->stage_load_bytes += bm->byte_size;
+    if (s->profile_csv) {
+        cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
+    }
+    return 0;
+}
+
 int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
     if (!name) return -1;
     auto *s = get_state();
@@ -213,6 +313,7 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     if (!bm) return -3;
     if (evict) {
+        if (llama_weight_runtime_desired_query(name) == LLAMA_WEIGHT_RUNTIME_CPU) return 0;
         if (!bm->resident) return 0;
         if (!bctx)         return -4;
         evict_blocks(s, bctx, {idx});
@@ -229,6 +330,195 @@ int elastic_sched_movement_request(const char *name, bool evict, void * /*ud*/) 
     return 0;
 }
 
+static int elastic_cpu_prepare_resident(elastic_state *s, const char *name, int idx, void *fixed_handle) {
+    if (!s || !name) return -1;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -3;
+    if (bm->resident) return 0;
+    void *target = bm->backend_handle ? bm->backend_handle : fixed_handle;
+    if (!target) return -4;
+
+    s->stage_xform_calls++;
+    auto t0 = std::chrono::steady_clock::now();
+    bool copied = false;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->staged_raw_by_idx.find(idx);
+        if (it != s->staged_raw_by_idx.end()) {
+            if (it->second.size() != bm->byte_size) return -5;
+            // CPU_Elastic computes with the generic CPU layout. PREPARE is the
+            // explicit raw-staging -> CPU-resident materialization stage.
+            std::memcpy(target, it->second.data(), bm->byte_size);
+            s->staged_raw_by_idx.erase(it);
+            copied = true;
+        }
+    }
+    if (!copied) {
+        int rc = read_block_direct_or_mmap(s, bm, target);
+        if (rc != 0) return rc;
+    }
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    s->stage_xform_us += (uint64_t) dt;
+    s->stage_xform_ok++;
+    s->stage_xform_bytes += bm->byte_size;
+    s->n_reloads_total += 1;
+    s->bytes_reloaded_total += bm->byte_size;
+    elastic::wbm_mark_resident(&s->wbm, idx, target);
+    llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_CPU);
+    if (s->profile_csv) {
+        cpu_profile_record("PREPARE", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
+    }
+    return 0;
+}
+
+static void cpu_start_async_load_worker(elastic_state *s) {
+    if (!s) return;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        if (s->async_load_worker_started) return;
+        s->async_load_worker_started = true;
+    }
+    std::thread([s]() {
+        for (;;) {
+            int idx = -1;
+            {
+                std::unique_lock<std::mutex> lk(s->sched_mtx);
+                s->async_load_cv.wait(lk, [s]() { return !s->async_load_queue.empty(); });
+                idx = s->async_load_queue.front();
+                s->async_load_queue.pop_front();
+            }
+            const std::string name = cpu_name_for_idx_copy(s, idx);
+            const int rc = elastic_cpu_stage_load_sync(s, name.c_str(), idx);
+            {
+                std::lock_guard<std::mutex> lk(s->sched_mtx);
+                s->async_load_state[idx] = rc == 0 ? 2 : rc;
+                s->async_load_completed++;
+            }
+            s->async_load_cv.notify_all();
+        }
+    }).detach();
+}
+
+static int cpu_enqueue_async_load(elastic_state *s, int idx) {
+    if (!s || idx < 0) return -1;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -2;
+    if (bm->resident) return 0;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        if (s->staged_raw_by_idx.find(idx) != s->staged_raw_by_idx.end()) return 0;
+        auto it = s->async_load_state.find(idx);
+        if (it != s->async_load_state.end() && it->second == 1) return 0;
+        s->async_load_state[idx] = 1;
+        s->async_load_queue.push_back(idx);
+        s->async_load_enqueued++;
+    }
+    cpu_start_async_load_worker(s);
+    s->async_load_cv.notify_one();
+    return 0;
+}
+
+static int cpu_wait_async_load(elastic_state *s, int idx) {
+    if (!s || idx < 0) return -1;
+    const uint64_t t0 = cpu_now_us();
+    int state = 0;
+    {
+        std::unique_lock<std::mutex> lk(s->sched_mtx);
+        auto it = s->async_load_state.find(idx);
+        if (it == s->async_load_state.end()) return 0;
+        if (it->second == 1) {
+            s->async_load_waits++;
+            s->async_load_cv.wait(lk, [s, idx]() {
+                auto cur = s->async_load_state.find(idx);
+                return cur == s->async_load_state.end() || cur->second != 1;
+            });
+        }
+        auto done = s->async_load_state.find(idx);
+        state = done == s->async_load_state.end() ? 0 : done->second;
+    }
+    s->async_load_wait_us += cpu_now_us() - t0;
+    return state >= 0 ? 0 : state;
+}
+
+static void cpu_start_async_prepare_worker(elastic_state *s) {
+    if (!s) return;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        if (s->async_prepare_worker_started) return;
+        s->async_prepare_worker_started = true;
+    }
+    std::thread([s]() {
+        for (;;) {
+            int idx = -1;
+            {
+                std::unique_lock<std::mutex> lk(s->sched_mtx);
+                s->async_prepare_cv.wait(lk, [s]() { return !s->async_prepare_queue.empty(); });
+                idx = s->async_prepare_queue.front();
+                s->async_prepare_queue.pop_front();
+            }
+            cpu_wait_async_load(s, idx);
+            const std::string name = cpu_name_for_idx_copy(s, idx);
+            void *fixed_handle = cpu_fixed_handle_for_idx(s, idx);
+            const int rc = elastic_cpu_prepare_resident(s, name.c_str(), idx, fixed_handle);
+            {
+                std::lock_guard<std::mutex> lk(s->sched_mtx);
+                s->async_prepare_state[idx] = rc == 0 ? 2 : rc;
+                s->async_prepare_completed++;
+            }
+            s->async_prepare_cv.notify_all();
+        }
+    }).detach();
+}
+
+static int cpu_enqueue_async_prepare(elastic_state *s, int idx) {
+    if (!s || idx < 0) return -1;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm) return -2;
+    if (bm->resident) return 0;
+    {
+        std::lock_guard<std::mutex> lk(s->sched_mtx);
+        auto it = s->async_prepare_state.find(idx);
+        if (it != s->async_prepare_state.end() && it->second == 1) return 0;
+        const size_t max_pending = cpu_async_prepare_max_pending();
+        if (max_pending > 0) {
+            size_t pending = 0;
+            for (const auto & kv : s->async_prepare_state) {
+                if (kv.second == 1) pending++;
+            }
+            if (pending >= max_pending) return 0;
+        }
+        s->async_prepare_state[idx] = 1;
+        s->async_prepare_queue.push_back(idx);
+        s->async_prepare_enqueued++;
+    }
+    cpu_start_async_prepare_worker(s);
+    s->async_prepare_cv.notify_one();
+    return 0;
+}
+
+static int cpu_wait_async_prepare(elastic_state *s, int idx) {
+    if (!s || idx < 0) return -1;
+    const uint64_t t0 = cpu_now_us();
+    int state = 0;
+    {
+        std::unique_lock<std::mutex> lk(s->sched_mtx);
+        auto it = s->async_prepare_state.find(idx);
+        if (it == s->async_prepare_state.end()) return 0;
+        if (it->second == 1) {
+            s->async_prepare_waits++;
+            s->async_prepare_cv.wait(lk, [s, idx]() {
+                auto cur = s->async_prepare_state.find(idx);
+                return cur == s->async_prepare_state.end() || cur->second != 1;
+            });
+        }
+        auto done = s->async_prepare_state.find(idx);
+        state = done == s->async_prepare_state.end() ? 0 : done->second;
+    }
+    s->async_prepare_wait_us += cpu_now_us() - t0;
+    return state >= 0 ? 0 : state;
+}
+
 int elastic_sched_stage_request(const char *name, const char *stage, void * /*ud*/) {
     if (!name || !stage) return -1;
     auto *s = get_state();
@@ -242,35 +532,29 @@ int elastic_sched_stage_request(const char *name, const char *stage, void * /*ud
         return -2;
     }
     if (std::strcmp(stage, "load") == 0 || std::strcmp(stage, "load_cpu") == 0) {
-        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-        if (!bm) return -3;
-        if (bm->resident) return 0;
-        auto t0 = std::chrono::steady_clock::now();
-        s->stage_load_calls++;
-        std::vector<uint8_t> staging(bm->byte_size);
-        int rc = read_block_direct_or_mmap(s, bm, staging.data());
-        auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-        s->stage_load_us += (uint64_t) dt;
-        if (rc != 0) {
-            if (s->profile_csv) {
-                cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 0, "plan_stage");
-            }
-            return rc;
+        if (cpu_async_stage_load_enabled()) {
+            return cpu_enqueue_async_load(s, idx);
         }
-        {
-            std::lock_guard<std::mutex> lk(s->sched_mtx);
-            s->staged_raw_by_idx[idx] = std::move(staging);
-        }
-        s->stage_load_ok++;
-        s->stage_load_bytes += bm->byte_size;
-        if (s->profile_csv) {
-            cpu_profile_record("LOAD", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
-        }
-        return 0;
+        return elastic_cpu_stage_load_sync(s, name, idx);
     }
     if (std::strcmp(stage, "transfer") == 0 || std::strcmp(stage, "dma") == 0) {
         return 0;
+    }
+    if (std::strcmp(stage, "prepare_gpu") == 0) {
+        return -2;
+    }
+    if (std::strcmp(stage, "prepare") == 0 || std::strcmp(stage, "prepare_cpu") == 0 ||
+        std::strcmp(stage, "materialize") == 0) {
+        if (cpu_async_stage_prepare_enabled()) {
+            return cpu_enqueue_async_prepare(s, idx);
+        }
+        void *fixed_handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(s->sched_mtx);
+            auto hit = s->backend_handle_by_idx.find(idx);
+            if (hit != s->backend_handle_by_idx.end()) fixed_handle = hit->second;
+        }
+        return elastic_cpu_prepare_resident(s, name, idx, fixed_handle);
     }
     return -3;
 }
@@ -288,44 +572,7 @@ int elastic_sched_transform_request(const char *name, llama_weight_transform_kin
         auto hit = s->backend_handle_by_idx.find(idx);
         if (hit != s->backend_handle_by_idx.end()) fixed_handle = hit->second;
     }
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-    if (!bm) return -3;
-    if (bm->resident) return 0;
-    void *target = bm->backend_handle ? bm->backend_handle : fixed_handle;
-    if (!target) return -4;
-
-    s->stage_xform_calls++;
-    auto t0 = std::chrono::steady_clock::now();
-    bool copied = false;
-    {
-        std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->staged_raw_by_idx.find(idx);
-        if (it != s->staged_raw_by_idx.end()) {
-            if (it->second.size() != bm->byte_size) return -5;
-            // CPU_Elastic currently computes with the generic CPU layout. Make the
-            // transform stage explicit as raw-staging -> CPU resident layout; real
-            // CPU_REPACK buffer types are intentionally not enabled for this backend.
-            std::memcpy(target, it->second.data(), bm->byte_size);
-            s->staged_raw_by_idx.erase(it);
-            copied = true;
-        }
-    }
-    if (!copied) {
-        read_block_direct_or_mmap(s, bm, target);
-    }
-    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-    s->stage_xform_us += (uint64_t) dt;
-    s->stage_xform_ok++;
-    s->stage_xform_bytes += bm->byte_size;
-    s->n_reloads_total += 1;
-    s->bytes_reloaded_total += bm->byte_size;
-    elastic::wbm_mark_resident(&s->wbm, idx, target);
-    llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_CPU);
-    if (s->profile_csv) {
-        cpu_profile_record("XFORM", name, idx, bm->byte_size, dt / 1000.0, 1, "plan_stage");
-    }
-    return 0;
+    return elastic_cpu_prepare_resident(s, name, idx, fixed_handle);
 }
 
 void * elastic_sched_host_ptr_query(const char *name, void * /*ud*/) {
@@ -349,6 +596,14 @@ int64_t elastic_sched_budget_query(void * /*ud*/) {
     return (int64_t) elastic::budget_watcher_get(&s->bw);
 }
 
+void elastic_sched_budget_reset(void * /*ud*/) {
+    auto *s = get_state();
+    if (!s->bw_inited) return;
+    elastic::budget_watcher_reset_clock(&s->bw);
+    GGML_LOG_INFO("elastic: BudgetWatcher replay clock reset, B(t)=%zu MB\n",
+                  elastic::budget_watcher_get(&s->bw));
+}
+
 void elastic_sched_register_once() {
     auto *s = get_state();
     if (s->sched_registered) return;
@@ -360,6 +615,7 @@ void elastic_sched_register_once() {
     llama_weight_transform_register(elastic_sched_transform_request, nullptr);
     llama_weight_host_ptr_register (elastic_sched_host_ptr_query, nullptr);
     llama_budget_register          (elastic_sched_budget_query,    nullptr);
+    llama_budget_reset_register    (elastic_sched_budget_reset,    nullptr);
 }
 
 // pinned 策略 / EMBED_OUTSIDE_BUDGET
@@ -496,6 +752,25 @@ void ensure_block_resident(elastic_state *s, int wbm_idx, void *backend_handle) 
         cpu_profile_record("RELOAD_ENSURE", name_for_idx(s, wbm_idx), wbm_idx,
                            bm->byte_size, dt / 1000.0, 1, "decode_ensure");
     }
+}
+
+static void ensure_block_resident_pipeline(elastic_state *s, int wbm_idx, void *backend_handle) {
+    if (!s || wbm_idx < 0) return;
+    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, wbm_idx);
+    if (!bm || bm->resident) return;
+
+    cpu_wait_async_prepare(s, wbm_idx);
+    bm = elastic::wbm_get(&s->wbm, wbm_idx);
+    if (!bm || bm->resident) return;
+
+    cpu_wait_async_load(s, wbm_idx);
+    bm = elastic::wbm_get(&s->wbm, wbm_idx);
+    if (!bm || bm->resident) return;
+
+    const char *name = name_for_idx(s, wbm_idx);
+    int rc = elastic_cpu_prepare_resident(s, name, wbm_idx, backend_handle);
+    if (rc == 0) return;
+    ensure_block_resident(s, wbm_idx, backend_handle);
 }
 
 // evict 列表：madvise DONTNEED + mark_evicted
@@ -652,6 +927,8 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     "  direct_read  : calls=%llu ok=%llu fail=%llu total=%.2f ms MB=%.1f MB/s=%.1f\n"
                     "  stage_load   : calls=%llu ok=%llu total=%.2f ms MB=%.1f\n"
                     "  stage_xform  : calls=%llu ok=%llu total=%.2f ms MB=%.1f\n"
+                    "  async_load   : enqueued=%llu completed=%llu waits=%llu wait_total=%.2f ms\n"
+                    "  async_prepare: enqueued=%llu completed=%llu waits=%llu wait_total=%.2f ms\n"
                     "  evict_count  : %llu (%llu bytes total)\n"
                     "============================================\n",
                     (unsigned long long)st->profile_n_graph,
@@ -674,6 +951,14 @@ void elastic_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     (unsigned long long)st->stage_xform_ok,
                     st->stage_xform_us / 1000.0,
                     st->stage_xform_bytes / 1024.0 / 1024.0,
+                    (unsigned long long)st->async_load_enqueued,
+                    (unsigned long long)st->async_load_completed,
+                    (unsigned long long)st->async_load_waits,
+                    st->async_load_wait_us / 1000.0,
+                    (unsigned long long)st->async_prepare_enqueued,
+                    (unsigned long long)st->async_prepare_completed,
+                    (unsigned long long)st->async_prepare_waits,
+                    st->async_prepare_wait_us / 1000.0,
                     (unsigned long long)st->n_evicts_total,
                     (unsigned long long)st->bytes_evicted_total);
             });
@@ -909,7 +1194,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                 // 我们不知道每个 tensor 在 compute 内部什么时候被读。pre-evict
                 // 可能把后续 op 还要用的 tensor 提前丢弃，compute 读到 zeros。
                 // 容忍 resident 在 ensure 阶段涨过 target，compute 完成后再 evict。
-                ensure_block_resident(s, idx, h);
+                ensure_block_resident_pipeline(s, idx, h);
             }
             elastic::wbm_touch(&s->wbm, idx, 0);  // global counter 内部递增
         }
@@ -961,7 +1246,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                     if (!resolve(src, idx, h)) continue;
                     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
                     if (!bm || bm->resident) continue;
-                    ensure_block_resident(s, idx, h);
+                    ensure_block_resident_pipeline(s, idx, h);
                 }
             }
         };
@@ -981,7 +1266,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                     if (!bm || bm->resident || !bm->host_ptr || !bm->backend_handle) continue;
                     auto reg = llama_mmap_registry_find(bm->host_ptr);
                     if (reg.filename.empty()) {
-                        ensure_block_resident(s, idx, h);
+                        ensure_block_resident_pipeline(s, idx, h);
                         continue;
                     }
                     size_t file_offset = (const char*)bm->host_ptr - (const char*)reg.base;
@@ -993,7 +1278,7 @@ ggml_status elastic_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *c
                                                                   bm->backend_handle, file_offset, bm->byte_size) == 0) {
                         pending.emplace_back(idx, bm->byte_size);
                     } else {
-                        ensure_block_resident(s, idx, h);
+                        ensure_block_resident_pipeline(s, idx, h);
                     }
                 }
             }

@@ -750,11 +750,18 @@ std::unordered_map<std::string, llama_weight_runtime_record>      g_weight_runti
 std::mutex                                                       g_budget_mtx;
 llama_budget_fn_t                                                g_budget_fn = nullptr;
 void *                                                           g_budget_ud = nullptr;
+llama_budget_reset_fn_t                                          g_budget_reset_fn = nullptr;
+void *                                                           g_budget_reset_ud = nullptr;
 }
 void llama_budget_register(llama_budget_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_budget_mtx);
     g_budget_fn = fn;
     g_budget_ud = user_data;
+}
+void llama_budget_reset_register(llama_budget_reset_fn_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lk(g_budget_mtx);
+    g_budget_reset_fn = fn;
+    g_budget_reset_ud = user_data;
 }
 int64_t llama_budget_query(void) {
     llama_budget_fn_t fn;
@@ -765,6 +772,16 @@ int64_t llama_budget_query(void) {
         ud = g_budget_ud;
     }
     return fn ? fn(ud) : -1;
+}
+void llama_budget_reset_clock(void) {
+    llama_budget_reset_fn_t fn;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lk(g_budget_mtx);
+        fn = g_budget_reset_fn;
+        ud = g_budget_reset_ud;
+    }
+    if (fn) fn(ud);
 }
 
 // === Budget target hook (scheduler 的 "留多少" 维度) ===
@@ -871,6 +888,14 @@ void llama_weight_runtime_mark_desired(const char * name, llama_weight_runtime_l
     g_weight_runtime_state[name].desired = loc;
 }
 
+llama_weight_runtime_location llama_weight_runtime_desired_query(const char * name) {
+    if (!name || !*name) return LLAMA_WEIGHT_RUNTIME_UNKNOWN;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    auto it = g_weight_runtime_state.find(name);
+    if (it == g_weight_runtime_state.end()) return LLAMA_WEIGHT_RUNTIME_UNKNOWN;
+    return it->second.desired;
+}
+
 void llama_weight_runtime_mark_resident(const char * name, llama_weight_runtime_location loc) {
     if (!name || !*name) return;
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
@@ -974,6 +999,7 @@ int llama_weight_transform_request(const char * name, llama_weight_transform_kin
         int rc = p.first(name, kind, p.second);
         if (rc != -2) return rc;
     }
+    if (kind == LLAMA_WEIGHT_TRANSFORM_CPU_REPACK) return 0;
     return -2;
 }
 

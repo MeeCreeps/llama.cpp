@@ -505,6 +505,22 @@ llama_context::~llama_context() {
                        elastic_anchor_xform_events,
                        elastic_anchor_stage_failures);
     }
+    if (elastic_mru_cache_accesses > 0) {
+        LLAMA_LOG_INFO("%s: elastic true-mru summary: accesses=%" PRIu64
+                       " hits=%" PRIu64 " misses=%" PRIu64
+                       " evictions=%" PRIu64 " load_failures=%" PRIu64
+                       " evict_failures=%" PRIu64 " resident_bytes=%.2f MiB"
+                       " budget_bytes=%.2f MiB\n",
+                       __func__,
+                       elastic_mru_cache_accesses,
+                       elastic_mru_cache_hits,
+                       elastic_mru_cache_misses,
+                       elastic_mru_cache_evictions,
+                       elastic_mru_cache_load_failures,
+                       elastic_mru_cache_evict_failures,
+                       elastic_mru_cache_resident_bytes / 1024.0 / 1024.0,
+                       elastic_mru_cache_last_budget_bytes / 1024.0 / 1024.0);
+    }
     ggml_opt_free(opt_ctx);
     // 释放 elastic plan 只读句柄缓存(llama_plan_free 见本文件后段 C API)
     for (auto & kv : elastic_plan_view_cache) {
@@ -920,6 +936,213 @@ void llama_context::elastic_install_op_schedule() {
     op_schedule_ud = this;
 }
 
+void llama_context::elastic_mru_cache_reset() {
+    if (elastic_mru_cache_plan == elastic_plan && !elastic_mru_cache_resident.empty()) return;
+    elastic_mru_cache_plan = elastic_plan;
+    elastic_mru_cache_resident.clear();
+    elastic_mru_cache_pending_evict.clear();
+    elastic_mru_cache_last_use.clear();
+    elastic_mru_cache_resident_bytes = 0;
+    elastic_mru_cache_logged_budget = false;
+    if (!elastic_plan) return;
+    for (const auto & w : elastic_plan->weights) {
+        if (w.pinned || w.name.empty()) continue;
+        if (llama_weight_residency_query(w.name.c_str())) {
+            elastic_mru_cache_resident.insert(w.weight_id);
+            elastic_mru_cache_resident_bytes += w.byte_size;
+            elastic_mru_cache_last_use[w.weight_id] = 0;
+        }
+    }
+}
+
+size_t llama_context::elastic_mru_cache_budget_bytes() const {
+    if (!elastic_plan || elastic_plan->budget_mib <= 0) return 0;
+    size_t reserved = elastic_plan->kv_bytes + elastic_plan->misc_bytes;
+    if (elastic_plan->kv_bytes == 0) {
+        const char * kv = std::getenv("LLAMA_ELASTIC_ONLINE_KV_MB");
+        if (!kv || !*kv) kv = std::getenv("GGML_ELASTIC_KV_MB");
+        if (kv && *kv) {
+            const long long mb = std::atoll(kv);
+            if (mb > 0) reserved += (size_t) mb * 1024 * 1024;
+        }
+    }
+    if (elastic_plan->misc_bytes == 0) {
+        const char * misc = std::getenv("LLAMA_ELASTIC_ONLINE_MISC_MB");
+        if (!misc || !*misc) misc = std::getenv("GGML_ELASTIC_MISC_MB");
+        if (misc && *misc) {
+            const long long mb = std::atoll(misc);
+            if (mb > 0) reserved += (size_t) mb * 1024 * 1024;
+        }
+    }
+    const char * safety = std::getenv("LLAMA_ELASTIC_ONLINE_SAFETY_MB");
+    if (!safety || !*safety) safety = std::getenv("GGML_ELASTIC_SAFETY_MB");
+    if (safety && *safety) {
+        const long long mb = std::atoll(safety);
+        if (mb > 0) reserved += (size_t) mb * 1024 * 1024;
+    }
+    const char * pinned_extra = std::getenv("LLAMA_ELASTIC_PINNED_EXTRA_MB");
+    if (!pinned_extra || !*pinned_extra) pinned_extra = std::getenv("GGML_ELASTIC_PINNED_EXTRA_MB");
+    if (pinned_extra && *pinned_extra) {
+        const long long mb = std::atoll(pinned_extra);
+        if (mb > 0) reserved += (size_t) mb * 1024 * 1024;
+    }
+    const size_t budget = (size_t) elastic_plan->budget_mib * 1024 * 1024;
+    return budget > reserved ? budget - reserved : 0;
+}
+
+bool llama_context::elastic_mru_cache_pre_op(const struct ggml_tensor * op) {
+    if (!elastic_mru_cache_enabled || !elastic_plan || !op || op->op != GGML_OP_MUL_MAT) return false;
+    if (!op->src[0]) return true;
+    const char * raw = op->src[0]->name;
+    if (!raw || !*raw) return true;
+
+    const elastic::WeightPlan * w = elastic_plan->weight_by_name(raw);
+    std::string canonical;
+    if (!w) {
+        const char * first_hash = strchr(raw, '#');
+        const char * last_hash  = strrchr(raw, '#');
+        if (first_hash && last_hash && first_hash != last_hash) {
+            canonical.assign(first_hash + 1, last_hash);
+            if (!canonical.empty()) w = elastic_plan->weight_by_name(canonical);
+        }
+    }
+    if (!w || w->weight_id < 0 || w->pinned || w->name.empty()) return true;
+
+    elastic_mru_cache_reset();
+    elastic_mru_cache_accesses++;
+    elastic_mru_cache_clock++;
+
+    const bool was_resident = llama_weight_residency_query(w->name.c_str());
+    int ensure_rc = 0;
+    auto prepare_current = [&]() -> int {
+        if (w->xform == elastic::Xform::GPU_CONVERT) {
+            int rc = llama_weight_stage_request(w->name.c_str(), "prepare_gpu");
+            if (rc == -2) {
+                rc = llama_weight_transform_request(w->name.c_str(), LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT);
+            }
+            return rc;
+        }
+        if (w->xform == elastic::Xform::CPU_REPACK) {
+            int rc = llama_weight_stage_request(w->name.c_str(), "prepare_cpu");
+            if (rc == -2) {
+                rc = llama_weight_transform_request(w->name.c_str(), LLAMA_WEIGHT_TRANSFORM_CPU_REPACK);
+            }
+            return rc;
+        }
+        int rc = llama_weight_stage_request(w->name.c_str(), "prepare");
+        if (rc == -2) {
+            rc = llama_weight_movement_request(w->name.c_str(), /*evict=*/false);
+        }
+        return rc;
+    };
+    if (was_resident) {
+        elastic_mru_cache_hits++;
+        elastic_mru_cache_pending_evict.erase(w->weight_id);
+        if (elastic_mru_cache_resident.insert(w->weight_id).second) {
+            elastic_mru_cache_resident_bytes += w->byte_size;
+        }
+    } else {
+        elastic_mru_cache_misses++;
+        ensure_rc = prepare_current();
+        if (ensure_rc == 0) {
+            llama_weight_runtime_mark_resident(w->name.c_str(),
+                w->xform == elastic::Xform::CPU_REPACK ? LLAMA_WEIGHT_RUNTIME_CPU : LLAMA_WEIGHT_RUNTIME_GPU);
+            if (elastic_mru_cache_resident.insert(w->weight_id).second) {
+                elastic_mru_cache_resident_bytes += w->byte_size;
+            }
+        } else {
+            elastic_mru_cache_load_failures++;
+        }
+    }
+    static const bool trace_mru = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_MRU_TRACE");
+        return e && *e && *e != '0';
+    }();
+    static int trace_mru_count = 0;
+    if (trace_mru && trace_mru_count < 256) {
+        LLAMA_LOG_INFO("llama elastic true-mru access: weight=%s was_resident=%d rc=%d xform=%d logical_resident=%.2fMiB\n",
+                       w->name.c_str(),
+                       was_resident ? 1 : 0,
+                       ensure_rc,
+                       (int) w->xform,
+                       elastic_mru_cache_resident_bytes / 1024.0 / 1024.0);
+        trace_mru_count++;
+    }
+    elastic_mru_cache_last_use[w->weight_id] = elastic_mru_cache_clock;
+
+    const size_t budget = elastic_mru_cache_budget_bytes();
+    elastic_mru_cache_last_budget_bytes = budget;
+    if (!elastic_mru_cache_logged_budget) {
+        LLAMA_LOG_INFO("llama elastic true-mru: budget=%.2f MiB resident=%.2f MiB weights=%zu current=%s\n",
+                       budget / 1024.0 / 1024.0,
+                       elastic_mru_cache_resident_bytes / 1024.0 / 1024.0,
+                       elastic_mru_cache_resident.size(),
+                       w->name.c_str());
+        elastic_mru_cache_logged_budget = true;
+    }
+    if (budget == 0) return true;
+    static const bool mru_immediate_evict = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_MRU_EVICT_IMMEDIATE");
+        return e && *e && *e != '0';
+    }();
+    while (elastic_mru_cache_resident_bytes > budget) {
+        int victim = -1;
+        uint64_t newest = 0;
+        for (int id : elastic_mru_cache_resident) {
+            if (id == w->weight_id) continue; // do not evict the input before its compute op runs
+            const elastic::WeightPlan * vw = elastic_plan->weight_by_id(id);
+            if (!vw || vw->pinned || vw->name.empty()) continue;
+            uint64_t lu = 0;
+            auto it = elastic_mru_cache_last_use.find(id);
+            if (it != elastic_mru_cache_last_use.end()) lu = it->second;
+            if (victim < 0 || lu > newest) {
+                victim = id;
+                newest = lu;
+            }
+        }
+        if (victim < 0) break;
+        const elastic::WeightPlan * vw = elastic_plan->weight_by_id(victim);
+        if (!vw) break;
+        if (mru_immediate_evict && llama_weight_residency_query(vw->name.c_str())) {
+            if (sched) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            const int rc = llama_weight_movement_request(vw->name.c_str(), /*evict=*/true);
+            if (rc == 0) {
+                llama_weight_runtime_mark_resident(vw->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
+            } else {
+                elastic_mru_cache_evict_failures++;
+                elastic_mru_cache_pending_evict.insert(victim);
+            }
+        } else {
+            elastic_mru_cache_pending_evict.insert(victim);
+        }
+        elastic_mru_cache_resident.erase(victim);
+        elastic_mru_cache_last_use.erase(victim);
+        elastic_mru_cache_resident_bytes =
+            elastic_mru_cache_resident_bytes > vw->byte_size ? elastic_mru_cache_resident_bytes - vw->byte_size : 0;
+        elastic_mru_cache_evictions++;
+    }
+    return true;
+}
+
+void llama_context::elastic_mru_cache_flush_pending_evict() {
+    if (!elastic_mru_cache_enabled || !elastic_plan || elastic_mru_cache_pending_evict.empty()) return;
+    std::vector<int> victims(elastic_mru_cache_pending_evict.begin(), elastic_mru_cache_pending_evict.end());
+    elastic_mru_cache_pending_evict.clear();
+    for (int id : victims) {
+        const elastic::WeightPlan * vw = elastic_plan->weight_by_id(id);
+        if (!vw || vw->name.empty()) continue;
+        if (!llama_weight_residency_query(vw->name.c_str())) continue;
+        int rc = llama_weight_movement_request(vw->name.c_str(), /*evict=*/true);
+        if (rc != 0) {
+            elastic_mru_cache_evict_failures++;
+            continue;
+        }
+        llama_weight_runtime_mark_resident(vw->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
+    }
+}
+
 void llama_context::elastic_install_runtime_dispatch() {
     if (!elastic_plan) {
         if (sched) ggml_backend_sched_set_pre_op_callback(sched.get(), nullptr, nullptr);
@@ -933,6 +1156,13 @@ void llama_context::elastic_install_runtime_dispatch() {
         static void call(const struct ggml_tensor * op, int backend_id, void * ud) {
             auto * self = (llama_context *) ud;
             if (!self || !op) return;
+            if (self->elastic_mru_cache_pre_op(op)) {
+                return;
+            }
+            auto idx_it = self->elastic_graph_op_index.find(op);
+            if (idx_it != self->elastic_graph_op_index.end()) {
+                self->elastic_fire_anchor_op(idx_it->second, "pre_op_index");
+            }
             static const bool trace_preop = []() {
                 const char * e = std::getenv("LLAMA_ELASTIC_PREOP_TRACE");
                 return e && atoi(e) != 0;
@@ -1095,18 +1325,34 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
             }
             return LLAMA_WEIGHT_TRANSFORM_NONE;
         };
-        auto transform_request = [this, transform_kind_for_event](const elastic::PlanEvent & ev) {
+        auto async_gpu_xform_stage_enabled = []() {
+            static const bool enabled = []() {
+                const char * e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+                if (e && *e) return *e != '0';
+                e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_STAGE");
+                return e && *e && *e != '0';
+            }();
+            return enabled;
+        };
+        auto transform_request = [this, transform_kind_for_event, async_gpu_xform_stage_enabled](const elastic::PlanEvent & ev) {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(ev.weight_id) : nullptr;
             if (!w) return;
             llama_weight_transform_kind kind = transform_kind_for_event(ev);
-            int rc = llama_weight_transform_request(w->name.c_str(), kind);
+            const char * stage = ev.to_loc == elastic::Location::CPU ? "prepare_cpu" :
+                                (ev.to_loc == elastic::Location::GPU ? "prepare_gpu" : "prepare");
+            int rc = llama_weight_stage_request(w->name.c_str(), stage);
+            if (rc == -2) {
+                rc = llama_weight_transform_request(w->name.c_str(), kind);
+            }
             if (rc == 0) {
                 switch (ev.to_loc) {
                     case elastic::Location::CPU:
                         llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_CPU);
                         break;
                     case elastic::Location::GPU:
-                        llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                        if (!async_gpu_xform_stage_enabled()) {
+                            llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                        }
                         break;
                     case elastic::Location::DISK:
                         llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
@@ -1145,6 +1391,12 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
                     const char * e = std::getenv("LLAMA_ELASTIC_ANCHOR_TRACE");
                     return e && atoi(e) != 0;
                 }();
+                static const bool async_gpu_xform_stage = []() {
+                    const char * e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+                    if (e && *e) return *e != '0';
+                    e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_STAGE");
+                    return e && *e && *e != '0';
+                }();
                 if (trace_anchor) {
                     LLAMA_LOG_INFO("llama elastic anchor: anchor=%s op=%d events=%zu\n",
                                    anchor_name, op_id, events.size());
@@ -1176,7 +1428,7 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
                             self->elastic_anchor_xform_events++;
                             static const bool enable_cpu_xform_stage = []() {
                                 const char * e = std::getenv("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE");
-                                return e && *e && *e != 0;
+                                return e && *e && *e != '0';
                             }();
                             if (evp->to_loc == elastic::Location::CPU && !enable_cpu_xform_stage) {
                                 continue;
@@ -1187,11 +1439,20 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
                                 case elastic::Location::CPU:  kind = LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;  break;
                                 case elastic::Location::DISK: kind = LLAMA_WEIGHT_TRANSFORM_NONE;        break;
                             }
-                            rc = llama_weight_transform_request(w->name.c_str(), kind);
+                            const char * stage = evp->to_loc == elastic::Location::CPU ? "prepare_cpu" :
+                                                (evp->to_loc == elastic::Location::GPU ? "prepare_gpu" : "prepare");
+                            rc = llama_weight_stage_request(w->name.c_str(), stage);
+                            if (rc == -2) {
+                                rc = llama_weight_transform_request(w->name.c_str(), kind);
+                            }
                             break;
                         }
                         case elastic::EvKind::PREFETCH:
+                            break;
                         case elastic::EvKind::EVICT:
+                            if (llama_weight_state_query(w->name.c_str()) & LLAMA_WEIGHT_STATE_DISK_AVAILABLE) {
+                                rc = llama_weight_movement_request(w->name.c_str(), /*evict=*/true);
+                            }
                             break;
                     }
                     if (rc != 0) {
@@ -1206,7 +1467,9 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
                                 llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_CPU);
                                 break;
                             case elastic::Location::GPU:
-                                llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                                if (!async_gpu_xform_stage) {
+                                    llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                                }
                                 break;
                             case elastic::Location::DISK:
                                 llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
@@ -1222,6 +1485,20 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     }
 
     elastic_plan = plan;
+    static const bool mru_cache_env = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_RUNTIME_MRU_CACHE");
+        return e && *e && *e != '0';
+    }();
+    elastic_mru_cache_enabled = mru_cache_env;
+    for (const auto & w : plan->weights) {
+        llama_weight_runtime_location desired = LLAMA_WEIGHT_RUNTIME_DISK;
+        switch (w.location) {
+            case elastic::Location::CPU:  desired = LLAMA_WEIGHT_RUNTIME_CPU;  break;
+            case elastic::Location::GPU:  desired = LLAMA_WEIGHT_RUNTIME_GPU;  break;
+            case elastic::Location::DISK: desired = LLAMA_WEIGHT_RUNTIME_DISK; break;
+        }
+        llama_weight_runtime_mark_desired(w.name.c_str(), desired);
+    }
     elastic_route.clear();
     elastic_runtime_route.clear();
     elastic_migrate.clear();
@@ -1231,6 +1508,7 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     // to an event-empty plan hides earlier pipeline activity in final metrics.
     elastic_anchor_fired.clear();
     elastic::ReconcileStats st = elastic_executor->apply(*plan);
+    elastic_mru_cache_reset();
 
     // RUNTIME-dispatch op:executor 不灌 static route,改由 op_runtime_dispatch hook
     // 在 compute 时查表(D2b-runtime,M5)。这里收集 name → backend_id。
@@ -1282,6 +1560,38 @@ void llama_context::maybe_apply_plan() {
     if (budget_bucket_mib > 1 && B > 0) {
         B = (B / budget_bucket_mib) * budget_bucket_mib;
     }
+    static const int64_t budget_up_step_buckets = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_PLAN_UP_STEP_BUCKETS");
+        if (!e || !*e) return (int64_t) 0;
+        const long long v = std::atoll(e);
+        return v > 0 ? (int64_t) v : (int64_t) 0;
+    }();
+    static const int64_t budget_up_step_mib =
+        budget_up_step_buckets > 0 ? std::max<int64_t>(1, budget_bucket_mib) * budget_up_step_buckets : 0;
+    if (budget_up_step_mib > 0 && elastic_last_applied && B > 0) {
+        if (elastic_effective_budget_mib < 0) {
+            elastic_effective_budget_mib = elastic_last_applied->budget_mib > 0 ? elastic_last_applied->budget_mib : B;
+        }
+        const int64_t raw_budget_mib = B;
+        if (raw_budget_mib < elastic_effective_budget_mib) {
+            // Memory pressure is hard: never plan above the current budget.
+            elastic_effective_budget_mib = raw_budget_mib;
+        } else if (raw_budget_mib > elastic_effective_budget_mib) {
+            // Budget recoveries are soft. Move upward gradually so online does
+            // not reload a large resident set that the next low-budget sample
+            // may immediately evict.
+            elastic_effective_budget_mib = std::min(raw_budget_mib, elastic_effective_budget_mib + budget_up_step_mib);
+        }
+        if (elastic_effective_budget_mib != raw_budget_mib) {
+            LLAMA_LOG_INFO("%s: raw budget=%lldMiB slew-limited to %lldMiB (up_step=%lldMiB)\n",
+                           __func__, (long long) raw_budget_mib,
+                           (long long) elastic_effective_budget_mib,
+                           (long long) budget_up_step_mib);
+        }
+        B = elastic_effective_budget_mib;
+    } else {
+        elastic_effective_budget_mib = B;
+    }
     static const bool callback_no_cache = []() {
         const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
         return e && *e && *e != '0';
@@ -1290,11 +1600,52 @@ void llama_context::maybe_apply_plan() {
         const char * e = std::getenv("GGML_ELASTIC_CALLBACK_APPLY_SAME_BUDGET");
         return e && *e && *e != '0';
     }();
+    static const int switch_stable_steps = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_PLAN_SWITCH_STABLE_STEPS");
+        if (!e || !*e) return 2;
+        const int v = std::atoi(e);
+        return v > 1 ? v : 1;
+    }();
+    static const uint64_t switch_min_gap_steps = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_PLAN_SWITCH_MIN_GAP_STEPS");
+        if (!e || !*e) return (uint64_t) 0;
+        const long long v = std::atoll(e);
+        return v > 0 ? (uint64_t) v : (uint64_t) 0;
+    }();
 
     // 档没变 → 0 开销。callback no-cache 也默认按 budget 档防抖,避免稳定低预算
     // 下每 token 重复生成/应用同一份 stage plan；需要复现旧行为时可打开上面的 env。
     if (elastic_last_applied && B == elastic_last_applied->budget_mib &&
         (!callback_no_cache || !callback_apply_same_budget)) {
+        elastic_pending_budget_mib = -1;
+        elastic_pending_budget_hits = 0;
+        return;
+    }
+
+    // Budget traces can oscillate around adjacent buckets. Re-applying a plan
+    // invalidates the graph and may schedule reload/xform work, so require the
+    // new bucket to survive a few decode ticks before switching away from an
+    // already running plan. The first plan is still applied immediately.
+    if (elastic_last_applied && switch_stable_steps > 1) {
+        if (elastic_pending_budget_mib != B) {
+            elastic_pending_budget_mib = B;
+            elastic_pending_budget_hits = 1;
+        } else {
+            elastic_pending_budget_hits++;
+        }
+        if (elastic_pending_budget_hits < switch_stable_steps) {
+            LLAMA_LOG_INFO("%s: budget=%lldMiB pending switch hit=%d/%d, keep plan(budget_mib=%lld)\n",
+                           __func__, (long long) B, elastic_pending_budget_hits, switch_stable_steps,
+                           (long long) elastic_last_applied->budget_mib);
+            return;
+        }
+    }
+    if (elastic_last_applied && switch_min_gap_steps > 0 &&
+        decode_step > elastic_last_switch_decode_step &&
+        decode_step - elastic_last_switch_decode_step < switch_min_gap_steps) {
+        LLAMA_LOG_INFO("%s: budget=%lldMiB switch suppressed by min_gap=%llu steps, keep plan(budget_mib=%lld)\n",
+                       __func__, (long long) B, (unsigned long long) switch_min_gap_steps,
+                       (long long) elastic_last_applied->budget_mib);
         return;
     }
 
@@ -1302,7 +1653,23 @@ void llama_context::maybe_apply_plan() {
     const elastic::ExecPlan * p = elastic_provider->get(B, 0, 0);
     const auto t_get1 = std::chrono::steady_clock::now();
     const double provider_get_ms = std::chrono::duration<double, std::milli>(t_get1 - t_get0).count();
-    if (!p) return;
+    static const bool trace_plan_apply = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_PLAN_TRACE");
+        return e && *e && *e != 0;
+    }();
+    if (!p) {
+        if (trace_plan_apply) {
+            LLAMA_LOG_WARN("%s: budget=%lldMiB provider returned no plan provider_get_ms=%.3f\n",
+                           __func__, (long long) B, provider_get_ms);
+        }
+        return;
+    }
+    if (trace_plan_apply) {
+        LLAMA_LOG_INFO("%s: budget=%lldMiB got plan budget=%lld weights=%d ops=%d timeline=%d schedule=%d provider_get_ms=%.3f\n",
+                       __func__, (long long) B, (long long) p->budget_mib,
+                       (int) p->weights.size(), (int) p->ops.size(),
+                       (int) p->timeline.size(), (int) p->schedule_events.size(), provider_get_ms);
+    }
     // 指针相同(table 同档同指针) 或 provider 量化到同 budget 档时,只更新指针。
     if (p == elastic_last_applied) return;
     if (elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib &&
@@ -1324,10 +1691,120 @@ void llama_context::maybe_apply_plan() {
     const double apply_ms = std::chrono::duration<double, std::milli>(t_apply1 - t_apply0).count();
     elastic_last_applied = p;
     elastic_last_plan_signature = sig;
+    elastic_last_switch_decode_step = decode_step;
+    elastic_pending_budget_mib = -1;
+    elastic_pending_budget_hits = 0;
     LLAMA_LOG_INFO("%s: budget=%lldMiB → switched to plan(budget_mib=%lld) provider_get_ms=%.3f apply_ms=%.3f\n",
                    __func__, (long long) B, (long long) p->budget_mib, provider_get_ms, apply_ms);
 }
 
+void llama_context::elastic_fire_anchor_op(int op_id, const char * reason) {
+    if (!elastic_executor || !elastic_plan) return;
+    if (!elastic_executor->defer_stage_events()) return;
+    if (op_id < 0) return;
+    const auto & events = elastic_executor->events_for_anchor(op_id);
+    if (events.empty()) return;
+    elastic_anchor_requests++;
+    if (elastic_anchor_fired.count(op_id) > 0) {
+        elastic_anchor_duplicates++;
+        return;
+    }
+    elastic_anchor_fired.insert(op_id);
+    elastic_anchor_hits++;
+    elastic_anchor_events_fired += events.size();
+    static const bool trace_anchor = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_ANCHOR_TRACE");
+        return e && atoi(e) != 0;
+    }();
+    if (trace_anchor) {
+        LLAMA_LOG_INFO("llama elastic anchor: reason=%s op=%d events=%zu\n",
+                       reason ? reason : "unknown", op_id, events.size());
+    }
+    static const bool enable_cpu_xform_stage = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE");
+        return e && *e && *e != '0';
+    }();
+    static const bool async_gpu_xform_stage = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+        if (e && *e) return *e != '0';
+        e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_STAGE");
+        return e && *e && *e != '0';
+    }();
+    for (const elastic::PlanEvent * evp : events) {
+        if (!evp) continue;
+        const elastic::WeightPlan * w = elastic_plan->weight_by_id(evp->weight_id);
+        if (!w) continue;
+        int rc = 0;
+        switch (evp->kind) {
+            case elastic::EvKind::LOAD:
+                elastic_anchor_load_events++;
+                if (evp->engine == elastic::Engine::CPU) {
+                    rc = llama_weight_stage_request(w->name.c_str(), "load_cpu");
+                } else if (evp->engine == elastic::Engine::GPU) {
+                    rc = llama_weight_stage_request(w->name.c_str(), "load_gpu");
+                } else {
+                    rc = llama_weight_stage_request(w->name.c_str(), "load");
+                }
+                if (rc == -2) {
+                    rc = llama_weight_stage_request(w->name.c_str(), "load");
+                }
+                break;
+            case elastic::EvKind::TRANSFER:
+                elastic_anchor_transfer_events++;
+                rc = llama_weight_stage_request(w->name.c_str(), "transfer");
+                break;
+            case elastic::EvKind::XFORM: {
+                elastic_anchor_xform_events++;
+                if (evp->to_loc == elastic::Location::CPU && !enable_cpu_xform_stage) {
+                    continue;
+                }
+                llama_weight_transform_kind kind = LLAMA_WEIGHT_TRANSFORM_NONE;
+                switch (evp->to_loc) {
+                    case elastic::Location::GPU:  kind = LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT; break;
+                    case elastic::Location::CPU:  kind = LLAMA_WEIGHT_TRANSFORM_CPU_REPACK;  break;
+                    case elastic::Location::DISK: kind = LLAMA_WEIGHT_TRANSFORM_NONE;        break;
+                }
+                const char * stage = evp->to_loc == elastic::Location::CPU ? "prepare_cpu" :
+                                    (evp->to_loc == elastic::Location::GPU ? "prepare_gpu" : "prepare");
+                rc = llama_weight_stage_request(w->name.c_str(), stage);
+                if (rc == -2) {
+                    rc = llama_weight_transform_request(w->name.c_str(), kind);
+                }
+                break;
+            }
+            case elastic::EvKind::PREFETCH:
+                break;
+            case elastic::EvKind::EVICT:
+                if (llama_weight_state_query(w->name.c_str()) & LLAMA_WEIGHT_STATE_DISK_AVAILABLE) {
+                    rc = llama_weight_movement_request(w->name.c_str(), /*evict=*/true);
+                }
+                break;
+        }
+        if (rc != 0) {
+            elastic_anchor_stage_failures++;
+            if (trace_anchor) {
+                LLAMA_LOG_WARN("llama elastic anchor: stage request failed reason=%s op=%d weight=%s kind=%d rc=%d\n",
+                               reason ? reason : "unknown", op_id, w->name.c_str(), (int) evp->kind, rc);
+            }
+        } else if (evp->kind == elastic::EvKind::XFORM) {
+            switch (evp->to_loc) {
+                case elastic::Location::CPU:
+                    llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_CPU);
+                    break;
+                case elastic::Location::GPU:
+                    if (!async_gpu_xform_stage) {
+                        llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                    }
+                    break;
+                case elastic::Location::DISK:
+                    llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
+                    break;
+            }
+        } else if (rc == 0 && evp->to_loc == elastic::Location::DISK) {
+            llama_weight_runtime_mark_resident(w->name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
+        }
+    }
+}
 int llama_context::n_backends() const { return (int)backends.size(); }
 const char * llama_context::backend_name(int i) const {
     if (i < 0 || i >= (int)backends.size()) return nullptr;
@@ -1412,6 +1889,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+    }
+
+    if (elastic_enabled && elastic_executor) {
+        elastic_graph_op_index.clear();
+        const int n_graph_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_graph_nodes; ++i) {
+            elastic_graph_op_index[ggml_graph_node(gf, i)] = i;
         }
     }
 
@@ -2095,6 +2580,40 @@ ggml_status llama_context::graph_compute(
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
+    static const bool repeat_elastic_anchors_per_graph = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_ANCHOR_REPEAT_PER_GRAPH");
+        return e && *e && *e != '0';
+    }();
+    static const bool evict_disk_weights_per_graph = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_EVICT_DISK_WEIGHTS_PER_GRAPH");
+        return e && *e && *e != '0';
+    }();
+    static const bool preload_disk_weights_per_graph = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_PRELOAD_DISK_WEIGHTS_PER_GRAPH");
+        return e && *e && *e != '0';
+    }();
+    if (repeat_elastic_anchors_per_graph && elastic_executor && elastic_executor->defer_stage_events()) {
+        elastic_anchor_fired.clear();
+        if ((evict_disk_weights_per_graph || preload_disk_weights_per_graph) && elastic_plan) {
+            for (const auto & w : elastic_plan->weights) {
+                if (w.location != elastic::Location::DISK || w.pinned || w.name.empty()) continue;
+                if (evict_disk_weights_per_graph && llama_weight_residency_query(w.name.c_str())) {
+                    int rc = llama_weight_movement_request(w.name.c_str(), /*evict=*/true);
+                    if (rc == 0) {
+                        llama_weight_runtime_mark_resident(w.name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
+                    }
+                }
+                if (preload_disk_weights_per_graph) {
+                    int rc = llama_weight_stage_request(w.name.c_str(), "load_gpu");
+                    if (rc == -2) {
+                        rc = llama_weight_stage_request(w.name.c_str(), "load");
+                    }
+                    (void) rc;
+                }
+            }
+        }
+    }
+
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
@@ -2115,6 +2634,11 @@ ggml_status llama_context::graph_compute(
     if (std::getenv("LLAMA_OP_SCHED_DEBUG")) {
         fprintf(stderr, "[op-sched] post-compute graph splits = %d\n",
                 ggml_backend_sched_get_n_splits(sched.get()));
+    }
+    if (status == GGML_STATUS_SUCCESS && elastic_mru_cache_enabled && !elastic_mru_cache_pending_evict.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        elastic_mru_cache_flush_pending_evict();
+        graph_invalidate();
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

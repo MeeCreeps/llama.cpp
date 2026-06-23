@@ -334,9 +334,14 @@ private:
     const elastic::ExecPlan * elastic_plan         = nullptr;  // 当前已 apply(不拥有)
     const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
     uint64_t elastic_last_plan_signature = 0;                  // execution-equivalence debounce
+    int64_t  elastic_pending_budget_mib  = -1;                 // budget switch hysteresis candidate
+    int      elastic_pending_budget_hits = 0;                  // consecutive decode ticks at candidate budget
+    int64_t  elastic_effective_budget_mib = -1;                // optional slew-limited budget for online planning
+    uint64_t elastic_last_switch_decode_step = 0;              // last real apply tick
     std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id (STATIC routing)
     std::unordered_map<std::string, int> elastic_runtime_route;// weight 名 → backend_id (RUNTIME dispatch, M5)
     std::unordered_map<std::string, int> elastic_anchor_op;    // anchor weight/op 名 → op_id
+    std::unordered_map<const ggml_tensor *, int> elastic_graph_op_index; // current graph tensor* -> op index
     std::unordered_set<int>              elastic_anchor_fired; // 当前 plan 已触发过的 anchor op
     uint64_t elastic_anchor_requests        = 0;               // backend 到达 weight anchor 的通知次数
     uint64_t elastic_anchor_hits            = 0;               // 命中当前 plan anchor 的次数
@@ -346,6 +351,25 @@ private:
     uint64_t elastic_anchor_transfer_events = 0;
     uint64_t elastic_anchor_xform_events    = 0;
     uint64_t elastic_anchor_stage_failures  = 0;               // provider 返回非 0 的 stage/xform 请求数
+    // True runtime MRU cache baseline. This is separate from plan-time resident
+    // selection: every pre-op access updates recency; a miss loads the weight,
+    // then pressure evicts the most recently used resident weight other than
+    // the current op's input.
+    bool     elastic_mru_cache_enabled      = false;
+    const elastic::ExecPlan * elastic_mru_cache_plan = nullptr;
+    uint64_t elastic_mru_cache_clock        = 0;
+    uint64_t elastic_mru_cache_accesses     = 0;
+    uint64_t elastic_mru_cache_hits         = 0;
+    uint64_t elastic_mru_cache_misses       = 0;
+    uint64_t elastic_mru_cache_load_failures = 0;
+    uint64_t elastic_mru_cache_evictions    = 0;
+    uint64_t elastic_mru_cache_evict_failures = 0;
+    size_t   elastic_mru_cache_resident_bytes = 0;
+    size_t   elastic_mru_cache_last_budget_bytes = 0;
+    bool     elastic_mru_cache_logged_budget = false;
+    std::unordered_map<int, uint64_t> elastic_mru_cache_last_use;
+    std::unordered_set<int>           elastic_mru_cache_resident;
+    std::unordered_set<int>           elastic_mru_cache_pending_evict;
     // weight 名 → (migrate_from_backend, xform) — 跨后端迁移意图 (M5, 设备侧用)
     std::unordered_map<std::string, std::pair<int,int>> elastic_migrate;
     bool    elastic_enabled = false;                           // dynamic online loop 开关
@@ -359,6 +383,11 @@ private:
     // 内部 helpers(apply_exec_plan 在 public 区声明)
     void elastic_install_op_schedule();                        // 安装读 elastic_route 的 op_schedule_fn
     void elastic_install_runtime_dispatch();                   // M5:装 per-op runtime dispatch hook
+    void elastic_fire_anchor_op(int op_id, const char * reason);// 按 graph op index 触发 staged pipeline events
+    bool elastic_mru_cache_pre_op(const struct ggml_tensor * op);
+    void elastic_mru_cache_reset();
+    void elastic_mru_cache_flush_pending_evict();
+    size_t elastic_mru_cache_budget_bytes() const;
     void maybe_apply_plan();                                   // online loop:档变换 plan
     int64_t elastic_budget_mib() const;                        // 当前预算(BudgetWatcher/meminfo)
 

@@ -23,13 +23,39 @@ def layer_of(name: str) -> int:
     return int(m.group(1)) if m else -1
 
 
+def order_key(name: str) -> tuple[int, int, str]:
+    layer = layer_of(name)
+    if layer >= 0:
+        return (0, layer, name)
+    return (1, 0, name)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build minimal model meta from profile CSV")
     ap.add_argument("csv", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--base-meta", type=Path, default=None,
+                    help="optional existing weights_ops.json to merge with profile-derived weights")
+    ap.add_argument("--include-output-weight", action="store_true",
+                    help="append output.weight when result_output compute profile exists")
+    ap.add_argument("--output-weight-byte-size", type=int, default=0,
+                    help="byte size for output.weight; required when --include-output-weight is used without GGUF extraction")
     args = ap.parse_args()
 
     by_name: dict[str, dict] = {}
+    if args.base_meta:
+        base = json.loads(args.base_meta.read_text())
+        for w in base.get("weights", []):
+            name = str(w.get("name", ""))
+            if not name:
+                continue
+            by_name[name] = {
+                "name": name,
+                "byte_size": int(w.get("byte_size", w.get("bytes", 0)) or 0),
+                "quant": str(w.get("quant", "")),
+            }
+
+    saw_result_output_compute = False
     for path in args.csv:
         with path.open(newline="") as f:
             for row in csv.DictReader(f):
@@ -37,11 +63,22 @@ def main() -> None:
                 if not name or name == "ggml_cgraph":
                     continue
                 kind = row.get("kind", "")
+                if name == "result_output" and kind == "COMPUTE":
+                    saw_result_output_compute = True
                 if kind in WEIGHT_KINDS:
                     cur = by_name.setdefault(name, {"name": name, "byte_size": 0, "quant": ""})
                     cur["byte_size"] = max(cur["byte_size"], int(row.get("bytes", "0") or 0))
 
-    ordered_names = sorted(by_name, key=lambda n: (layer_of(n), n))
+    if args.include_output_weight and saw_result_output_compute and "output.weight" not in by_name:
+        if args.output_weight_byte_size <= 0:
+            raise SystemExit("--output-weight-byte-size is required to append output.weight")
+        by_name["output.weight"] = {
+            "name": "output.weight",
+            "byte_size": int(args.output_weight_byte_size),
+            "quant": "",
+        }
+
+    ordered_names = sorted(by_name, key=order_key)
     weights = []
     ops = []
     for i, name in enumerate(ordered_names):

@@ -55,6 +55,9 @@ int  budget_watcher_init(budget_watcher *bw,
 // 非阻塞读当前 B(t)。
 size_t budget_watcher_get(const budget_watcher *bw);
 
+// 将 replay 时间原点重置为当前时刻，并立即写入 t=0 的预算。
+void budget_watcher_reset_clock(budget_watcher *bw);
+
 // 停止线程并清理。可重入安全。
 void budget_watcher_shutdown(budget_watcher *bw);
 

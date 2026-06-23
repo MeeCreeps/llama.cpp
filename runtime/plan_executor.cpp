@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace elastic {
 
@@ -19,13 +21,20 @@ bool PlanExecutor::use_interval_schedule() const {
 
 static bool interval_enable_cpu_xform_stage() {
     const char * e = std::getenv("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE");
-    return e && *e && *e != 0;
+    return e && *e && *e != '0';
+}
+
+static int interval_prepare_lead_override() {
+    const char * e = std::getenv("LLAMA_ELASTIC_PREPARE_LEAD_OPS");
+    if (!e || !*e) return -1;
+    int v = std::atoi(e);
+    return v < 0 ? 0 : v;
 }
 
 static bool interval_project_stage_kind(const std::string & kind) {
     const char * e = std::getenv("LLAMA_ELASTIC_INTERVAL_STAGE_KINDS");
     if (!e || !*e) {
-        return kind == "load";
+        return kind == "load" || kind == "prepare";
     }
     std::string spec(e);
     size_t pos = 0;
@@ -34,6 +43,8 @@ static bool interval_project_stage_kind(const std::string & kind) {
         std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
         item.erase(std::remove_if(item.begin(), item.end(), [](unsigned char c) { return std::isspace(c); }), item.end());
         if (item == kind || item == "all") return true;
+        if (kind == "prepare" && (item == "xform" || item == "transfer")) return true;
+        if (kind == "xform" && item == "prepare") return true;
         if (comma == std::string::npos) break;
         pos = comma + 1;
     }
@@ -50,6 +61,39 @@ static const char * event_kind_name(EvKind kind) {
         case EvKind::EVICT:    return "evict";
     }
     return "";
+}
+
+static const char * event_stage_name(const PlanEvent & e) {
+    if (e.kind == EvKind::XFORM) return "prepare";
+    return event_kind_name(e.kind);
+}
+
+static bool interval_include_transition_timeline() {
+    const char * e = std::getenv("LLAMA_ELASTIC_INTERVAL_INCLUDE_TRANSITIONS");
+    return !(e && *e && *e == '0');
+}
+
+static bool interval_project_event_kind(EvKind kind) {
+    return kind == EvKind::LOAD || kind == EvKind::TRANSFER || kind == EvKind::XFORM || kind == EvKind::EVICT;
+}
+
+static std::string interval_event_key(const PlanEvent & e) {
+    return std::to_string((int) e.kind) + ":" +
+           std::to_string(e.weight_id) + ":" +
+           std::to_string((int) e.from_loc) + ":" +
+           std::to_string((int) e.to_loc) + ":" +
+           std::to_string((int) e.engine);
+}
+
+static int anchor_event_order(EvKind kind) {
+    switch (kind) {
+        case EvKind::LOAD:     return 0; // host staging does not consume GPU budget
+        case EvKind::EVICT:    return 1; // free GPU budget before materialization
+        case EvKind::TRANSFER: return 2;
+        case EvKind::XFORM:    return 3;
+        case EvKind::PREFETCH: return 4;
+    }
+    return 5;
 }
 
 void PlanExecutor::build_anchor_index() {
@@ -83,34 +127,67 @@ void PlanExecutor::build_anchor_index() {
             }
         }
 
+        std::unordered_set<std::string> projected_keys;
+        const int prepare_lead_override = interval_prepare_lead_override();
+        const bool evict_disk_after_use = []() {
+            const char * e = std::getenv("LLAMA_ELASTIC_INTERVAL_EVICT_DISK_AFTER_USE");
+            return !(e && *e && *e == '0');
+        }();
+        const bool evict_disk_at_graph_end = []() {
+            const char * e = std::getenv("LLAMA_ELASTIC_INTERVAL_EVICT_DISK_AT_GRAPH_END");
+            return e && *e && *e != '0';
+        }();
+        auto add_projected = [&](PlanEvent pe) {
+            if (!interval_project_event_kind(pe.kind)) return;
+            if (pe.kind != EvKind::EVICT && !interval_project_stage_kind(event_stage_name(pe))) return;
+            if (pe.kind == EvKind::XFORM && pe.engine == Engine::CPU && !interval_enable_cpu_xform_stage()) return;
+            if (pe.kind == EvKind::XFORM && prepare_lead_override >= 0) {
+                auto cit = compute_anchor_by_weight.find(pe.weight_id);
+                if (cit != compute_anchor_by_weight.end()) {
+                    pe.anchor_op_id = std::max(0, cit->second - prepare_lead_override);
+                } else {
+                    auto wit = weight_to_op.find(pe.weight_id);
+                    if (wit != weight_to_op.end()) {
+                        pe.anchor_op_id = std::max(0, wit->second - prepare_lead_override);
+                    }
+                }
+            }
+            if (pe.anchor_op_id < 0) {
+                auto cit = compute_anchor_by_weight.find(pe.weight_id);
+                if (cit != compute_anchor_by_weight.end()) {
+                    pe.anchor_op_id = cit->second;
+                } else {
+                    auto wit = weight_to_op.find(pe.weight_id);
+                    pe.anchor_op_id = wit == weight_to_op.end() ? 0 : wit->second;
+                }
+            }
+            pe.overlap_group = pe.anchor_op_id;
+            const std::string key = interval_event_key(pe);
+            if (projected_keys.insert(key).second) {
+                projected_schedule_events_.push_back(pe);
+            }
+        };
+
         for (const auto & ev : plan_->schedule_events) {
-            if (ev.kind != "load" && ev.kind != "transfer" && ev.kind != "xform") {
-                continue;
-            }
-            if (!interval_project_stage_kind(ev.kind)) {
-                continue;
-            }
-            if (ev.kind == "xform" && ev.engine == "xform_cpu" && !interval_enable_cpu_xform_stage()) {
+            if (ev.kind != "load" && ev.kind != "transfer" && ev.kind != "xform" && ev.kind != "prepare") {
                 continue;
             }
             PlanEvent pe;
             pe.weight_id = ev.weight_id;
             pe.anchor_op_id = ev.anchor_op_id;
-            if (pe.anchor_op_id < 0) {
-                auto cit = compute_anchor_by_weight.find(ev.weight_id);
-                if (cit != compute_anchor_by_weight.end()) {
-                    pe.anchor_op_id = cit->second;
-                } else {
-                    auto wit = weight_to_op.find(ev.weight_id);
-                    pe.anchor_op_id = wit == weight_to_op.end() ? 0 : wit->second;
-                }
-            }
-            pe.overlap_group = pe.anchor_op_id;
             if (ev.kind == "load") {
                 pe.kind = EvKind::LOAD;
                 pe.from_loc = Location::DISK;
-                pe.to_loc = Location::CPU;
-                pe.engine = ev.choice.find("gpu") != std::string::npos ? Engine::GPU : Engine::CPU;
+                if (ev.choice.find("gpu") != std::string::npos) {
+                    pe.to_loc = Location::GPU;
+                    pe.engine = Engine::GPU;
+                } else if (ev.choice.find("cpu") != std::string::npos) {
+                    pe.to_loc = Location::CPU;
+                    pe.engine = Engine::CPU;
+                } else {
+                    pe.to_loc = Location::CPU;
+                    pe.engine = Engine::DISK;
+                }
             } else if (ev.kind == "transfer") {
                 pe.kind = EvKind::TRANSFER;
                 pe.from_loc = Location::CPU;
@@ -118,13 +195,54 @@ void PlanExecutor::build_anchor_index() {
                 pe.engine = Engine::TRANSFER;
             } else {
                 pe.kind = EvKind::XFORM;
-                pe.from_loc = (ev.engine == "xform_gpu" || ev.choice.find("gpu") != std::string::npos) ? Location::GPU : Location::CPU;
+                pe.from_loc = (ev.engine == "xform_gpu" || ev.engine == "prepare_gpu" || ev.choice.find("gpu") != std::string::npos) ? Location::GPU : Location::CPU;
                 pe.to_loc = pe.from_loc;
                 pe.engine = pe.to_loc == Location::GPU ? Engine::GPU : Engine::CPU;
             }
-            projected_schedule_events_.push_back(pe);
+            add_projected(pe);
         }
 
+        // The interval CP schedule describes the steady-state stage timing.
+        // Online plans additionally carry a state-transition timeline based on
+        // actual runtime residency.  Ignoring it here makes the runtime fall
+        // back to foreground ensure/reload, which invalidates baseline timing.
+        if (interval_include_transition_timeline()) {
+            for (const auto & e : plan_->timeline) {
+                add_projected(e);
+            }
+        }
+
+        if (evict_disk_after_use) {
+            int max_op_id = 0;
+            for (const auto & op : plan_->ops) max_op_id = std::max(max_op_id, op.op_id);
+            for (const auto & w : plan_->weights) {
+                if (w.location != Location::DISK || w.pinned) continue;
+                auto cit = compute_anchor_by_weight.find(w.weight_id);
+                if (cit == compute_anchor_by_weight.end()) {
+                    auto wit = weight_to_op.find(w.weight_id);
+                    if (wit == weight_to_op.end()) continue;
+                    cit = compute_anchor_by_weight.emplace(w.weight_id, wit->second).first;
+                }
+                PlanEvent ev;
+                ev.kind         = EvKind::EVICT;
+                ev.weight_id    = w.weight_id;
+                ev.from_loc     = Location::GPU;
+                ev.to_loc       = Location::DISK;
+                ev.engine       = Engine::GPU;
+                ev.anchor_op_id = evict_disk_at_graph_end ? max_op_id : std::min(max_op_id, cit->second + 1);
+                ev.overlap_group = ev.anchor_op_id;
+                add_projected(ev);
+            }
+        }
+
+        std::sort(projected_schedule_events_.begin(), projected_schedule_events_.end(),
+                  [](const PlanEvent & a, const PlanEvent & b) {
+                      if (a.anchor_op_id != b.anchor_op_id) return a.anchor_op_id < b.anchor_op_id;
+                      const int ao = anchor_event_order(a.kind);
+                      const int bo = anchor_event_order(b.kind);
+                      if (ao != bo) return ao < bo;
+                      return a.weight_id < b.weight_id;
+                  });
         for (const auto & e : projected_schedule_events_) {
             anchor_index_[e.anchor_op_id].push_back(&e);
         }
@@ -133,7 +251,7 @@ void PlanExecutor::build_anchor_index() {
 
     for (const auto & e : plan_->timeline) {
         if ((e.kind == EvKind::LOAD || e.kind == EvKind::TRANSFER || e.kind == EvKind::XFORM) &&
-            !interval_project_stage_kind(event_kind_name(e.kind))) {
+            !interval_project_stage_kind(event_stage_name(e))) {
             continue;
         }
         anchor_index_[e.anchor_op_id].push_back(&e);

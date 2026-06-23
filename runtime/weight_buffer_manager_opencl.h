@@ -20,12 +20,15 @@
 #endif
 #include <CL/cl.h>
 
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
 #include <list>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +42,8 @@ namespace elastic {
 struct soa_callbacks {
     std::function<int()> evict_fn;
     std::function<int()> reload_fn;
+    std::function<int()> transfer_fn;
+    std::function<int()> xform_fn;
 };
 
 // SOA pool entry: parent buffer + d/q sub-buffer 一起回收避免重建子视图开销.
@@ -46,6 +51,7 @@ struct soa_pool_entry {
     void *parent = nullptr;
     void *d      = nullptr;
     void *q      = nullptr;
+    void *ready_event = nullptr;
 };
 
 enum class wbmcl_device_event_kind {
@@ -74,6 +80,7 @@ enum class wbmcl_stage_detail_kind {
     TRANSPOSE_ENQUEUE = 8,
     FINAL_WAIT_ENQUEUE = 9,
     MARK_RESIDENT   = 10,
+    CPU_XFORM       = 11,
 };
 
 struct wbmcl_stage_detail_bucket {
@@ -122,6 +129,12 @@ struct wbm_opencl_ctx {
     cl_mem            soa_staging          = nullptr;
     size_t            soa_staging_capacity = 0;
     cl_event          soa_staging_last_use_ev = nullptr;
+    std::vector<cl_mem>   soa_staging_slots;
+    std::vector<size_t>   soa_staging_slot_capacity;
+    std::vector<cl_event> soa_staging_slot_last_use_ev;
+    std::mutex            soa_staging_mtx;
+    size_t                soa_staging_next_slot = 0;
+    size_t                soa_staging_current_slot = 0;
 
     // O_DIRECT reload (非 SOA 路径). 默认由 ggml-opencl 注入;
     // GGML_ELASTIC_DIRECT_IO=0 时关闭:
@@ -137,10 +150,37 @@ struct wbm_opencl_ctx {
     bool retain_host_staging = false;
     size_t host_staging_pool_limit = 0; // 0 = 不限
     size_t host_staging_pool_bytes = 0;
+    std::mutex host_staging_mtx;
     std::unordered_map<int, std::vector<char>> host_staging_by_idx;
     std::unordered_map<size_t, std::vector<std::vector<char>>> host_staging_pool_by_size;
     std::list<size_t> host_staging_pool_order;
     size_t bytes_loaded_total = 0;
+
+    // Async stage LOAD worker. State values: 1=queued/running, 2=ok, <0=failed rc.
+    bool async_stage_load = false;
+    bool async_load_shutdown = false;
+    std::mutex async_load_mtx;
+    std::condition_variable async_load_cv;
+    std::deque<int> async_load_queue;
+    std::unordered_map<int, int> async_load_state;
+    std::thread async_load_worker;
+    uint64_t async_load_enqueued = 0;
+    uint64_t async_load_completed = 0;
+    uint64_t async_load_waits = 0;
+    uint64_t async_load_wait_us = 0;
+
+    // Async SOA materialization worker. Used by staged pipeline experiments to
+    // submit the existing SOA reload callback at a TRANSFER anchor and let the
+    // eventual XFORM/compute consumer wait only if it catches up.
+    bool async_soa_reload_worker_started = false;
+    std::mutex async_soa_reload_mtx;
+    std::condition_variable async_soa_reload_cv;
+    std::deque<int> async_soa_reload_queue;
+    std::unordered_map<int, int> async_soa_reload_state; // 1=queued/running, 2=ok, <0=failed
+    uint64_t async_soa_reload_enqueued = 0;
+    uint64_t async_soa_reload_completed = 0;
+    uint64_t async_soa_reload_waits = 0;
+    uint64_t async_soa_reload_wait_us = 0;
 
     uint64_t stage_load_calls = 0;
     uint64_t stage_load_ok    = 0;
@@ -151,6 +191,12 @@ struct wbm_opencl_ctx {
     uint64_t direct_read_fail  = 0;
     uint64_t direct_read_us    = 0;
     size_t   direct_read_bytes = 0;
+    uint64_t async_load_direct_read_calls = 0;
+    uint64_t async_load_direct_read_us    = 0;
+    size_t   async_load_direct_read_bytes = 0;
+    uint64_t foreground_direct_read_calls = 0;
+    uint64_t foreground_direct_read_us    = 0;
+    size_t   foreground_direct_read_bytes = 0;
 
     uint64_t stage_transfer_calls = 0;
     uint64_t stage_transfer_ok    = 0;
@@ -176,12 +222,17 @@ struct wbm_opencl_ctx {
 
     bool stage_detail = false;
     std::mutex stage_detail_mtx;
-    wbmcl_stage_detail_bucket stage_detail_buckets[11];
+    wbmcl_stage_detail_bucket stage_detail_buckets[12];
 };
 
 void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
                         std::function<int()> evict_fn,
                         std::function<int()> reload_fn);
+void wbmcl_register_soa_split(wbm_opencl_ctx *octx, int idx,
+                              std::function<int()> evict_fn,
+                              std::function<int()> reload_fn,
+                              std::function<int()> transfer_fn,
+                              std::function<int()> xform_fn);
 
 // 绑定一个已存在的 WBM 和 OpenCL 上下文。不接管 cl_context / queue 的生命周期，
 // 调用方仍负责销毁。xfer_queue 可传 nullptr，此时 prefetch / 同步上传走
@@ -220,10 +271,16 @@ int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
 
 // 分阶段 plan API:
 //   LOAD  : disk/mmap -> host staging
-//   TRANSFER : host staging -> backend buffer
-//   XFORM : backend/raw -> compute layout (SOA callback 或 generic no-op)
+//   PREPARE  : backend-specific materialization for compute
+//              (GPU: write + convert/transpose; CPU: repack/transform)
+//   TRANSFER/XFORM are legacy internal sub-stages kept for compatibility.
 // 旧 ensure_resident 仍是完整兼容路径。
 int  wbmcl_load_host(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_wait_host_load(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_soa_reload_async(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_wait_soa_reload(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_prepare_backend(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx);
 

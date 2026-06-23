@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
+#include <future>
 #include <sstream>
 
 #include <nlohmann/json.hpp>
@@ -52,6 +54,10 @@ public:
                 std::string err2;
                 if (!plan_from_make_plan_file(path, mp, &err2)) {
                     last_err_ = "native: " + err + "; make_plan: " + err2;
+                    if (std::getenv("LLAMA_ELASTIC_PLAN_TRACE")) {
+                        std::fprintf(stderr, "elastic TableProvider: failed to load %s: %s\n",
+                                     path.c_str(), last_err_.c_str());
+                    }
                     return nullptr;
                 }
                 *plan = std::move(mp);
@@ -123,25 +129,40 @@ public:
         : fn_(std::move(fn)) {
         const char * e = std::getenv("GGML_ELASTIC_CALLBACK_NOCACHE");
         no_cache_ = e && *e && *e != '0';
+        const char * a = std::getenv("GGML_ELASTIC_CALLBACK_ASYNC");
+        async_ = a && *a && *a != '0';
     }
 
     const ExecPlan * get(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) override {
         if (!fn_) return nullptr;
+        if (async_) {
+            if (const ExecPlan * ready = poll_async(budget_mib)) {
+                return ready;
+            }
+            if (!last_ready_) {
+                // First plan is blocking so decode never starts without a plan.
+                auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
+                if (!plan) return nullptr;
+                history_.push_back(std::move(plan));
+                last_ready_ = history_.back().get();
+                return last_ready_;
+            }
+            if (!pending_ && (no_cache_ || last_requested_budget_ != budget_mib)) {
+                start_async(budget_mib, kv_bytes, misc_bytes);
+            }
+            return last_ready_;
+        }
         if (no_cache_) {
-            auto plan = std::make_unique<ExecPlan>();
-            if (!fn_(budget_mib, *plan)) return nullptr;
-            plan->kv_bytes   = kv_bytes;
-            plan->misc_bytes = misc_bytes;
+            auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
+            if (!plan) return nullptr;
             history_.push_back(std::move(plan));
             return history_.back().get();
         }
-        // 按 budget 缓存以保证指针稳定(同 budget → 同 plan 指针)。
+        // 按 budget 缓存以保证指针稳定(同 budget -> 同 plan 指针)。
         auto it = cache_.find(budget_mib);
         if (it == cache_.end()) {
-            auto plan = std::make_unique<ExecPlan>();
-            if (!fn_(budget_mib, *plan)) return nullptr;
-            plan->kv_bytes   = kv_bytes;
-            plan->misc_bytes = misc_bytes;
+            auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
+            if (!plan) return nullptr;
             it = cache_.emplace(budget_mib, std::move(plan)).first;
         }
         return it->second.get();
@@ -150,10 +171,55 @@ public:
     int n_bands() const override { return (int) (cache_.size() + history_.size()); }
 
 private:
+    std::unique_ptr<ExecPlan> solve_once(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) {
+        auto plan = std::make_unique<ExecPlan>();
+        if (!fn_(budget_mib, *plan)) return nullptr;
+        plan->kv_bytes   = kv_bytes;
+        plan->misc_bytes = misc_bytes;
+        return plan;
+    }
+
+    void start_async(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) {
+        pending_ = true;
+        last_requested_budget_ = budget_mib;
+        auto fn = fn_;
+        pending_future_ = std::async(std::launch::async, [fn, budget_mib, kv_bytes, misc_bytes]() mutable {
+            auto plan = std::make_unique<ExecPlan>();
+            if (!fn || !fn(budget_mib, *plan)) {
+                return std::make_pair(budget_mib, std::unique_ptr<ExecPlan>());
+            }
+            plan->kv_bytes   = kv_bytes;
+            plan->misc_bytes = misc_bytes;
+            return std::make_pair(budget_mib, std::move(plan));
+        });
+    }
+
+    const ExecPlan * poll_async(int64_t current_budget_mib) {
+        if (!pending_) return nullptr;
+        if (pending_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            return nullptr;
+        }
+        pending_ = false;
+        auto result = pending_future_.get();
+        if (result.first != current_budget_mib) {
+            return nullptr;
+        }
+        auto plan = std::move(result.second);
+        if (!plan) return nullptr;
+        history_.push_back(std::move(plan));
+        last_ready_ = history_.back().get();
+        return last_ready_;
+    }
+
     std::function<bool(int64_t, ExecPlan &)>         fn_;
     std::map<int64_t, std::unique_ptr<ExecPlan>>     cache_;
     std::vector<std::unique_ptr<ExecPlan>>           history_;
+    std::future<std::pair<int64_t, std::unique_ptr<ExecPlan>>> pending_future_;
+    const ExecPlan *                                 last_ready_ = nullptr;
+    int64_t                                          last_requested_budget_ = -1;
+    bool                                             pending_ = false;
     bool                                             no_cache_ = false;
+    bool                                             async_ = false;
 };
 
 }  // namespace

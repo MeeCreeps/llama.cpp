@@ -5,6 +5,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace elastic {
@@ -57,6 +58,7 @@ const char *stage_detail_kind_name(wbmcl_stage_detail_kind kind) {
         case wbmcl_stage_detail_kind::TRANSPOSE_ENQUEUE:  return "transpose_enqueue";
         case wbmcl_stage_detail_kind::FINAL_WAIT_ENQUEUE: return "final_wait_enqueue";
         case wbmcl_stage_detail_kind::MARK_RESIDENT:      return "mark_resident";
+        case wbmcl_stage_detail_kind::CPU_XFORM:          return "cpu_xform";
     }
     return "unknown";
 }
@@ -109,12 +111,73 @@ void host_staging_pool_put(wbm_opencl_ctx *octx, std::vector<char> &&buf) {
     octx->host_staging_pool_bytes += nbytes;
 }
 
+
+bool async_load_on_evict_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_ON_EVICT");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+
+bool release_stage_after_xform_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+bool soa_reload_on_transfer_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_SOA_RELOAD_ON_TRANSFER");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+bool soa_async_reload_on_transfer_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_SOA_ASYNC_RELOAD_ON_TRANSFER");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+bool async_stage_prepare_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
+        if (e && *e) return *e != '0';
+        e = std::getenv("GGML_ELASTIC_SOA_ASYNC_RELOAD_ON_TRANSFER");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+size_t async_stage_prepare_max_pending() {
+    static const size_t max_pending = []() {
+        const char *e = std::getenv("GGML_ELASTIC_ASYNC_PREPARE_MAX_PENDING");
+        long long v = e && *e ? atoll(e) : 0;
+        if (v < 0) v = 0;
+        return static_cast<size_t>(v);
+    }();
+    return max_pending;
+}
+
 void release_host_staging(wbm_opencl_ctx *octx, int idx) {
     if (!octx) return;
-    auto it = octx->host_staging_by_idx.find(idx);
-    if (it == octx->host_staging_by_idx.end()) return;
-    host_staging_pool_put(octx, std::move(it->second));
-    octx->host_staging_by_idx.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
+        auto it = octx->host_staging_by_idx.find(idx);
+        if (it == octx->host_staging_by_idx.end()) return;
+        host_staging_pool_put(octx, std::move(it->second));
+        octx->host_staging_by_idx.erase(it);
+    }
+    if (octx->async_stage_load) {
+        std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+        octx->async_load_state.erase(idx);
+    }
 }
 
 }  // namespace
@@ -142,13 +205,48 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->n_creates            = 0;
     octx->n_releases           = 0;
     octx->direct_read_fn       = nullptr;  // ggml-opencl lazy_init 按 env 注入
+    octx->soa_staging = nullptr;
+    octx->soa_staging_capacity = 0;
+    octx->soa_staging_last_use_ev = nullptr;
+    octx->soa_staging_slots.clear();
+    octx->soa_staging_slot_capacity.clear();
+    octx->soa_staging_slot_last_use_ev.clear();
+    octx->soa_staging_next_slot = 0;
+    octx->soa_staging_current_slot = 0;
     octx->retain_host_staging  = false;
     octx->host_staging_pool_limit = 0;
     octx->host_staging_pool_bytes = 0;
-    octx->host_staging_by_idx.clear();
-    octx->host_staging_pool_by_size.clear();
-    octx->host_staging_pool_order.clear();
+    {
+        std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
+        octx->host_staging_by_idx.clear();
+        octx->host_staging_pool_by_size.clear();
+        octx->host_staging_pool_order.clear();
+    }
     octx->bytes_loaded_total   = 0;
+    octx->async_stage_load = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_LOAD");
+        return e && *e && *e != '0';
+    }();
+    octx->async_load_shutdown = false;
+    octx->async_load_queue.clear();
+    octx->async_load_state.clear();
+    octx->async_load_enqueued = 0;
+    octx->async_load_completed = 0;
+    octx->async_load_waits = 0;
+    octx->async_load_wait_us = 0;
+    octx->async_soa_reload_worker_started = false;
+    octx->async_soa_reload_queue.clear();
+    octx->async_soa_reload_state.clear();
+    octx->async_soa_reload_enqueued = 0;
+    octx->async_soa_reload_completed = 0;
+    octx->async_soa_reload_waits = 0;
+    octx->async_soa_reload_wait_us = 0;
+    octx->async_load_direct_read_calls = 0;
+    octx->async_load_direct_read_us = 0;
+    octx->async_load_direct_read_bytes = 0;
+    octx->foreground_direct_read_calls = 0;
+    octx->foreground_direct_read_us = 0;
+    octx->foreground_direct_read_bytes = 0;
     octx->stage_load_calls = 0;
     octx->stage_load_ok = 0;
     octx->stage_load_us = 0;
@@ -172,6 +270,31 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->device_events.clear();
     octx->stage_detail = false;
     for (auto & b : octx->stage_detail_buckets) b = {};
+
+    if (octx->async_stage_load) {
+        octx->async_load_worker = std::thread([octx]() {
+            for (;;) {
+                int idx = -1;
+                {
+                    std::unique_lock<std::mutex> lock(octx->async_load_mtx);
+                    octx->async_load_cv.wait(lock, [octx]() {
+                        return octx->async_load_shutdown || !octx->async_load_queue.empty();
+                    });
+                    if (octx->async_load_shutdown && octx->async_load_queue.empty()) break;
+                    idx = octx->async_load_queue.front();
+                    octx->async_load_queue.pop_front();
+                }
+                const int rc = wbmcl_load_host(octx, idx);
+                {
+                    std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+                    octx->async_load_state[idx] = rc == 0 ? 2 : rc;
+                    octx->async_load_completed++;
+                }
+                octx->async_load_cv.notify_all();
+            }
+        });
+        octx->async_load_worker.detach();
+    }
     return 0;
 }
 
@@ -252,7 +375,7 @@ void wbmcl_record_stage_detail(wbm_opencl_ctx *octx,
                                size_t bytes) {
     if (!octx || !octx->stage_detail) return;
     const int idx = (int) kind;
-    if (idx < 0 || idx >= 11) return;
+    if (idx < 0 || idx >= 12) return;
     std::lock_guard<std::mutex> lock(octx->stage_detail_mtx);
     auto & b = octx->stage_detail_buckets[idx];
     b.n++;
@@ -262,13 +385,13 @@ void wbmcl_record_stage_detail(wbm_opencl_ctx *octx,
 
 void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
     if (!octx || !octx->stage_detail || !out) return;
-    wbmcl_stage_detail_bucket buckets[11];
+    wbmcl_stage_detail_bucket buckets[12];
     {
         std::lock_guard<std::mutex> lock(octx->stage_detail_mtx);
-        for (int i = 0; i < 11; ++i) buckets[i] = octx->stage_detail_buckets[i];
+        for (int i = 0; i < 12; ++i) buckets[i] = octx->stage_detail_buckets[i];
     }
     std::fprintf(out, "\n=== wbmcl stage detail timing dump (host substage) ===\n");
-    for (int i = 0; i < 11; ++i) {
+    for (int i = 0; i < 12; ++i) {
         const auto & b = buckets[i];
         const double ms = b.us / 1000.0;
         const double mb = b.bytes / 1024.0 / 1024.0;
@@ -276,6 +399,25 @@ void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
         std::fprintf(out, "detail %-18s calls=%llu total=%.3f ms avg=%.3f ms MB=%.1f\n",
                      stage_detail_kind_name((wbmcl_stage_detail_kind) i),
                      (unsigned long long) b.n, ms, avg, mb);
+    }
+    if (octx->async_stage_load) {
+        const double wait_ms = octx->async_load_wait_us / 1000.0;
+        const double avg_wait = octx->async_load_waits ? wait_ms / octx->async_load_waits : 0.0;
+        std::fprintf(out, "async load worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms\n",
+                     (unsigned long long) octx->async_load_enqueued,
+                     (unsigned long long) octx->async_load_completed,
+                     (unsigned long long) octx->async_load_waits,
+                     wait_ms, avg_wait);
+    }
+    if (async_stage_prepare_enabled() || octx->async_soa_reload_worker_started ||
+        octx->async_soa_reload_enqueued > 0 || octx->async_soa_reload_completed > 0) {
+        const double wait_ms = octx->async_soa_reload_wait_us / 1000.0;
+        const double avg_wait = octx->async_soa_reload_waits ? wait_ms / octx->async_soa_reload_waits : 0.0;
+        std::fprintf(out, "async prepare worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms\n",
+                     (unsigned long long) octx->async_soa_reload_enqueued,
+                     (unsigned long long) octx->async_soa_reload_completed,
+                     (unsigned long long) octx->async_soa_reload_waits,
+                     wait_ms, avg_wait);
     }
     std::fprintf(out, "======================================================\n");
 }
@@ -299,7 +441,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         wbm_set_prefetch_event(octx->wbm, idx, nullptr);
         octx->bytes_uploaded_total += meta->byte_size;
         wbm_mark_resident(octx->wbm, idx, meta->backend_handle);
-        release_host_staging(octx, idx);
+        if (!octx->async_stage_load || release_stage_after_xform_enabled()) release_host_staging(octx, idx);
         return 0;
     }
 
@@ -308,19 +450,34 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
         return -3;
     }
 
+    // If a plan LOAD stage is in flight for this weight, wait here only because
+    // compute is about to need the tensor. This is the consumer-side dependency
+    // that turns anchor LOAD into real producer/consumer overlap.
+    wbmcl_wait_host_load(octx, idx);
+
     // Transfer 源解析: LOAD stage 已执行时优先用 host staging；否则默认 mmap host_ptr
     // (隐式 page fault 读盘)。 若注入了
     // direct_read_fn (GGML_ELASTIC_DIRECT_IO=1), 先 O_DIRECT pread 到 thread_local
     // scratch (绕 page cache, 模拟真 disk 成本), 再用 scratch 做 transfer 源。
     const void *dma_src = meta->host_ptr;
     bool use_direct_scratch = false;
-    auto staged = octx->host_staging_by_idx.find(idx);
-    if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= meta->byte_size) {
-        dma_src = staged->second.data();
+    {
+        std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
+        auto staged = octx->host_staging_by_idx.find(idx);
+        if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= meta->byte_size) {
+            dma_src = staged->second.data();
+        }
+    }
+    if (dma_src != meta->host_ptr) {
+        // using staged buffer from async/scheduled LOAD
     } else if (octx->direct_read_fn) {
         static thread_local std::vector<char> direct_scratch;
         if (direct_scratch.size() < meta->byte_size) direct_scratch.resize(meta->byte_size);
+        const uint64_t direct_t0 = now_us();
         if (octx->direct_read_fn(meta->host_ptr, direct_scratch.data(), meta->byte_size) == 0) {
+            octx->foreground_direct_read_calls++;
+            octx->foreground_direct_read_us += now_us() - direct_t0;
+            octx->foreground_direct_read_bytes += meta->byte_size;
             dma_src            = direct_scratch.data();
             use_direct_scratch = true;
         } else {
@@ -523,7 +680,11 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
             std::fprintf(stderr, "[wbmcl] SOA evict_fn 失败 block %d rc=%d\n", idx, rc);
             return rc;
         }
-        release_host_staging(octx, idx);
+        if (!octx->async_stage_load) {
+            release_host_staging(octx, idx);
+        } else if (async_load_on_evict_enabled()) {
+            wbmcl_load_host_async(octx, idx);
+        }
         return 0;
     }
 
@@ -560,6 +721,7 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
     octx->n_releases += 1;
     octx->bytes_evicted_total += meta->byte_size;
     wbm_mark_evicted(octx->wbm, idx);
+    if (octx->async_stage_load && async_load_on_evict_enabled()) wbmcl_load_host_async(octx, idx);
     return 0;
 }
 
@@ -576,6 +738,7 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
     const uint64_t t0 = now_us();
     octx->stage_load_calls++;
 
+    std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
     auto & staging = octx->host_staging_by_idx[idx];
     if (staging.size() < meta->byte_size) {
         std::vector<char> pooled = host_staging_pool_take(octx, meta->byte_size);
@@ -588,7 +751,11 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
 
     int rc = -1;
     if (octx->direct_read_fn) {
+        const uint64_t direct_t0 = now_us();
         rc = octx->direct_read_fn(meta->host_ptr, staging.data(), meta->byte_size);
+        octx->async_load_direct_read_calls++;
+        octx->async_load_direct_read_us += now_us() - direct_t0;
+        if (rc == 0) octx->async_load_direct_read_bytes += meta->byte_size;
     }
     if (rc != 0) {
         std::memcpy(staging.data(), meta->host_ptr, meta->byte_size);
@@ -598,6 +765,144 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
     octx->stage_load_bytes += meta->byte_size;
     octx->stage_load_us += now_us() - t0;
     return 0;
+}
+
+int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    if (!octx->async_stage_load) return wbmcl_load_host(octx, idx);
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+    if (!meta->host_ptr || meta->byte_size == 0) return -3;
+    {
+        std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+        auto hit = octx->host_staging_by_idx.find(idx);
+        if (hit != octx->host_staging_by_idx.end() && hit->second.size() >= meta->byte_size) {
+            return 0;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+        auto it = octx->async_load_state.find(idx);
+        if (it != octx->async_load_state.end() && it->second == 1) return 0;
+        octx->async_load_state[idx] = 1;
+        octx->async_load_queue.push_back(idx);
+        octx->async_load_enqueued++;
+    }
+    octx->async_load_cv.notify_one();
+    return 0;
+}
+
+int wbmcl_wait_host_load(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->async_stage_load) return 0;
+    {
+        std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+        const block_meta *meta = wbm_get(octx->wbm, idx);
+        auto hit = octx->host_staging_by_idx.find(idx);
+        if (meta && hit != octx->host_staging_by_idx.end() && hit->second.size() >= meta->byte_size) {
+            return 0;
+        }
+    }
+    const uint64_t t0 = now_us();
+    int state = 0;
+    {
+        std::unique_lock<std::mutex> lock(octx->async_load_mtx);
+        auto it = octx->async_load_state.find(idx);
+        if (it == octx->async_load_state.end()) return 0;
+        if (it->second != 1) return it->second >= 0 ? 0 : it->second;
+        octx->async_load_waits++;
+        octx->async_load_cv.wait(lock, [&]() {
+            auto cur = octx->async_load_state.find(idx);
+            return cur == octx->async_load_state.end() || cur->second != 1;
+        });
+        auto done = octx->async_load_state.find(idx);
+        state = done == octx->async_load_state.end() ? 0 : done->second;
+    }
+    octx->async_load_wait_us += now_us() - t0;
+    return state >= 0 ? 0 : state;
+}
+
+static void wbmcl_start_soa_reload_worker(wbm_opencl_ctx *octx) {
+    if (!octx) return;
+    {
+        std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
+        if (octx->async_soa_reload_worker_started) return;
+        octx->async_soa_reload_worker_started = true;
+    }
+    std::thread([octx]() {
+        for (;;) {
+            int idx = -1;
+            {
+                std::unique_lock<std::mutex> lock(octx->async_soa_reload_mtx);
+                octx->async_soa_reload_cv.wait(lock, [octx]() {
+                    return !octx->async_soa_reload_queue.empty();
+                });
+                idx = octx->async_soa_reload_queue.front();
+                octx->async_soa_reload_queue.pop_front();
+            }
+            int rc = -2;
+            auto it = octx->soa_per_idx.find(idx);
+            if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
+                const block_meta *meta = wbm_get(octx->wbm, idx);
+                rc = (meta && meta->resident) ? 0 : it->second.reload_fn();
+            }
+            {
+                std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
+                octx->async_soa_reload_state[idx] = rc == 0 ? 2 : rc;
+                octx->async_soa_reload_completed++;
+            }
+            octx->async_soa_reload_cv.notify_all();
+        }
+    }).detach();
+}
+
+int wbmcl_soa_reload_async(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+    if (meta->resident) return 0;
+    auto it = octx->soa_per_idx.find(idx);
+    if (it == octx->soa_per_idx.end() || !it->second.reload_fn) return -3;
+    wbmcl_start_soa_reload_worker(octx);
+    {
+        std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
+        auto cur = octx->async_soa_reload_state.find(idx);
+        if (cur != octx->async_soa_reload_state.end() && cur->second == 1) return 0;
+        const size_t max_pending = async_stage_prepare_max_pending();
+        if (max_pending > 0) {
+            size_t pending = 0;
+            for (const auto & kv : octx->async_soa_reload_state) {
+                if (kv.second == 1) pending++;
+            }
+            if (pending >= max_pending) return 0;
+        }
+        octx->async_soa_reload_state[idx] = 1;
+        octx->async_soa_reload_queue.push_back(idx);
+        octx->async_soa_reload_enqueued++;
+    }
+    octx->async_soa_reload_cv.notify_one();
+    return 0;
+}
+
+int wbmcl_wait_soa_reload(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || idx < 0) return -1;
+    const uint64_t t0 = now_us();
+    int state = 0;
+    {
+        std::unique_lock<std::mutex> lock(octx->async_soa_reload_mtx);
+        auto it = octx->async_soa_reload_state.find(idx);
+        if (it == octx->async_soa_reload_state.end()) return 0;
+        if (it->second == 1) {
+            octx->async_soa_reload_waits++;
+            octx->async_soa_reload_cv.wait(lock, [&]() {
+                auto cur = octx->async_soa_reload_state.find(idx);
+                return cur == octx->async_soa_reload_state.end() || cur->second != 1;
+            });
+        }
+        auto done = octx->async_soa_reload_state.find(idx);
+        state = done == octx->async_soa_reload_state.end() ? 0 : done->second;
+    }
+    octx->async_soa_reload_wait_us += now_us() - t0;
+    return state >= 0 ? 0 : state;
 }
 
 int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
@@ -612,18 +917,38 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
         rc = -2;
     } else if (meta->resident || meta->prefetch_event) {
         rc = 0;
-    } else if (octx->soa_per_idx.find(idx) != octx->soa_per_idx.end()) {
-        // SOA tensors still rely on their registered reload_fn because a raw
-        // host->GPU write is not sufficient to rebuild the device layout.
-        rc = 0;
+    } else if (auto soa = octx->soa_per_idx.find(idx);
+               soa != octx->soa_per_idx.end() && (soa->second.transfer_fn || soa->second.reload_fn)) {
+        // SOA tensors need backend materialization (write + convert/transpose)
+        // before compute.  In the staged pipeline experiment, let TRANSFER
+        // trigger that callback at the transfer anchor.  Without the env flag,
+        // preserve the older behavior where XFORM/foreground ensure performs it.
+        if (async_stage_prepare_enabled()) {
+            rc = wbmcl_soa_reload_async(octx, idx);
+        } else if (soa->second.transfer_fn) {
+            rc = soa->second.transfer_fn();
+        } else {
+            rc = soa_reload_on_transfer_enabled() ? soa->second.reload_fn() : 0;
+        }
     } else {
-        auto staged = octx->host_staging_by_idx.find(idx);
-        if (staged == octx->host_staging_by_idx.end() || staged->second.size() < meta->byte_size) {
+        const int wait_rc = wbmcl_wait_host_load(octx, idx);
+        if (wait_rc != 0) {
+            rc = wait_rc;
+        }
+        std::vector<char> * staged_ptr = nullptr;
+        if (rc == 0) {
+            std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
+            auto staged = octx->host_staging_by_idx.find(idx);
+            if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= meta->byte_size) {
+                staged_ptr = &staged->second;
+            }
+        }
+        if (rc == 0 && staged_ptr == nullptr) {
             // No preceding LOAD stage reached this tensor. Fall back to the
             // correctness path, which may perform direct disk read + transfer
             // synchronously.
             rc = wbmcl_ensure_resident(octx, idx);
-            if (rc == 0) release_host_staging(octx, idx);
+            if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         } else {
             cl_int err = CL_SUCCESS;
             cl_mem buf = nullptr;
@@ -660,7 +985,7 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
                     }
                     cl_event write_ev = nullptr;
                     err = clEnqueueWriteBuffer(use_q, buf, CL_FALSE,
-                                               0, meta->byte_size, staged->second.data(),
+                                               0, meta->byte_size, staged_ptr->data(),
                                                0, nullptr, &write_ev);
                     if (err != CL_SUCCESS) {
                         std::fprintf(stderr, "[wbmcl stage transfer] async clEnqueueWriteBuffer failed block %d: %s (%d)\n",
@@ -678,7 +1003,7 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
                     }
                 } else {
                     err = clEnqueueWriteBuffer(octx->compute_queue, buf, CL_TRUE,
-                                               0, meta->byte_size, staged->second.data(),
+                                               0, meta->byte_size, staged_ptr->data(),
                                                0, nullptr, nullptr);
                     if (err != CL_SUCCESS) {
                         std::fprintf(stderr, "[wbmcl stage transfer] clEnqueueWriteBuffer failed block %d: %s (%d)\n",
@@ -689,7 +1014,7 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
                     } else {
                         octx->bytes_uploaded_total += meta->byte_size;
                         wbm_mark_resident(octx->wbm, idx, static_cast<void *>(buf));
-                        release_host_staging(octx, idx);
+                        if (!octx->async_stage_load || release_stage_after_xform_enabled()) release_host_staging(octx, idx);
                     }
                 }
             }
@@ -712,17 +1037,23 @@ int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
     octx->stage_xform_calls++;
     int rc = 0;
     auto it = octx->soa_per_idx.find(idx);
-    if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
+    if (it != octx->soa_per_idx.end() && (it->second.xform_fn || it->second.reload_fn)) {
         const block_meta *meta = wbm_get(octx->wbm, idx);
         if (meta && meta->resident) {
-            release_host_staging(octx, idx);
+            if (!octx->async_stage_load || release_stage_after_xform_enabled()) release_host_staging(octx, idx);
             rc = 0;
+        } else if (async_stage_prepare_enabled() && wbmcl_wait_soa_reload(octx, idx) == 0 &&
+                   (meta = wbm_get(octx->wbm, idx)) && meta->resident) {
+            rc = 0;
+        } else if (it->second.xform_fn) {
+            rc = it->second.xform_fn();
+            if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         } else {
             rc = it->second.reload_fn();
-            if (rc == 0) release_host_staging(octx, idx);
+            if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         }
     } else {
-        release_host_staging(octx, idx);
+        if (!octx->async_stage_load || release_stage_after_xform_enabled()) release_host_staging(octx, idx);
         rc = 0;
     }
     if (rc == 0) {
@@ -731,6 +1062,34 @@ int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
     }
     octx->stage_xform_us += now_us() - t0;
     return rc;
+}
+
+int wbmcl_prepare_backend(wbm_opencl_ctx *octx, int idx) {
+    if (!octx || !octx->wbm) return -1;
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+    if (meta->resident) return 0;
+
+    auto soa = octx->soa_per_idx.find(idx);
+    if (soa != octx->soa_per_idx.end() && (soa->second.xform_fn || soa->second.transfer_fn || soa->second.reload_fn)) {
+        // Treat OpenCL SOA materialization as one prepare stage.  Internally it
+        // may perform host write, convert and transpose; planner/runtime should
+        // not need to schedule those as separate high-level stages.
+        if (async_stage_prepare_enabled()) {
+            return wbmcl_soa_reload_async(octx, idx);
+        }
+        if (soa->second.xform_fn) {
+            return soa->second.xform_fn();
+        }
+        if (soa->second.transfer_fn) {
+            return soa->second.transfer_fn();
+        }
+        return soa->second.reload_fn();
+    }
+
+    int rc = wbmcl_dma_to_backend(octx, idx);
+    if (rc != 0) return rc;
+    return wbmcl_transform_backend(octx, idx);
 }
 
 int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
@@ -848,7 +1207,11 @@ int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
                 std::fprintf(stderr, "[wbmcl] 批量 SOA evict_fn 失败 block %d rc=%d\n", v, rc);
                 continue;
             }
-            release_host_staging(octx, v);
+            if (!octx->async_stage_load) {
+                release_host_staging(octx, v);
+            } else if (async_load_on_evict_enabled()) {
+                wbmcl_load_host_async(octx, v);
+            }
             ++released;
             continue;
         }
@@ -875,6 +1238,7 @@ int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
                 octx->cached_bytes += m->byte_size;
                 octx->bytes_evicted_total += m->byte_size;
                 wbm_mark_evicted(octx->wbm, v);
+                if (octx->async_stage_load && async_load_on_evict_enabled()) wbmcl_load_host_async(octx, v);
                 ++released;
                 continue;
             }
@@ -902,6 +1266,45 @@ cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx) {
 
 void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     if (!octx || !octx->wbm) return;
+    if (octx->async_stage_load) {
+        {
+            std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+            octx->async_load_shutdown = true;
+        }
+        octx->async_load_cv.notify_all();
+        if (octx->async_load_worker.joinable()) {
+            octx->async_load_worker.join();
+        }
+    }
+    if (octx->soa_staging_last_use_ev) {
+        clWaitForEvents(1, &octx->soa_staging_last_use_ev);
+        clReleaseEvent(octx->soa_staging_last_use_ev);
+        octx->soa_staging_last_use_ev = nullptr;
+    }
+    if (octx->soa_staging) {
+        clReleaseMemObject(octx->soa_staging);
+        octx->n_releases += 1;
+        octx->soa_staging = nullptr;
+        octx->soa_staging_capacity = 0;
+    }
+    for (cl_event ev : octx->soa_staging_slot_last_use_ev) {
+        if (ev) {
+            clWaitForEvents(1, &ev);
+            clReleaseEvent(ev);
+        }
+    }
+    for (cl_mem mem : octx->soa_staging_slots) {
+        if (mem) {
+            clReleaseMemObject(mem);
+            octx->n_releases += 1;
+        }
+    }
+    octx->soa_staging_slots.clear();
+    octx->soa_staging_slot_capacity.clear();
+    octx->soa_staging_slot_last_use_ev.clear();
+    octx->soa_staging_next_slot = 0;
+    octx->soa_staging_current_slot = 0;
+
     // 释放 retain 模式下暂存的所有 cl_mem
     for (auto &kv : octx->retained_buffers_by_size) {
         for (void *p : kv.second) {
@@ -914,9 +1317,12 @@ void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     octx->retained_buffers_by_size.clear();
     octx->retain_order_sizes.clear();
     octx->cached_bytes = 0;
-    octx->host_staging_by_idx.clear();
-    octx->host_staging_pool_by_size.clear();
-    octx->host_staging_pool_order.clear();
+    {
+        std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
+        octx->host_staging_by_idx.clear();
+        octx->host_staging_pool_by_size.clear();
+        octx->host_staging_pool_order.clear();
+    }
     octx->host_staging_pool_bytes = 0;
     for (auto &b : octx->wbm->blocks) {
         // 清掉未消费的 in-flight prefetch（block 还没 resident 但已发 write）
@@ -957,8 +1363,21 @@ void wbmcl_shutdown(wbm_opencl_ctx *octx) {
 void wbmcl_register_soa(wbm_opencl_ctx *octx, int idx,
                         std::function<int()> evict_fn,
                         std::function<int()> reload_fn) {
+    wbmcl_register_soa_split(octx, idx, std::move(evict_fn), std::move(reload_fn), nullptr, nullptr);
+}
+
+void wbmcl_register_soa_split(wbm_opencl_ctx *octx, int idx,
+                              std::function<int()> evict_fn,
+                              std::function<int()> reload_fn,
+                              std::function<int()> transfer_fn,
+                              std::function<int()> xform_fn) {
     if (!octx) return;
-    octx->soa_per_idx[idx] = soa_callbacks{std::move(evict_fn), std::move(reload_fn)};
+    octx->soa_per_idx[idx] = soa_callbacks{
+        std::move(evict_fn),
+        std::move(reload_fn),
+        std::move(transfer_fn),
+        std::move(xform_fn),
+    };
 }
 
 }  // namespace elastic

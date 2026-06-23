@@ -128,6 +128,7 @@ class SolverHTTPServer(ThreadingHTTPServer):
                 allow_cpu_fallback=bool(req.get("allow_cpu_fallback", self.args.allow_cpu_fallback)),
                 transition_weight=float(req.get("transition_weight", self.args.transition_weight)),
                 disk_reload_multiplier=float(req.get("disk_reload_multiplier", self.args.disk_reload_multiplier)),
+                disk_gpu_reload_multiplier=float(req.get("disk_gpu_reload_multiplier", self.args.disk_gpu_reload_multiplier)),
                 overlap_model=str(req.get("overlap_model", self.args.overlap_model)),
                 cp_objective=str(req.get("cp_objective", self.args.cp_objective)),
                 allowed_placements=str(req.get("allowed_placements", self.args.allowed_placements)),
@@ -157,8 +158,9 @@ def main() -> None:
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
-    ap.add_argument("--transition-weight", type=float, default=1.0)
+    ap.add_argument("--transition-weight", type=float, default=0.1)
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
+    ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
