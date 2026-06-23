@@ -1341,3 +1341,103 @@ margin=100 still avoids movement:
     but it starts to lose speed, consistent with keeping a lower-budget plan
     longer than necessary.
 ```
+
+## Cross-trace 60-second A/B
+
+Artifact:
+
+```text
+.wiki/elastic_memory/incremental_plan_diff/artifacts/cross_trace_9g_keep50_prewarm_60s
+```
+
+Settings:
+
+```text
+traces:                  trace_01_user_147, trace_05_user_74, trace_06_user_204
+source window:           runner-selected lowest 180 s window
+bench seconds:           60 s
+cooldown target:         42 C
+candidate_min_distance:  32
+transition_weight:       0.5
+keep_current_margin:     50 ms
+candidate prewarm:       on
+candidate event logs:    off
+```
+
+Results:
+
+```text
+trace_01_user_147:
+    window min/mean/max:      3752.1 / 4451.9 / 4809.4 MiB
+
+    offline:
+        raw ms/token:          381.71
+        exec ms/token:         442.74
+        apply_count:           8
+        planned load/xform:    187 / 187
+        direct_read:           7583.73 ms, 187 calls, 5602.5 MiB
+
+    candidate-select:
+        raw ms/token:          257.27
+        exec ms/token:         265.60
+        online calls:          8
+        apply_count:           3
+        planned load/xform:    73 / 73
+        direct_read:           1353.08 ms, 73 calls, 2166.8 MiB
+
+trace_05_user_74:
+    window min/mean/max:      4695.1 / 5174.6 / 6487.4 MiB
+
+    offline:
+        raw ms/token:          200.31
+        exec ms/token:         203.29
+        apply_count:           8
+        planned load/xform:    52 / 52
+        direct_read:           1017.08 ms, 150 calls, 2133.0 MiB
+
+    candidate-select:
+        raw ms/token:          175.52
+        exec ms/token:         177.28
+        online calls:          4
+        apply_count:           2
+        planned load/xform:    19 / 19
+        direct_read:           417.69 ms, 19 calls, 501.8 MiB
+
+trace_06_user_204:
+    window min/mean/max:      4781.0 / 5171.9 / 6427.0 MiB
+
+    offline:
+        raw ms/token:          198.62
+        exec ms/token:         200.16
+        apply_count:           3
+        planned load/xform:    19 / 19
+        direct_read:           458.53 ms, 70 calls, 960.8 MiB
+
+    candidate-select:
+        raw ms/token:          197.66
+        exec ms/token:         198.83
+        online calls:          3
+        apply_count:           2
+        planned load/xform:    12 / 12
+        direct_read:           402.16 ms, 63 calls, 837.0 MiB
+```
+
+Interpretation:
+
+```text
+The benefit scales with how much unnecessary movement offline performs:
+
+    trace_01:
+        large memory pressure and many budget changes.  Online avoids most
+        movement and substantially improves speed.
+
+    trace_05:
+        moderate pressure.  Online still reduces movement and improves speed.
+
+    trace_06:
+        high-budget window with little movement.  Online mostly matches offline
+        speed while still reducing apply/load/xform counts.
+
+This supports the broader claim that incremental planning is most valuable
+when budget-optimal offline switching creates redundant materialization.
+```
