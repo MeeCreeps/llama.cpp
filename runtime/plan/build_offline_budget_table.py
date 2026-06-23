@@ -48,6 +48,10 @@ def main() -> None:
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
+    ap.add_argument("--top-k", type=int, default=1,
+                    help="number of diverse candidate plans to preserve per budget")
+    ap.add_argument("--candidate-placement-specs", default="",
+                    help="semicolon-separated allowed-placement specs used to diversify candidates")
     ap.add_argument("--chain-state", action="store_true",
                     help="build each budget using the previous lower-budget plan as current state")
     args = ap.parse_args()
@@ -62,8 +66,18 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="offline_chain_state_") as td:
         prev_state: Path | None = None
+        placement_specs = [s.strip() for s in args.candidate_placement_specs.split(";") if s.strip()]
+        if not placement_specs:
+            placement_specs = [
+                args.allowed_placements,
+                "cpu,gpu,disk_gpu",
+                "cpu,gpu,disk_cpu",
+                "gpu,disk_gpu",
+                "cpu,disk_cpu",
+            ]
         for b in budgets:
-            out = args.out_dir / f"plan_{b}MiB.json"
+            candidates = []
+            n_candidates = max(1, args.top_k)
             cmd = [
                 sys.executable,
                 str(solver),
@@ -80,22 +94,36 @@ def main() -> None:
                 "--disk-gpu-reload-multiplier", str(args.disk_gpu_reload_multiplier),
                 "--overlap-model", str(args.overlap_model),
                 "--cp-objective", str(args.cp_objective),
-                "--allowed-placements", str(args.allowed_placements),
-                "--out", str(out),
             ]
             if args.chain_state and prev_state is not None:
                 cmd.extend(["--state", str(prev_state)])
             if args.allow_cpu_fallback:
                 cmd.append("--allow-cpu-fallback")
-            subprocess.run(cmd, check=True)
-            index.append({"budget_mib": b, "file": out.name})
+            for k in range(n_candidates):
+                out = args.out_dir / (f"plan_{b}MiB.json" if k == 0 else f"plan_{b}MiB_cand{k}.json")
+                cand_cmd = list(cmd)
+                cand_cmd.extend([
+                    "--allowed-placements", placement_specs[k % len(placement_specs)],
+                    "--disk-gpu-reload-multiplier", str(args.disk_gpu_reload_multiplier * (1.0 + 0.20 * (k // len(placement_specs)))),
+                    "--out", str(out),
+                ])
+                subprocess.run(cand_cmd, check=True)
+                plan = json.loads(out.read_text())
+                candidates.append({
+                    "candidate_id": k,
+                    "file": out.name,
+                    "allowed_placements": placement_specs[k % len(placement_specs)],
+                    "pred_per_token_ms": plan.get("pred_per_token_ms", 0.0),
+                    "bottleneck": plan.get("bottleneck", ""),
+                })
+            index.append({"budget_mib": b, "file": candidates[0]["file"], "candidates": candidates})
             if args.chain_state:
                 next_state = Path(td) / f"state_{b}MiB.json"
-                plan_to_state(out, next_state)
+                plan_to_state(args.out_dir / candidates[0]["file"], next_state)
                 prev_state = next_state
 
-    (args.out_dir / "index.json").write_text(json.dumps({"index": index}, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"out_dir": str(args.out_dir), "plans": len(index)}, indent=2))
+    (args.out_dir / "index.json").write_text(json.dumps({"index": index, "top_k": max(1, args.top_k)}, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"out_dir": str(args.out_dir), "budgets": len(index), "top_k": max(1, args.top_k)}, indent=2))
 
 
 if __name__ == "__main__":

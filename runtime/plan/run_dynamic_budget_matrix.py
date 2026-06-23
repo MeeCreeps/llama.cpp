@@ -556,7 +556,7 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
             if "prepare" in stage_kinds or "all" in stage_kinds:
                 common.setdefault("GGML_ELASTIC_ASYNC_STAGE_PREPARE", "1")
                 common.setdefault("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE", "1")
-    if method in {"offline", "online", "mru"}:
+    if method in {"offline", "online", "mru", "candidate-select", "diff-graph-expand"}:
         common["GGML_ELASTIC_DYNAMIC"] = "1"
     if method == "offline":
         common["LLAMA_ELASTIC_DIR"] = args.phone_plan_dir
@@ -586,6 +586,27 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE_MISC_MB": str(args.misc_mib),
                 "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(effective_safety_mib),
                 "LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS": str(args.time_limit_ms),
+                "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
+                "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
+                "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
+                "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
+                "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
+                "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
+                "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
+            }
+        )
+    elif method in {"candidate-select", "diff-graph-expand"}:
+        common.update(
+            {
+                "LLAMA_ELASTIC_ONLINE": "1",
+                "LLAMA_ELASTIC_ONLINE_MODE": method,
+                "LLAMA_ELASTIC_CANDIDATE_DIR": args.phone_plan_dir,
+                "LLAMA_ELASTIC_MODEL_META": args.phone_model_meta,
+                "LLAMA_ELASTIC_COST_DIR": args.phone_cost_dir,
+                "LLAMA_ELASTIC_ONLINE_WORK_DIR": work_dir,
+                "LLAMA_ELASTIC_ONLINE_KV_MB": str(args.kv_mib),
+                "LLAMA_ELASTIC_ONLINE_MISC_MB": str(args.misc_mib),
+                "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(effective_safety_mib),
                 "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
                 "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
                 "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
@@ -638,7 +659,7 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
 
 
 def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[str] | None:
-    if "online" not in args.methods.split(","):
+    if "online" not in {m.strip() for m in args.methods.split(",") if m.strip()}:
         return None
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = log_path.open("w")
@@ -685,7 +706,7 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
 
 def methods_need_offline_table(methods: str) -> bool:
     selected = {m.strip() for m in methods.split(",") if m.strip()}
-    return bool(selected & {"offline", "static-min"})
+    return bool(selected & {"offline", "static-min", "candidate-select", "diff-graph-expand"})
 
 
 def stop_remote_server(args: argparse.Namespace, proc: subprocess.Popen[str] | None) -> None:
@@ -738,6 +759,10 @@ def main() -> None:
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu",
                     help="comma-separated solver placement choices")
+    ap.add_argument("--top-k", type=int, default=1,
+                    help="number of candidate plans per budget for candidate-select / diff-graph-expand")
+    ap.add_argument("--candidate-placement-specs", default="",
+                    help="semicolon-separated allowed-placement specs for offline candidate diversity")
     ap.add_argument("--use-interval-schedule", choices=("auto", "0", "1"), default="auto",
                     help="whether runtime uses schedule.events anchors; auto enables it for interval_makespan")
     ap.add_argument("--interval-stage-kinds", default="load,prepare",
@@ -841,7 +866,11 @@ def main() -> None:
             str(args.cp_objective),
             "--allowed-placements",
             str(args.allowed_placements),
+            "--top-k",
+            str(args.top_k),
         ]
+        if args.candidate_placement_specs:
+            cmd.extend(["--candidate-placement-specs", str(args.candidate_placement_specs)])
         if args.offline_chain_state:
             cmd.append("--chain-state")
         if not args.dry_run:
@@ -905,7 +934,7 @@ def main() -> None:
                 if (t.local.name, method) in completed:
                     print(f"=== skip existing trace={t.local.name} method={method} ===", flush=True)
                     continue
-                if method in {"online", "mru"} and not args.dry_run:
+                if method in {"online", "mru", "candidate-select", "diff-graph-expand"} and not args.dry_run:
                     adb_shell_retry(
                         args.adb_serial,
                         f"rm -rf {shell_quote(work)} && mkdir -p {shell_quote(work)}",

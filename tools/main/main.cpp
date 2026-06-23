@@ -119,6 +119,7 @@ struct elastic_online_solver_state {
     std::string remote_url;
     std::string model_meta_path;
     std::string cost_dir;
+    std::string candidate_dir;
     std::string work_dir;
     int kv_mib = 128;
     int misc_mib = 256;
@@ -330,6 +331,154 @@ static bool elastic_allowed_placement_has(const std::string & spec, const std::s
         pos = comma + 1;
     }
     return false;
+}
+
+static double elastic_candidate_transition_cost(elastic_online_solver_state * s, const nlohmann::json & plan,
+                                                double * load_mb, double * prepare_mb, double * evict_mb,
+                                                int * changed_weights) {
+    double cost = 0.0;
+    if (load_mb) *load_mb = 0.0;
+    if (prepare_mb) *prepare_mb = 0.0;
+    if (evict_mb) *evict_mb = 0.0;
+    if (changed_weights) *changed_weights = 0;
+
+    for (const auto & w : plan.value("weights", nlohmann::json::array())) {
+        const std::string name = w.value("name", std::string());
+        if (name.empty() || w.value("pinned", false)) continue;
+        const size_t bytes = (size_t) w.value("byte_size", 0);
+        const double mb = bytes / 1024.0 / 1024.0;
+        const std::string loc = w.value("location", std::string("disk"));
+
+        llama_elastic_weight_state st{};
+        if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) {
+            st.flags = 0;
+        }
+
+        if (loc == "gpu") {
+            if (!elastic_state_has(st.flags, "GPU")) {
+                cost += elastic_gpu_reload_cost(s, name, bytes);
+                if (load_mb) *load_mb += mb;
+                if (prepare_mb) *prepare_mb += mb;
+                if (changed_weights) (*changed_weights)++;
+            }
+        } else if (loc == "cpu") {
+            if (!elastic_state_has(st.flags, "CPU")) {
+                cost += elastic_stage_cost(s, "CPU_Elastic", "LOAD", name, bytes);
+                cost += elastic_stage_cost(s, "CPU_Elastic", "XFORM", name, bytes);
+                if (load_mb) *load_mb += mb;
+                if (prepare_mb) *prepare_mb += mb;
+                if (changed_weights) (*changed_weights)++;
+            }
+        } else {
+            if (elastic_state_any_resident(st.flags)) {
+                const bool gpu = elastic_state_has(st.flags, "GPU");
+                cost += elastic_stage_cost(s, gpu ? "OpenCL" : "CPU_Elastic", "EVICT", name, bytes);
+                if (evict_mb) *evict_mb += mb;
+                if (changed_weights) (*changed_weights)++;
+            }
+        }
+    }
+    return cost;
+}
+
+static bool elastic_online_generate_candidate_select(elastic_online_solver_state * s, int64_t budget_mib,
+                                                     const std::string & plan_path) {
+    if (!s || s->candidate_dir.empty()) return false;
+
+    std::ifstream idxf(s->candidate_dir + "/index.json");
+    if (!idxf) {
+        LOG_ERR("[elastic-candidate] failed to open index %s/index.json\n", s->candidate_dir.c_str());
+        return false;
+    }
+    nlohmann::json idx;
+    idxf >> idx;
+
+    nlohmann::json best_row;
+    bool have_row = false;
+    int64_t best_budget = std::numeric_limits<int64_t>::min();
+    const nlohmann::json rows = idx.value("index", nlohmann::json::array());
+    for (const auto & row : rows) {
+        const int64_t b = row.value("budget_mib", 0);
+        if (b <= budget_mib && b > best_budget) {
+            best_budget = b;
+            best_row = row;
+            have_row = true;
+        }
+    }
+    if (!have_row) {
+        for (const auto & row : rows) {
+            const int64_t b = row.value("budget_mib", 0);
+            if (!have_row || b < best_budget) {
+                best_budget = b;
+                best_row = row;
+                have_row = true;
+            }
+        }
+    }
+    if (!have_row) return false;
+
+    nlohmann::json candidates = best_row.value("candidates", nlohmann::json::array());
+    if (candidates.empty()) {
+        candidates.push_back({{"candidate_id", 0}, {"file", best_row.value("file", std::string())}});
+    }
+
+    double best_score = std::numeric_limits<double>::infinity();
+    double best_transition = 0.0;
+    double best_load_mb = 0.0;
+    double best_prepare_mb = 0.0;
+    double best_evict_mb = 0.0;
+    int best_changed = 0;
+    int best_cid = -1;
+    std::string best_file;
+    nlohmann::json best_plan;
+
+    for (const auto & cand : candidates) {
+        const std::string file = cand.value("file", std::string());
+        if (file.empty()) continue;
+        std::ifstream pf(s->candidate_dir + "/" + file);
+        if (!pf) continue;
+        nlohmann::json plan;
+        pf >> plan;
+        double load_mb = 0.0, prepare_mb = 0.0, evict_mb = 0.0;
+        int changed = 0;
+        const double transition = elastic_candidate_transition_cost(s, plan, &load_mb, &prepare_mb, &evict_mb, &changed);
+        const double steady = plan.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
+        const double score = steady + s->transition_weight * transition;
+        if (score < best_score) {
+            best_score = score;
+            best_transition = transition;
+            best_load_mb = load_mb;
+            best_prepare_mb = prepare_mb;
+            best_evict_mb = evict_mb;
+            best_changed = changed;
+            best_cid = cand.value("candidate_id", -1);
+            best_file = file;
+            best_plan = std::move(plan);
+        }
+    }
+    if (best_plan.is_null()) return false;
+
+    best_plan["online_selection"] = {
+        {"mode", s->mode},
+        {"source_budget_mib", best_budget},
+        {"candidate_id", best_cid},
+        {"candidate_file", best_file},
+        {"score_ms", best_score},
+        {"transition_ms", best_transition},
+        {"transition_weight", s->transition_weight},
+        {"diff_changed_weights", best_changed},
+        {"diff_load_mb", best_load_mb},
+        {"diff_prepare_mb", best_prepare_mb},
+        {"diff_evict_mb", best_evict_mb},
+    };
+
+    std::ofstream out(plan_path);
+    if (!out) return false;
+    out << best_plan.dump(2) << "\n";
+    LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
+            (long long) budget_mib, (long long) best_budget, best_cid, best_file.c_str(),
+            best_score, best_transition, best_changed, best_load_mb, best_prepare_mb, best_evict_mb);
+    return out.good();
 }
 
 static bool elastic_online_generate_native(elastic_online_solver_state * s, int64_t budget_mib, const std::string & plan_path) {
@@ -621,6 +770,13 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
         s->remote_server_ms_total += server_ms;
         LOG_INF("[elastic-online] remote budget=%lld remote_wall_ms=%.3f server_solve_ms=%.3f\n",
                 (long long) budget_mib, remote_wall_ms, server_ms);
+    } else if (s->mode == "candidate-select" || s->mode == "diff-graph-expand") {
+        if (!elastic_online_generate_candidate_select(s, budget_mib, plan_path)) {
+            s->failures++;
+            LOG_ERR("[elastic-online] candidate selector failed budget=%lld dir=%s\n",
+                    (long long) budget_mib, s->candidate_dir.c_str());
+            return nullptr;
+        }
     } else {
         if (!elastic_online_generate_native(s, budget_mib, plan_path)) {
             s->failures++;
@@ -803,6 +959,7 @@ int main(int argc, char ** argv) {
         online.remote_url = std::getenv("LLAMA_ELASTIC_ONLINE_REMOTE_URL") ? std::getenv("LLAMA_ELASTIC_ONLINE_REMOTE_URL") : "";
         online.model_meta_path = std::getenv("LLAMA_ELASTIC_MODEL_META") ? std::getenv("LLAMA_ELASTIC_MODEL_META") : "";
         online.cost_dir = std::getenv("LLAMA_ELASTIC_COST_DIR") ? std::getenv("LLAMA_ELASTIC_COST_DIR") : "";
+        online.candidate_dir = std::getenv("LLAMA_ELASTIC_CANDIDATE_DIR") ? std::getenv("LLAMA_ELASTIC_CANDIDATE_DIR") : "";
         online.work_dir = std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") ? std::getenv("LLAMA_ELASTIC_ONLINE_WORK_DIR") : "/data/local/tmp/elastic/online";
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_KV_MB")) online.kv_mib = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_MISC_MB")) online.misc_mib = std::atoi(e);

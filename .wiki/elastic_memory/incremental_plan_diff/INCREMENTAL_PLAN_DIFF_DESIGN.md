@@ -501,3 +501,64 @@ load/prepare/evict bytes caused by accepted diffs
 
 This instrumentation is essential for showing that the method is not just
 faster, but is making interpretable residency-aware decisions.
+
+## Implementation Status
+
+Initial implementation:
+
+```text
+commit base:
+    705d8f014 elastic: save pipeline runtime and incremental diff design
+
+offline builder:
+    runtime/plan/build_offline_budget_table.py
+
+new options:
+    --top-k
+    --candidate-placement-specs
+
+index format:
+    index.json keeps the legacy `file` field and adds `candidates`.
+```
+
+Runtime support:
+
+```text
+LLAMA_ELASTIC_ONLINE_MODE=candidate-select
+LLAMA_ELASTIC_CANDIDATE_DIR=<plan-table-dir>
+```
+
+The first runtime selector:
+
+```text
+1. reads candidates for the current budget bucket
+2. evaluates transition_cost(S_runtime -> P_candidate)
+3. scores steady_cost + transition_weight * transition_cost
+4. writes selected plan into the normal online work directory
+5. attaches `online_selection` metadata to the generated plan
+```
+
+The `diff-graph-expand` mode is wired to the same selector as a placeholder for
+the next stage.  The current implementation records aggregate diff statistics
+but does not yet accept/reject subgraphs independently.
+
+Smoke artifact:
+
+```text
+.wiki/elastic_memory/incremental_plan_diff/artifacts/candidate_select_smoke_10s_v2
+```
+
+Smoke result:
+
+```text
+method             status   rc   generated tokens   raw ms/token
+candidate-select   ok       0    7                  1662.94
+```
+
+The log confirms runtime candidate selection without remote CP-SAT:
+
+```text
+[elastic-candidate] budget=4096 table_budget=4096 candidate=0
+score=516.315 transition=89.562 changed=100
+load=112.5MB prepare=112.5MB evict=828.0MB
+```
