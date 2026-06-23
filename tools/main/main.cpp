@@ -127,7 +127,9 @@ struct elastic_online_solver_state {
     std::unordered_map<std::string, nlohmann::json> candidate_plan_cache;
     std::unordered_map<std::string, llama_plan *> candidate_loaded_plan_cache;
     std::unordered_map<std::string, double> cost_cache;
+    std::unordered_set<std::string> keep_current_fast_cache;
     bool log_candidate_scores = false;
+    bool log_candidate_events = true;
     std::string last_candidate_file;
     int64_t last_candidate_budget_mib = 0;
     double keep_current_margin_ms = 0.0;
@@ -713,6 +715,54 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     int best_cid = -1;
     std::string best_file;
     nlohmann::json best_plan;
+
+    if (s->mode == "candidate-select" && s->keep_current_margin_ms > 0.0 &&
+        !s->last_candidate_file.empty() && s->last_candidate_budget_mib > 0 &&
+        s->last_candidate_budget_mib <= budget_mib) {
+        const auto keep_it = s->candidate_plan_cache.find(s->last_candidate_file);
+        if (keep_it != s->candidate_plan_cache.end()) {
+            const std::string keep_key = s->last_candidate_file + "|" + std::to_string((long long) budget_mib);
+            const double keep_steady = keep_it->second.value("pred_per_token_ms", std::numeric_limits<double>::infinity());
+            if (s->keep_current_fast_cache.find(keep_key) != s->keep_current_fast_cache.end()) {
+                if (selected_file) *selected_file = s->last_candidate_file;
+                if (s->log_candidate_events) {
+                    LOG_INF("[elastic-candidate-keep] budget=%lld keep_budget=%lld file=%s keep_steady=%.3f margin=%.3f best_candidate_score=%.3f cached=1\n",
+                            (long long) budget_mib, (long long) s->last_candidate_budget_mib,
+                            s->last_candidate_file.c_str(), keep_steady, s->keep_current_margin_ms,
+                            keep_steady);
+                    LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
+                            (long long) budget_mib, (long long) s->last_candidate_budget_mib, -2,
+                            s->last_candidate_file.c_str(), keep_steady, 0.0, 0, 0.0, 0.0, 0.0);
+                }
+                return true;
+            }
+            double best_steady = std::numeric_limits<double>::infinity();
+            for (const auto & cand : candidates) {
+                const std::string file = cand.value("file", std::string());
+                if (file.empty()) continue;
+                const auto it = s->candidate_plan_cache.find(file);
+                if (it == s->candidate_plan_cache.end()) continue;
+                const double steady = it->second.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
+                best_steady = std::min(best_steady, steady);
+            }
+            if (std::isfinite(keep_steady) && std::isfinite(best_steady) &&
+                keep_steady <= best_steady + s->keep_current_margin_ms) {
+                s->keep_current_fast_cache.insert(keep_key);
+                if (selected_file) *selected_file = s->last_candidate_file;
+                if (s->log_candidate_events) {
+                    LOG_INF("[elastic-candidate-keep] budget=%lld keep_budget=%lld file=%s keep_steady=%.3f margin=%.3f best_candidate_score=%.3f fast=1\n",
+                            (long long) budget_mib, (long long) s->last_candidate_budget_mib,
+                            s->last_candidate_file.c_str(), keep_steady, s->keep_current_margin_ms,
+                            best_steady);
+                    LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
+                            (long long) budget_mib, (long long) s->last_candidate_budget_mib, -2,
+                            s->last_candidate_file.c_str(), keep_steady, 0.0, 0, 0.0, 0.0, 0.0);
+                }
+                return true;
+            }
+        }
+    }
+
     const auto state_flags = elastic_snapshot_weight_flags(s);
 
     for (const auto & cand : candidates) {
@@ -751,9 +801,11 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         s->last_candidate_budget_mib <= budget_mib) {
         const auto keep_it = s->candidate_plan_cache.find(s->last_candidate_file);
         if (keep_it != s->candidate_plan_cache.end()) {
+            const std::string keep_key = s->last_candidate_file + "|" + std::to_string((long long) budget_mib);
             const double keep_steady = keep_it->second.value("pred_per_token_ms", std::numeric_limits<double>::infinity());
             const double candidate_score = best_score;
             if (keep_steady <= best_score + s->keep_current_margin_ms) {
+                s->keep_current_fast_cache.insert(keep_key);
                 best_score = keep_steady;
                 best_transition = 0.0;
                 best_load_mb = 0.0;
@@ -764,10 +816,12 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
                 best_file = s->last_candidate_file;
                 best_budget = s->last_candidate_budget_mib;
                 best_plan = keep_it->second;
-                LOG_INF("[elastic-candidate-keep] budget=%lld keep_budget=%lld file=%s keep_steady=%.3f margin=%.3f best_candidate_score=%.3f\n",
-                        (long long) budget_mib, (long long) s->last_candidate_budget_mib,
-                        s->last_candidate_file.c_str(), keep_steady, s->keep_current_margin_ms,
-                        candidate_score);
+                if (s->log_candidate_events) {
+                    LOG_INF("[elastic-candidate-keep] budget=%lld keep_budget=%lld file=%s keep_steady=%.3f margin=%.3f best_candidate_score=%.3f\n",
+                            (long long) budget_mib, (long long) s->last_candidate_budget_mib,
+                            s->last_candidate_file.c_str(), keep_steady, s->keep_current_margin_ms,
+                            candidate_score);
+                }
             }
         }
     }
@@ -800,9 +854,11 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         out << best_plan.dump() << "\n";
         if (!out.good()) return false;
     }
-    LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
-            (long long) budget_mib, (long long) best_budget, best_cid, best_file.c_str(),
-            best_score, best_transition, best_changed, best_load_mb, best_prepare_mb, best_evict_mb);
+    if (s->log_candidate_events) {
+        LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
+                (long long) budget_mib, (long long) best_budget, best_cid, best_file.c_str(),
+                best_score, best_transition, best_changed, best_load_mb, best_prepare_mb, best_evict_mb);
+    }
     if (s->mode == "candidate-select") {
         s->last_candidate_file = best_file;
         s->last_candidate_budget_mib = best_budget;
@@ -1114,12 +1170,14 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
         }
         const auto t1 = std::chrono::steady_clock::now();
         const double gen_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        LOG_INF("[elastic-online] budget=%lld selected %s mode=%s gen_ms=%.3f weights=%d ops=%d calls=%llu failures=%llu\n",
-                (long long) budget_mib, selected_file.c_str(),
-                s->mode.c_str(), gen_ms,
-                llama_plan_n_weights(plan), llama_plan_n_ops(plan),
-                (unsigned long long) s->calls,
-                (unsigned long long) s->failures);
+        if (s->log_candidate_events) {
+            LOG_INF("[elastic-online] budget=%lld selected %s mode=%s gen_ms=%.3f weights=%d ops=%d calls=%llu failures=%llu\n",
+                    (long long) budget_mib, selected_file.c_str(),
+                    s->mode.c_str(), gen_ms,
+                    llama_plan_n_weights(plan), llama_plan_n_ops(plan),
+                    (unsigned long long) s->calls,
+                    (unsigned long long) s->failures);
+        }
         return plan;
     } else if (s->mode == "diff-graph-expand") {
         std::string selected_file;
@@ -1322,6 +1380,7 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_SCORES")) online.log_candidate_scores = std::atoi(e) != 0;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_EVENTS")) online.log_candidate_events = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_KEEP_CURRENT_MARGIN_MS")) online.keep_current_margin_ms = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;

@@ -1621,6 +1621,11 @@ void llama_context::maybe_apply_plan() {
         elastic_pending_budget_hits = 0;
         return;
     }
+    if (elastic_last_applied && elastic_last_provider_plan == elastic_last_applied &&
+        elastic_last_provider_budget_mib == B &&
+        (!callback_no_cache || !callback_apply_same_budget)) {
+        return;
+    }
 
     // Budget traces can oscillate around adjacent buckets. Re-applying a plan
     // invalidates the graph and may schedule reload/xform work, so require the
@@ -1671,16 +1676,24 @@ void llama_context::maybe_apply_plan() {
                        (int) p->timeline.size(), (int) p->schedule_events.size(), provider_get_ms);
     }
     // 指针相同(table 同档同指针) 或 provider 量化到同 budget 档时,只更新指针。
-    if (p == elastic_last_applied) return;
+    if (p == elastic_last_applied) {
+        elastic_last_provider_budget_mib = B;
+        elastic_last_provider_plan = p;
+        return;
+    }
     if (elastic_last_applied && p->budget_mib == elastic_last_applied->budget_mib &&
         (!callback_no_cache || !callback_apply_same_budget)) {
         elastic_last_applied = p;  // 认作同档,只更新指针,不重 apply
+        elastic_last_provider_budget_mib = B;
+        elastic_last_provider_plan = p;
         return;
     }
     const uint64_t sig = elastic_plan_signature(*p);
     if (elastic_last_applied && sig == elastic_last_plan_signature &&
         (!callback_no_cache || !callback_apply_same_budget)) {
         elastic_last_applied = p;
+        elastic_last_provider_budget_mib = B;
+        elastic_last_provider_plan = p;
         LLAMA_LOG_INFO("%s: budget=%lldMiB → plan(budget_mib=%lld) execution-equivalent, skipped apply provider_get_ms=%.3f\n",
                        __func__, (long long) B, (long long) p->budget_mib, provider_get_ms);
         return;
@@ -1691,6 +1704,8 @@ void llama_context::maybe_apply_plan() {
     const double apply_ms = std::chrono::duration<double, std::milli>(t_apply1 - t_apply0).count();
     elastic_last_applied = p;
     elastic_last_plan_signature = sig;
+    elastic_last_provider_budget_mib = B;
+    elastic_last_provider_plan = p;
     elastic_last_switch_decode_step = decode_step;
     elastic_pending_budget_mib = -1;
     elastic_pending_budget_hits = 0;
@@ -3833,6 +3848,8 @@ int llama_context::elastic_enable(const char * provider_kind, const char * plans
     }
     elastic_enabled = true;
     elastic_last_applied = nullptr;
+    elastic_last_provider_plan = nullptr;
+    elastic_last_provider_budget_mib = -1;
     LLAMA_LOG_INFO("%s: elastic enabled (provider=%s)\n", __func__, kind.c_str());
     return 0;
 }

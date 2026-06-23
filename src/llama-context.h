@@ -333,7 +333,9 @@ private:
     std::unique_ptr<elastic::PlanProvider> elastic_provider;   // dynamic 模式
     const elastic::ExecPlan * elastic_plan         = nullptr;  // 当前已 apply(不拥有)
     const elastic::ExecPlan * elastic_last_applied = nullptr;  // online loop 指针比较用
+    const elastic::ExecPlan * elastic_last_provider_plan = nullptr; // provider returned this plan for this budget
     uint64_t elastic_last_plan_signature = 0;                  // execution-equivalence debounce
+    int64_t  elastic_last_provider_budget_mib = -1;            // raw/effective budget for provider-result cache
     int64_t  elastic_pending_budget_mib  = -1;                 // budget switch hysteresis candidate
     int      elastic_pending_budget_hits = 0;                  // consecutive decode ticks at candidate budget
     int64_t  elastic_effective_budget_mib = -1;                // optional slew-limited budget for online planning

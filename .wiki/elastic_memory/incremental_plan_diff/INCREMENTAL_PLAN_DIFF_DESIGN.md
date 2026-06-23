@@ -987,3 +987,82 @@ This is only a 60-second smoke run and not a cooled A/B comparison.  The next
 step is to sweep keep_margin_ms in {25, 50, 100, 150} and compare against
 offline on the same trace with cooldown/randomized order.
 ```
+
+## Provider-cache refinement
+
+The sticky branch exposed a second overhead source.  Even when the selected
+plan remains unchanged, the runtime used to call the online provider every
+token whenever:
+
+```text
+raw/effective budget B != applied_plan.budget_mib
+```
+
+This happens naturally with sticky keep:
+
+```text
+current raw budget: 4608 / 4864 / ...
+applied plan:       4352
+decision:           keep 4352 because transition is not worth it
+```
+
+The old context-level cache only skipped provider calls when `B` matched the
+applied plan's own budget.  The refinement adds a provider-result cache:
+
+```text
+if provider(B) previously returned the currently applied plan:
+    skip provider(B) on the next token with the same B
+```
+
+This keeps the online decision exact at the first occurrence of a budget, but
+avoids repeatedly proving the same keep decision while the budget remains
+unchanged.
+
+Additional runtime knob:
+
+```text
+LLAMA_ELASTIC_CANDIDATE_LOG_EVENTS=0
+```
+
+This disables per-budget candidate event logs for production-speed runs.  The
+default remains enabled for debugging and summary scripts.
+
+Short A/B on the same 60-second oscillating window:
+
+```text
+trace:
+    trace_06_user_204_10min_x1.csv
+
+offline:
+    raw ms/token:          224.79
+    exec ms/token:         243.08
+    provider_get_ms_total: 36.00
+    apply_count:           15
+    planned load/xform:    208 / 208
+    direct_read:           4315.24 ms, 257 calls, 6507.0 MiB
+
+candidate-select:
+    transition_weight:     0.5
+    keep_current_margin:   50 ms
+    provider result cache: on
+    candidate event logs:  off
+    raw ms/token:          224.08
+    exec ms/token:         228.61
+    provider_get_ms_total: 143.96
+    online calls:          13
+    apply_count:           2
+    planned load/xform:    34 / 34
+    direct_read:           961.38 ms, 34 calls, 1012.5 MiB
+```
+
+Interpretation:
+
+```text
+The online plan is now slightly faster on raw ms/token in this short run, and
+clearly faster on execution-side ms/token.  It also reduces materialization
+work by roughly 6x and direct-read volume by roughly 6.4x.
+
+The remaining provider time is dominated by the first few calls, which still
+load/cache candidate plan data lazily.  A future improvement is to prewarm the
+candidate table before timed decode starts.
+```
