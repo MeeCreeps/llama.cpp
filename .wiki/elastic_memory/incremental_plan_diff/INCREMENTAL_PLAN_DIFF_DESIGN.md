@@ -1441,3 +1441,112 @@ The benefit scales with how much unnecessary movement offline performs:
 This supports the broader claim that incremental planning is most valuable
 when budget-optimal offline switching creates redundant materialization.
 ```
+
+## Final 60-second baseline matrix
+
+Artifacts:
+
+```text
+.wiki/elastic_memory/incremental_plan_diff/artifacts/final_cross_trace_mixed_baselines_60s
+.wiki/elastic_memory/incremental_plan_diff/artifacts/final_cross_trace_mru_cpu_60s
+.wiki/elastic_memory/incremental_plan_diff/artifacts/final_oscillating_mixed_baselines_60s
+.wiki/elastic_memory/incremental_plan_diff/artifacts/final_oscillating_mru_cpu_60s
+```
+
+Common settings:
+
+```text
+device:                  OP12, adb serial 5ae7a43d
+model:                   Meta-Llama-3-8B-Instruct.Q4_0.gguf
+context / batch:          -c 4096 -b 32 -ub 32
+decode window:            60 s measured decode
+trace replay:             180 s trace window, replay speedup 1
+bucket size:              256 MiB
+kv / misc / safety:       512 / 256 / 474 MiB
+cooldown target:          42 C before every run
+offline/candidate plans:  top-k=4, min-distance=32
+candidate policy:         keep_current_margin=50 ms, prewarm on, event logs off
+MRU policy:               cpu,disk_cpu only
+online CP-SAT:            remote solve, solver time excluded from exec ms/token
+```
+
+The `raw ms/token` column is the end-to-end decode speed from llama.cpp timing.
+The `exec ms/token` column subtracts planner provider time in the runner.  For
+old online CP-SAT, this makes the speed comparable to prior reports where solve
+time is not charged to decode; the solve overhead is shown separately in
+`provider ms total` and `remote wall ms`.  For candidate-select, `provider
+ms/call` is the online candidate decision latency.
+
+| trace | method | raw ms/tok | exec ms/tok | tokens | provider ms total | provider ms/call | remote wall ms | calls | apply | load/xform | read MB | min/mean/max MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| oscillating trace06 | static-min | 1965.8 | 1965.8 | 31 | 0.00 |  | 0.0 |  | 0 | 39/39 | 1147.5 | 4008.2/4615.7/5705.9 |
+| oscillating trace06 | mru-cpu | 2143.5 | 2143.6 | 28 | 38.89 | 12.96 | 0.0 | 3 | 3 | 0/0 | 9315.0 | 4008.2/4615.7/5705.9 |
+| oscillating trace06 | offline | 271.8 | 294.9 | 212 | 37.55 |  | 0.0 |  | 15 | 208/208 | 6507.0 | 4008.2/4615.7/5705.9 |
+| oscillating trace06 | candidate-select | 207.7 | 211.5 | 286 | 29.72 | 2.29 | 0.0 | 13 | 2 | 34/34 | 1012.5 | 4008.2/4615.7/5705.9 |
+| oscillating trace06 | online CP-SAT | 183.6 | 141.1 | 223 | 14970.36 | 787.91 | 14467.3 | 19 | 19 | 305/400 | 6581.2 | 4008.2/4615.7/5705.9 |
+| trace_01_user_147 | static-min | 3705.6 | 3705.6 | 17 | 0.00 |  | 0.0 |  | 0 | 46/46 | 1404.0 | 3752.1/4451.9/4809.4 |
+| trace_01_user_147 | mru-cpu | 2582.5 | 2580.7 | 24 | 81.69 | 13.62 | 0.0 | 6 | 6 | 0/0 | 15417.0 | 3752.1/4451.9/4809.4 |
+| trace_01_user_147 | offline | 356.9 | 395.5 | 160 | 33.96 |  | 0.0 |  | 8 | 187/187 | 5602.5 | 3752.1/4451.9/4809.4 |
+| trace_01_user_147 | candidate-select | 288.3 | 298.7 | 202 | 49.66 | 6.21 | 0.0 | 8 | 3 | 73/73 | 2166.8 | 3752.1/4451.9/4809.4 |
+| trace_01_user_147 | online CP-SAT | 194.1 | 191.7 | 249 | 6807.77 | 756.42 | 6555.2 | 9 | 9 | 216/264 | 6480.0 | 3752.1/4451.9/4809.4 |
+| trace_05_user_74 | static-min | 199.5 | 199.5 | 301 | 0.00 |  | 0.0 |  | 0 | 12/12 | 378.0 | 4695.1/5174.6/6487.4 |
+| trace_05_user_74 | mru-cpu | 962.2 | 961.3 | 63 | 74.30 | 12.38 | 0.0 | 6 | 6 | 0/0 | 3181.5 | 4695.1/5174.6/6487.4 |
+| trace_05_user_74 | offline | 193.9 | 199.0 | 302 | 26.53 |  | 0.0 |  | 8 | 52/52 | 2133.0 | 4695.1/5174.6/6487.4 |
+| trace_05_user_74 | candidate-select | 173.6 | 175.1 | 343 | 23.37 | 5.84 | 0.0 | 4 | 2 | 19/19 | 501.8 | 4695.1/5174.6/6487.4 |
+| trace_05_user_74 | online CP-SAT | 186.8 | 171.0 | 287 | 5951.82 | 743.98 | 5723.9 | 8 | 8 | 128/156 | 1516.5 | 4695.1/5174.6/6487.4 |
+| trace_06_user_204 | static-min | 192.2 | 192.2 | 312 | 0.00 |  | 0.0 |  | 0 | 12/12 | 378.0 | 4781.0/5171.9/6427.0 |
+| trace_06_user_204 | mru-cpu | 804.6 | 804.2 | 75 | 27.28 | 13.64 | 0.0 | 2 | 2 | 0/0 | 378.0 | 4781.0/5171.9/6427.0 |
+| trace_06_user_204 | offline | 179.2 | 180.6 | 332 | 24.88 |  | 0.0 |  | 3 | 19/19 | 960.8 | 4781.0/5171.9/6427.0 |
+| trace_06_user_204 | candidate-select | 215.2 | 216.5 | 277 | 31.29 | 10.43 | 0.0 | 3 | 2 | 12/12 | 837.0 | 4781.0/5171.9/6427.0 |
+| trace_06_user_204 | online CP-SAT | 201.9 | 197.0 | 287 | 2189.52 | 729.84 | 2104.5 | 3 | 3 | 81/86 | 641.2 | 4781.0/5171.9/6427.0 |
+
+Summary:
+
+```text
+oscillating trace06:
+    candidate-select is 1.43x faster than offline by exec ms/token
+    and uses only 34 load/xform operations instead of 208.  It is still
+    slower than online CP-SAT's decode-only number, but candidate selection
+    takes only 2.29 ms/call instead of about 788 ms/call.
+
+trace_05_user_74:
+    candidate-select is 1.14x faster than offline by exec ms/token and is
+    close to online CP-SAT decode-only speed.  It is also faster than online
+    in raw wall timing because no solver wall time is paid.
+
+trace_01_user_147:
+    candidate-select is 1.32x faster than offline and far faster than MRU/static.
+    However, it is not close to online CP-SAT.  The current plan-level candidate
+    selector reduces movement from 187 to 73 load/xform operations, while CP-SAT
+    finds a better compute/movement trade-off for this window.
+
+trace_06_user_204:
+    this is a high-budget, low-movement window.  Offline and static-min are already
+    strong, so candidate-select has little transition cost to remove and is slower.
+```
+
+Research interpretation:
+
+```text
+The current incremental version proves the intended fast-online mechanism:
+
+    offline top-k candidates + runtime residency scoring
+        -> millisecond-level online decisions
+        -> large movement reduction when budget changes would otherwise force
+           redundant materialization
+
+It does not yet fully reproduce online CP-SAT quality on every trace.  The weak
+case is trace_01, where choosing among whole precomputed candidate plans is too
+coarse.  The next research step should use the graph/tree diff expansion from
+Step 4 to locally accept only the valuable sub-diffs from the CP-SAT target plan:
+
+    root: target candidate plan difference from current residency
+    internal nodes: layer or layer-range placement changes
+    leaves: individual weight placement changes
+    accept rule: apply a sub-diff only when
+        saved decode/compute cost - extra load/transform/read cost > margin
+        and the resulting placement remains under the current budget
+
+That should keep the current candidate-select latency profile while closing the
+quality gap to CP-SAT on difficult traces like trace_01.
+```
