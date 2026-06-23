@@ -1895,3 +1895,432 @@ JSONs for most decisions because it returns prewarmed plan handles directly.
 That is part of why it is fast.  For diff analysis, this means candidate-select
 must be inspected through runtime logs and counters, while `online` and
 `diff-tree-ideal` can be inspected through pulled `*_plan.json` files.
+
+## Research design: trade-off-driven diff planning
+
+The final diff design should be framed around one core trade-off:
+
+```text
+target-plan quality
+    How good is the plan if we could instantly materialize it?
+
+adaptation cost
+    How expensive is it to move from the current runtime state to that plan?
+```
+
+Offline planning optimizes mostly the first term.  Online CP-SAT optimizes both
+terms, but the solve overhead is too high.  The research goal is therefore:
+
+```text
+Approximate online CP-SAT's state-aware plan quality with a bounded graph/tree
+search whose online cost is close to candidate selection.
+```
+
+### State, Plan, and Target
+
+The method should explicitly separate three objects:
+
+```text
+S_t:
+    actual runtime state at time t
+    for each weight: current CPU/GPU residency, transformed status, disk source
+
+P_prev:
+    previous logical/applied plan
+    useful for plan identity reuse and coarse semantic structure
+
+P_target(B_t):
+    high-quality target for the current budget
+    can come from online CP-SAT, an offline CP-SAT-like candidate, or a learned
+    online-target generator
+```
+
+The true transition cost is:
+
+```text
+Cost(S_t -> P_target)
+```
+
+not:
+
+```text
+Cost(P_prev -> P_target)
+```
+
+`P_prev` is still useful, but only as a structural prior:
+
+```text
+Diff(P_prev, P_target):
+    what the planner logically wants to change
+
+Diff(S_t, P_target):
+    what the runtime must actually load, transform, transfer, or evict
+```
+
+This distinction is important because runtime state can diverge from the
+previous plan:
+
+```text
+foreground misses may materialize weights not expected by P_prev
+deferred evictions may keep weights longer than P_prev says
+budget-up events may keep a lower-budget plan active
+failed/skipped materialization may leave expected resident weights absent
+```
+
+### Trade-off Objective
+
+For a candidate adjusted plan `P_adj`, define:
+
+```text
+Objective(P_adj | S_t, B_t) =
+    steady_decode_cost(P_adj)
+  + lambda * adaptation_cost(S_t -> P_adj)
+  + mu     * apply_cost(P_prev -> P_adj)
+  + rho    * risk(P_adj, B_t)
+```
+
+where:
+
+```text
+steady_decode_cost:
+    expected per-token decode cost after the plan is materialized
+
+adaptation_cost:
+    disk load + CPU transform + CPU->GPU transfer + GPU transform + evict cost
+    computed from actual runtime state S_t
+
+apply_cost:
+    fixed and variable overhead of applying a new ExecPlan
+    zero if the adjusted plan reuses the previous plan handle
+
+risk:
+    memory-pressure / oscillation / future-regret penalty
+```
+
+For an online decision over a finite horizon `H` tokens, it is more intuitive to
+score a diff node by benefit:
+
+```text
+Score(node) =
+    H * steady_gain(node)
+  - lambda * transition_cost_from_S_t(node)
+  - mu     * plan_apply_penalty(node)
+  - rho    * memory_pressure_penalty(node)
+  - eta    * future_regret(node)
+```
+
+Accepting a node means:
+
+```text
+Move this structured group toward P_target.
+```
+
+Rejecting a node means:
+
+```text
+Keep the current/runtime placement for this group.
+```
+
+This gives the main research narrative:
+
+```text
+The planner does not blindly switch to the budget-optimal target.  It accepts
+only those target-plan differences whose predicted decode benefit is large
+enough to justify their transition and plan-application cost.
+```
+
+### Diff Graph Construction
+
+The diff graph should have two layers of meaning:
+
+```text
+semantic hierarchy:
+    root -> layer range -> layer -> component -> weight
+
+resource coupling:
+    weights sharing disk locality, transform backend, GPU memory pressure, or
+    pipeline overlap window should be grouped or connected
+```
+
+Initial tree:
+
+```text
+root
+  layer_range 0-7
+    attention
+      attn_q
+      attn_k
+      attn_v
+      attn_output
+    ffn
+      ffn_gate
+      ffn_up
+      ffn_down
+  layer_range 8-15
+  ...
+```
+
+For this project, the first-class graph nodes should reflect the observed
+online/offline differences:
+
+```text
+attn_promote:
+    current CPU/disk -> target GPU for attention weights
+    motivation: online CP-SAT frequently promotes attention to GPU
+
+ffn_demote:
+    current GPU -> CPU/disk for FFN weights
+    motivation: make room for higher-value attention GPU residency
+
+disk_recover:
+    disk -> CPU/GPU when the current horizon justifies reload
+
+keep_identity:
+    reject all low-value changes and return the previous plan handle
+```
+
+A node should store both logical and runtime information:
+
+```text
+node = {
+    weights,
+    semantic_type: attn_promote / ffn_demote / disk_recover / mixed,
+    base_placement: from P_prev or P_current_plan,
+    runtime_state: from S_t,
+    target_placement: from P_target,
+    resident_delta_bytes,
+    steady_gain_ms_per_token,
+    transition_cost_ms,
+    apply_cost_ms,
+    risk_penalty_ms,
+}
+```
+
+### Expand / Accept / Reject
+
+The graph search should start coarse and refine only uncertain regions:
+
+```text
+frontier = [root children]
+
+while frontier not empty and online_budget remains:
+    node = pop_best_or_largest_uncertain(frontier)
+    score = Score(node)
+
+    if score is clearly positive and memory feasible:
+        accept node
+
+    elif score is clearly negative:
+        reject node
+
+    else:
+        expand node into children
+```
+
+The key is that `expand` has a research meaning:
+
+```text
+Expand when a coarse group mixes useful and harmful diffs.
+```
+
+Examples:
+
+```text
+Accept whole node:
+    blk.0-7.attn CPU -> GPU has high steady gain and many weights are already
+    GPU resident, so transition cost is low.
+
+Reject whole node:
+    blk.24-31.ffn disk -> GPU has high transform cost and short expected
+    reuse horizon.
+
+Expand node:
+    blk.8-15.attn has mixed current states; some weights are already GPU,
+    others require disk reload.  Split by layer or q/k/v/o.
+```
+
+This is the clean graph/tree motivation:
+
+```text
+Flat weight-level diff is too expensive and misses shared structure.
+Whole-plan switching is too coarse and may pay redundant transformation.
+Tree expansion searches between these extremes.
+```
+
+### Memory Feasibility and Repair
+
+Accepting promotion nodes consumes memory.  Demotion nodes release memory.  The
+planner should maintain an incremental memory accounting:
+
+```text
+used_bytes = resident_bytes(current adjusted plan)
+
+accept promotion:
+    used_bytes += newly resident bytes
+
+accept demotion:
+    used_bytes -= evicted resident bytes
+```
+
+If a high-value promotion would exceed budget, the graph can create a paired
+decision:
+
+```text
+accept attn_promote only if enough ffn_demote nodes are also accepted
+```
+
+This can be represented as a small local repair problem:
+
+```text
+needed_bytes = used_bytes + promote_bytes - budget_bytes
+
+choose demotion nodes with lowest loss_per_byte until needed_bytes <= 0
+```
+
+This is where the tree/graph structure becomes more than grouping:
+
+```text
+attention promotion and FFN demotion are coupled by GPU memory pressure.
+The graph explicitly searches this exchange instead of treating each weight
+independently.
+```
+
+### Target Generation
+
+The design needs a target that contains the high-quality online behavior.
+There are three possible target sources:
+
+```text
+1. offline top-k candidates:
+    very cheap, but may miss CP-SAT-like attention promotion patterns
+
+2. offline top-k plus structured perturbations:
+    add candidates that explicitly promote attention and demote FFN under each
+    budget bucket
+
+3. occasional online CP-SAT teacher:
+    run full online CP-SAT offline or sparsely at runtime to collect target
+    diffs, then distill them into graph templates
+```
+
+For this project, the most practical next target is:
+
+```text
+offline top-k + attention-promotion candidate family
+```
+
+Example candidate family:
+
+```text
+P0:
+    normal offline CP-SAT plan
+
+P1:
+    force more attention weights to GPU, repair memory by demoting low-value FFN
+
+P2:
+    preserve current/resident-heavy plan for low transition cost
+
+P3:
+    high-budget aggressive GPU plan
+```
+
+Then the diff tree can refine:
+
+```text
+S_t -> P_attn_promote
+```
+
+instead of only:
+
+```text
+S_t -> P_offline
+```
+
+### Why This Should Approach Online CP-SAT
+
+Online CP-SAT has two observed advantages:
+
+```text
+1. It is state-aware:
+       it avoids expensive changes away from current residency.
+
+2. It can change placement quality:
+       it promotes attention CPU -> GPU under the same resident budget.
+```
+
+The proposed diff-tree approximates these with:
+
+```text
+state-aware transition cost:
+    all node costs use S_t, not just P_prev
+
+structured target diffs:
+    attention promotion and FFN demotion are explicit graph nodes
+
+bounded local search:
+    only expand uncertain high-impact regions
+
+plan identity reuse:
+    if accepted diffs do not justify a new plan, return previous plan handle
+```
+
+Expected behavior:
+
+```text
+when budget changes slightly:
+    keep previous plan or accept a small repair diff
+
+when budget increases:
+    accept only promotion nodes whose horizon justifies transform cost
+
+when budget decreases:
+    accept demotion nodes with lowest loss per byte
+
+when current state already matches an online-like target:
+    return previous plan handle with near-zero online overhead
+```
+
+### Evaluation Claim
+
+The final experiments should measure four quantities, not only speed:
+
+```text
+decode speed:
+    raw and provider-excluded ms/token
+
+online overhead:
+    decision time per budget switch
+
+movement:
+    load/xform/transfer/evict count and MB
+
+plan quality:
+    placement diff against online CP-SAT teacher
+    especially attention CPU->GPU promotion coverage
+```
+
+The research hypothesis becomes:
+
+```text
+Graph-structured diff planning can preserve most of online CP-SAT's placement
+quality while keeping online decision time close to candidate-select.
+```
+
+Success criteria:
+
+```text
+speed:
+    diff-tree close to online CP-SAT decode-only speed and faster than offline
+
+overhead:
+    diff-tree decision time far below online CP-SAT solve time
+
+interpretability:
+    accepted nodes explain the improvement, e.g. attention promotion accepted,
+    low-value FFN demotion accepted, low-value budget-up diffs rejected
+
+robustness:
+    when online CP-SAT has little advantage, diff-tree should fall back to
+    keep_identity and not become worse than offline by excessive apply/load
+```
