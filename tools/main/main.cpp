@@ -121,6 +121,12 @@ struct elastic_online_solver_state {
     std::string model_meta_path;
     std::string cost_dir;
     std::string candidate_dir;
+    std::string candidate_cache_dir;
+    bool candidate_cache_loaded = false;
+    nlohmann::json candidate_index;
+    std::unordered_map<std::string, nlohmann::json> candidate_plan_cache;
+    std::unordered_map<std::string, llama_plan *> candidate_loaded_plan_cache;
+    std::unordered_map<std::string, double> cost_cache;
     std::string work_dir;
     int kv_mib = 128;
     int misc_mib = 256;
@@ -212,8 +218,17 @@ static bool elastic_has_measured_stage_kind(elastic_online_solver_state * s,
     return false;
 }
 
+static std::string elastic_cost_key(const char * prefix, const std::string & backend, const std::string & kind,
+                                    const std::string & name, size_t bytes) {
+    return std::string(prefix) + "|" + backend + "|" + kind + "|" + name + "|" + std::to_string((unsigned long long) bytes);
+}
+
 static double elastic_stage_cost(elastic_online_solver_state * s, const std::string & backend,
                                  const std::string & kind, const std::string & name, size_t bytes) {
+    const std::string key = elastic_cost_key("stage", backend, kind, name, bytes);
+    const auto cached = s->cost_cache.find(key);
+    if (cached != s->cost_cache.end()) return cached->second;
+
     const double mb = bytes / 1024.0 / 1024.0;
     double fb = 0.0;
     if (kind == "LOAD" || kind == "RELOAD_ENSURE") fb = 0.15 + mb / 1800.0 * 1000.0;
@@ -221,7 +236,9 @@ static double elastic_stage_cost(elastic_online_solver_state * s, const std::str
     else if (kind == "XFORM") fb = 0.10 + mb / 8000.0 * 1000.0;
     else if (kind == "SYNC") fb = 0.03;
     else if (kind == "EVICT") fb = 0.01;
-    return elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
+    const double value = elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
+    s->cost_cache.emplace(key, value);
+    return value;
 }
 
 static double elastic_gpu_reload_cost(elastic_online_solver_state * s, const std::string & name, size_t bytes) {
@@ -233,8 +250,14 @@ static double elastic_gpu_reload_cost(elastic_online_solver_state * s, const std
 
 static double elastic_compute_cost(elastic_online_solver_state * s, const std::string & backend,
                                    const std::string & name, size_t bytes) {
+    const std::string key = elastic_cost_key("compute", backend, "COMPUTE", name, bytes);
+    const auto cached = s->cost_cache.find(key);
+    if (cached != s->cost_cache.end()) return cached->second;
+
     if (backend == "CPU_Elastic" && !elastic_has_measured_compute(s, "CPU_Elastic")) {
-        return std::numeric_limits<double>::infinity();
+        const double value = std::numeric_limits<double>::infinity();
+        s->cost_cache.emplace(key, value);
+        return value;
     }
     const auto candidates = elastic_compute_profile_names(name);
     const auto & rs = s->op_costs.value("records", nlohmann::json::array());
@@ -253,12 +276,22 @@ static double elastic_compute_cost(elastic_online_solver_state * s, const std::s
         }
         if (exact == nullptr) exact = &r;
     }
-    if (best_mul_mat != nullptr) return best_mul_mat->value("median_ms", 0.0);
-    if (exact != nullptr) return exact->value("median_ms", 0.0);
+    if (best_mul_mat != nullptr) {
+        const double value = best_mul_mat->value("median_ms", 0.0);
+        s->cost_cache.emplace(key, value);
+        return value;
+    }
+    if (exact != nullptr) {
+        const double value = exact->value("median_ms", 0.0);
+        s->cost_cache.emplace(key, value);
+        return value;
+    }
 
     const double mb = bytes / 1024.0 / 1024.0;
     const double fb = backend == "OpenCL" ? 0.03 + mb * 0.020 : 0.05 + mb * 0.045;
-    return elastic_cost_lookup(s->op_costs, backend, "COMPUTE", name, bytes, fb);
+    const double value = elastic_cost_lookup(s->op_costs, backend, "COMPUTE", name, bytes, fb);
+    s->cost_cache.emplace(key, value);
+    return value;
 }
 
 static double elastic_backend_path_cost(elastic_online_solver_state * s, const std::string & backend,
@@ -334,7 +367,32 @@ static bool elastic_allowed_placement_has(const std::string & spec, const std::s
     return false;
 }
 
+static std::unordered_map<std::string, uint32_t> elastic_snapshot_weight_flags(elastic_online_solver_state * s) {
+    std::unordered_map<std::string, uint32_t> flags;
+    if (!s) return flags;
+    flags.reserve(s->weight_names.size());
+    for (const std::string & name : s->weight_names) {
+        llama_elastic_weight_state st{};
+        if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) st.flags = 0;
+        flags.emplace(name, st.flags);
+    }
+    return flags;
+}
+
+static uint32_t elastic_lookup_snapshot_flags(elastic_online_solver_state * s,
+                                             const std::unordered_map<std::string, uint32_t> * state_flags,
+                                             const std::string & name) {
+    if (state_flags) {
+        const auto it = state_flags->find(name);
+        if (it != state_flags->end()) return it->second;
+    }
+    llama_elastic_weight_state st{};
+    if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) st.flags = 0;
+    return st.flags;
+}
+
 static double elastic_candidate_transition_cost(elastic_online_solver_state * s, const nlohmann::json & plan,
+                                                const std::unordered_map<std::string, uint32_t> * state_flags,
                                                 double * load_mb, double * prepare_mb, double * evict_mb,
                                                 int * changed_weights) {
     double cost = 0.0;
@@ -350,20 +408,17 @@ static double elastic_candidate_transition_cost(elastic_online_solver_state * s,
         const double mb = bytes / 1024.0 / 1024.0;
         const std::string loc = w.value("location", std::string("disk"));
 
-        llama_elastic_weight_state st{};
-        if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) {
-            st.flags = 0;
-        }
+        const uint32_t flags = elastic_lookup_snapshot_flags(s, state_flags, name);
 
         if (loc == "gpu") {
-            if (!elastic_state_has(st.flags, "GPU")) {
+            if (!elastic_state_has(flags, "GPU")) {
                 cost += elastic_gpu_reload_cost(s, name, bytes);
                 if (load_mb) *load_mb += mb;
                 if (prepare_mb) *prepare_mb += mb;
                 if (changed_weights) (*changed_weights)++;
             }
         } else if (loc == "cpu") {
-            if (!elastic_state_has(st.flags, "CPU")) {
+            if (!elastic_state_has(flags, "CPU")) {
                 cost += elastic_stage_cost(s, "CPU_Elastic", "LOAD", name, bytes);
                 cost += elastic_stage_cost(s, "CPU_Elastic", "XFORM", name, bytes);
                 if (load_mb) *load_mb += mb;
@@ -371,8 +426,8 @@ static double elastic_candidate_transition_cost(elastic_online_solver_state * s,
                 if (changed_weights) (*changed_weights)++;
             }
         } else {
-            if (elastic_state_any_resident(st.flags)) {
-                const bool gpu = elastic_state_has(st.flags, "GPU");
+            if (elastic_state_any_resident(flags)) {
+                const bool gpu = elastic_state_has(flags, "GPU");
                 cost += elastic_stage_cost(s, gpu ? "OpenCL" : "CPU_Elastic", "EVICT", name, bytes);
                 if (evict_mb) *evict_mb += mb;
                 if (changed_weights) (*changed_weights)++;
@@ -380,6 +435,67 @@ static double elastic_candidate_transition_cost(elastic_online_solver_state * s,
         }
     }
     return cost;
+}
+
+static bool elastic_candidate_cache_load(elastic_online_solver_state * s) {
+    if (!s || s->candidate_dir.empty()) return false;
+    if (s->candidate_cache_loaded && s->candidate_cache_dir == s->candidate_dir) return true;
+
+    s->candidate_index = nlohmann::json();
+    s->candidate_plan_cache.clear();
+    s->candidate_loaded_plan_cache.clear();
+    s->candidate_cache_loaded = false;
+    s->candidate_cache_dir = s->candidate_dir;
+
+    std::ifstream idxf(s->candidate_dir + "/index.json");
+    if (!idxf) {
+        LOG_ERR("[elastic-candidate] failed to open index %s/index.json\n", s->candidate_dir.c_str());
+        return false;
+    }
+    idxf >> s->candidate_index;
+
+    size_t loaded = 0;
+    std::unordered_set<std::string> files;
+    for (const auto & row : s->candidate_index.value("index", nlohmann::json::array())) {
+        const std::string base_file = row.value("file", std::string());
+        if (!base_file.empty()) files.insert(base_file);
+        for (const auto & cand : row.value("candidates", nlohmann::json::array())) {
+            const std::string file = cand.value("file", std::string());
+            if (!file.empty()) files.insert(file);
+        }
+    }
+
+    for (const std::string & file : files) {
+        std::ifstream pf(s->candidate_dir + "/" + file);
+        if (!pf) {
+            LOG_ERR("[elastic-candidate] failed to open candidate plan %s/%s\n",
+                    s->candidate_dir.c_str(), file.c_str());
+            return false;
+        }
+        nlohmann::json plan;
+        pf >> plan;
+        s->candidate_plan_cache.emplace(file, std::move(plan));
+        loaded++;
+    }
+
+    s->candidate_cache_loaded = true;
+    LOG_INF("[elastic-candidate] cached %zu plans from %s\n", loaded, s->candidate_dir.c_str());
+    return true;
+}
+
+static llama_plan * elastic_candidate_load_plan_handle(elastic_online_solver_state * s, const std::string & file) {
+    if (!s || file.empty()) return nullptr;
+    const auto cached = s->candidate_loaded_plan_cache.find(file);
+    if (cached != s->candidate_loaded_plan_cache.end()) return cached->second;
+    const std::string path = s->candidate_dir + "/" + file;
+    llama_plan * plan = llama_plan_load_json(path.c_str());
+    if (!plan) {
+        LOG_ERR("[elastic-candidate] failed to load candidate plan handle %s\n", path.c_str());
+        return nullptr;
+    }
+    s->candidate_loaded_plan_cache.emplace(file, plan);
+    s->plans.push_back(plan);
+    return plan;
 }
 
 static std::string elastic_current_loc_from_flags(uint32_t flags) {
@@ -423,7 +539,8 @@ static void elastic_recompute_plan_events_from_weights(nlohmann::json & plan, in
     }
 }
 
-static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nlohmann::json & plan) {
+static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nlohmann::json & plan,
+                                           const std::unordered_map<std::string, uint32_t> * state_flags) {
     struct node {
         std::string key;
         std::vector<int> weight_ids;
@@ -460,9 +577,8 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
         const double mb = bytes / 1024.0 / 1024.0;
         const std::string target = w.value("location", std::string("disk"));
 
-        llama_elastic_weight_state st{};
-        if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) st.flags = 0;
-        const std::string cur = elastic_current_loc_from_flags(st.flags);
+        const uint32_t flags = elastic_lookup_snapshot_flags(s, state_flags, name);
+        const std::string cur = elastic_current_loc_from_flags(flags);
         current_loc_by_id[id] = cur;
         target_loc_by_id[id] = target;
         if (cur == target) continue;
@@ -481,7 +597,7 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
         g.prepare_mb += mb;
         if (target == "gpu") {
             g.transition_ms += elastic_gpu_reload_cost(s, name, bytes);
-            const double old_ms = elastic_backend_path_cost(s, "CPU", name, bytes, st.flags);
+            const double old_ms = elastic_backend_path_cost(s, "CPU", name, bytes, flags);
             const double new_ms = elastic_compute_cost(s, "OpenCL", name, bytes);
             if (std::isfinite(old_ms) && std::isfinite(new_ms)) {
                 g.steady_gain_ms += horizon * std::max(0.0, old_ms - new_ms);
@@ -549,21 +665,16 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nloh
 }
 
 static bool elastic_online_generate_candidate_select(elastic_online_solver_state * s, int64_t budget_mib,
-                                                     const std::string & plan_path) {
+                                                     const std::string & plan_path,
+                                                     std::string * selected_file,
+                                                     bool write_plan) {
     if (!s || s->candidate_dir.empty()) return false;
-
-    std::ifstream idxf(s->candidate_dir + "/index.json");
-    if (!idxf) {
-        LOG_ERR("[elastic-candidate] failed to open index %s/index.json\n", s->candidate_dir.c_str());
-        return false;
-    }
-    nlohmann::json idx;
-    idxf >> idx;
+    if (!elastic_candidate_cache_load(s)) return false;
 
     nlohmann::json best_row;
     bool have_row = false;
     int64_t best_budget = std::numeric_limits<int64_t>::min();
-    const nlohmann::json rows = idx.value("index", nlohmann::json::array());
+    const nlohmann::json rows = s->candidate_index.value("index", nlohmann::json::array());
     for (const auto & row : rows) {
         const int64_t b = row.value("budget_mib", 0);
         if (b <= budget_mib && b > best_budget) {
@@ -598,17 +709,18 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     int best_cid = -1;
     std::string best_file;
     nlohmann::json best_plan;
+    const auto state_flags = elastic_snapshot_weight_flags(s);
 
     for (const auto & cand : candidates) {
         const std::string file = cand.value("file", std::string());
         if (file.empty()) continue;
-        std::ifstream pf(s->candidate_dir + "/" + file);
-        if (!pf) continue;
-        nlohmann::json plan;
-        pf >> plan;
+        const auto it = s->candidate_plan_cache.find(file);
+        if (it == s->candidate_plan_cache.end()) continue;
+        const nlohmann::json & plan = it->second;
         double load_mb = 0.0, prepare_mb = 0.0, evict_mb = 0.0;
         int changed = 0;
-        const double transition = elastic_candidate_transition_cost(s, plan, &load_mb, &prepare_mb, &evict_mb, &changed);
+        const double transition = elastic_candidate_transition_cost(s, plan, &state_flags,
+                                                                    &load_mb, &prepare_mb, &evict_mb, &changed);
         const double steady = plan.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
         const double score = steady + s->transition_weight * transition;
         if (score < best_score) {
@@ -620,38 +732,43 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             best_changed = changed;
             best_cid = cand.value("candidate_id", -1);
             best_file = file;
-            best_plan = std::move(plan);
+            best_plan = plan;
         }
     }
     if (best_plan.is_null()) return false;
 
     if (s->mode == "diff-graph-expand") {
-        elastic_diff_graph_expand_plan(s, best_plan);
-        best_transition = elastic_candidate_transition_cost(s, best_plan, &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
+        elastic_diff_graph_expand_plan(s, best_plan, &state_flags);
+        best_transition = elastic_candidate_transition_cost(s, best_plan, &state_flags,
+                                                            &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
         best_score = best_plan.value("pred_per_token_ms", 0.0) + s->transition_weight * best_transition;
     }
+    if (selected_file) *selected_file = best_file;
 
-    best_plan["online_selection"] = {
-        {"mode", s->mode},
-        {"source_budget_mib", best_budget},
-        {"candidate_id", best_cid},
-        {"candidate_file", best_file},
-        {"score_ms", best_score},
-        {"transition_ms", best_transition},
-        {"transition_weight", s->transition_weight},
-        {"diff_changed_weights", best_changed},
-        {"diff_load_mb", best_load_mb},
-        {"diff_prepare_mb", best_prepare_mb},
-        {"diff_evict_mb", best_evict_mb},
-    };
+    if (write_plan) {
+        best_plan["online_selection"] = {
+            {"mode", s->mode},
+            {"source_budget_mib", best_budget},
+            {"candidate_id", best_cid},
+            {"candidate_file", best_file},
+            {"score_ms", best_score},
+            {"transition_ms", best_transition},
+            {"transition_weight", s->transition_weight},
+            {"diff_changed_weights", best_changed},
+            {"diff_load_mb", best_load_mb},
+            {"diff_prepare_mb", best_prepare_mb},
+            {"diff_evict_mb", best_evict_mb},
+        };
 
-    std::ofstream out(plan_path);
-    if (!out) return false;
-    out << best_plan.dump(2) << "\n";
+        std::ofstream out(plan_path);
+        if (!out) return false;
+        out << best_plan.dump() << "\n";
+        if (!out.good()) return false;
+    }
     LOG_INF("[elastic-candidate] budget=%lld table_budget=%lld candidate=%d file=%s score=%.3f transition=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
             (long long) budget_mib, (long long) best_budget, best_cid, best_file.c_str(),
             best_score, best_transition, best_changed, best_load_mb, best_prepare_mb, best_evict_mb);
-    return out.good();
+    return true;
 }
 
 static bool elastic_online_generate_native(elastic_online_solver_state * s, int64_t budget_mib, const std::string & plan_path) {
@@ -943,8 +1060,31 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
         s->remote_server_ms_total += server_ms;
         LOG_INF("[elastic-online] remote budget=%lld remote_wall_ms=%.3f server_solve_ms=%.3f\n",
                 (long long) budget_mib, remote_wall_ms, server_ms);
-    } else if (s->mode == "candidate-select" || s->mode == "diff-graph-expand") {
-        if (!elastic_online_generate_candidate_select(s, budget_mib, plan_path)) {
+    } else if (s->mode == "candidate-select") {
+        std::string selected_file;
+        if (!elastic_online_generate_candidate_select(s, budget_mib, plan_path, &selected_file, false)) {
+            s->failures++;
+            LOG_ERR("[elastic-online] candidate selector failed budget=%lld dir=%s\n",
+                    (long long) budget_mib, s->candidate_dir.c_str());
+            return nullptr;
+        }
+        llama_plan * plan = elastic_candidate_load_plan_handle(s, selected_file);
+        if (!plan) {
+            s->failures++;
+            return nullptr;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double gen_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        LOG_INF("[elastic-online] budget=%lld selected %s mode=%s gen_ms=%.3f weights=%d ops=%d calls=%llu failures=%llu\n",
+                (long long) budget_mib, selected_file.c_str(),
+                s->mode.c_str(), gen_ms,
+                llama_plan_n_weights(plan), llama_plan_n_ops(plan),
+                (unsigned long long) s->calls,
+                (unsigned long long) s->failures);
+        return plan;
+    } else if (s->mode == "diff-graph-expand") {
+        std::string selected_file;
+        if (!elastic_online_generate_candidate_select(s, budget_mib, plan_path, &selected_file, true)) {
             s->failures++;
             LOG_ERR("[elastic-online] candidate selector failed budget=%lld dir=%s\n",
                     (long long) budget_mib, s->candidate_dir.c_str());

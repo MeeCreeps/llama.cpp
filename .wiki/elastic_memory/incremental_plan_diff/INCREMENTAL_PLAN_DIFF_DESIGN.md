@@ -528,18 +528,28 @@ LLAMA_ELASTIC_ONLINE_MODE=candidate-select
 LLAMA_ELASTIC_CANDIDATE_DIR=<plan-table-dir>
 ```
 
-The first runtime selector:
+The runtime selector:
 
 ```text
-1. reads candidates for the current budget bucket
+1. loads and caches the candidate table on first use
 2. evaluates transition_cost(S_runtime -> P_candidate)
 3. scores steady_cost + transition_weight * transition_cost
-4. writes selected plan into the normal online work directory
-5. attaches `online_selection` metadata to the generated plan
+4. returns a cached `llama_plan*` directly for unmodified candidate-select
 ```
 
-The `diff-graph-expand` mode is wired to the same selector as a placeholder for
-the next stage.
+The selector keeps these runtime caches:
+
+```text
+index.json cache
+candidate JSON plan cache
+candidate `llama_plan*` handle cache
+runtime cost lookup cache
+```
+
+The cost cache is important.  Without it, each budget change repeatedly scans
+JSON profile records for every candidate weight.  With it, the first call fills
+the cache and later candidate scoring is mostly O(K * N_weights) arithmetic and
+state-bit checks.
 
 Second implementation:
 
@@ -594,3 +604,76 @@ rc: 0
 raw ms/token: 1561.18
 provider_get_ms_total: 160.058
 ```
+
+Current optimized smoke:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/cost_cache_smoke_20s_candidate
+
+trace:
+    trace_05_user_74_10min_x1.csv
+    source window: 20 s
+    budget bucket: 256 MiB
+    min/mean/max budget: 4301.7 / 4309.3 / 4320.6 MiB
+
+candidate-select:
+    raw ms/token: 220.79
+    provider_get_ms_total: 178.80
+    online calls: 10
+    failures: 0
+```
+
+Per-call candidate-select overhead after cache warmup:
+
+```text
+first call:
+    91.965 ms
+
+later calls:
+    24.860 ms
+    17.175 ms
+    15.291 ms
+    16.862 ms
+    4.790 ms
+    4.601 ms
+    9.807 ms
+    21.525 ms
+    10.684 ms
+```
+
+Diff graph optimized smoke:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/cost_cache_smoke_20s_diff
+
+diff-graph-expand:
+    raw ms/token: 183.42
+    provider_get_ms_total: 339.47
+    online calls: 11
+    failures: 0
+```
+
+Per-call diff-graph overhead after cache warmup:
+
+```text
+first call:
+    165.964 ms
+
+later calls:
+    23.760 ms
+    14.982 ms
+    10.954 ms
+    10.073 ms
+    11.296 ms
+    8.731 ms
+    19.106 ms
+    36.545 ms
+    13.863 ms
+    16.364 ms
+```
+
+This confirms that the online incremental path no longer depends on remote
+CP-SAT solve time.  The remaining large runtime cost is plan application and
+actual load/prepare/evict work, not online decision overhead.
