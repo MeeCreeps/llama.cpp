@@ -1187,3 +1187,86 @@ This is the clearest current evidence for the research claim:
 In this window, online reduces load/xform by 6.1x and direct-read volume by
 6.4x, while raw decode improves by about 18%.
 ```
+
+## Cooled 120-second order-swap A/B
+
+Artifacts:
+
+```text
+.wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_keep50_prewarm_cooled_offline_candidate_120s
+.wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_keep50_prewarm_cooled_candidate_offline_120s
+```
+
+Settings:
+
+```text
+trace:                   trace_06_user_204_10min_x1.csv
+source window:           180 s
+bench seconds:           120 s
+cooldown target:         42 C
+candidate_min_distance:  32
+transition_weight:       0.5
+keep_current_margin:     50 ms
+candidate prewarm:       on
+candidate event logs:    off
+```
+
+Order 1: offline -> candidate-select
+
+```text
+offline:
+    raw ms/token:          568.36
+    exec ms/token:         626.44
+    provider_get_ms_total: 40.53
+    apply_count:           21
+    planned load/xform:    310 / 310
+    direct_read:           10992.30 ms, 359 calls, 9544.5 MiB
+    thermal CPU max:       37.2 -> 55.4 C
+
+candidate-select:
+    raw ms/token:          233.12
+    exec ms/token:         235.86
+    provider_get_ms_total: 37.14
+    online calls:          13
+    apply_count:           2
+    planned load/xform:    34 / 34
+    direct_read:           1032.12 ms, 34 calls, 1012.5 MiB
+    thermal CPU max:       38.7 -> 53.9 C
+```
+
+Order 2: candidate-select -> offline
+
+```text
+candidate-select:
+    raw ms/token:          232.63
+    exec ms/token:         235.02
+    provider_get_ms_total: 38.30
+    online calls:          13
+    apply_count:           2
+    planned load/xform:    34 / 34
+    direct_read:           862.02 ms, 34 calls, 1012.5 MiB
+    thermal CPU max:       41.5 -> 54.3 C
+
+offline:
+    raw ms/token:          592.65
+    exec ms/token:         636.64
+    provider_get_ms_total: 37.55
+    apply_count:           17
+    planned load/xform:    257 / 257
+    direct_read:           8156.99 ms, 306 calls, 8030.2 MiB
+    thermal CPU max:       41.5 -> 64.3 C
+```
+
+Interpretation:
+
+```text
+The order-swap result is consistent:
+
+    candidate-select stays around 233 ms/token in both orders.
+    offline stays around 568-593 ms/token in both orders.
+
+The speedup is not a run-order artifact.  The main difference is movement:
+candidate-select applies two plans and keeps the low-budget/current-resident
+plan through budget-up oscillations; offline repeatedly switches to the
+budget-optimal target plan and pays hundreds of load/xform events.
+```
