@@ -1270,3 +1270,74 @@ candidate-select applies two plans and keeps the low-budget/current-resident
 plan through budget-up oscillations; offline repeatedly switches to the
 budget-optimal target plan and pays hundreds of load/xform events.
 ```
+
+## Keep-current margin sweep
+
+`keep_current_margin_ms` controls how much steady-state loss the incremental
+online planner is willing to tolerate before switching away from the current
+resident plan.
+
+Decision rule:
+
+```text
+P_keep = currently applied plan
+P_best = best scored candidate under current budget
+
+if budget(P_keep) <= current_budget
+   and steady_cost(P_keep) <= score(P_best) + keep_current_margin_ms:
+       keep P_keep and reject the diff
+else:
+       accept the selected candidate diff
+```
+
+Interpretation:
+
+```text
+margin = 0:
+    no sticky keep-current branch; behaves like candidate-select without
+    incremental diff rejection.
+
+small/moderate margin:
+    allows the runtime to keep an already resident/transformed plan when the
+    predicted steady loss is smaller than the movement avoided.
+
+too large margin:
+    may keep a feasible but overly conservative low-budget plan too long.
+```
+
+Sweep settings:
+
+```text
+trace:                   trace_06_user_204_10min_x1.csv
+source window:           180 s
+bench seconds:           60 s
+cooldown target:         42 C
+candidate_min_distance:  32
+transition_weight:       0.5
+candidate prewarm:       on
+candidate event logs:    off
+```
+
+Results:
+
+```text
+margin  raw ms/tok  exec ms/tok  provider ms  apply  load/xform  direct read ms/calls/MB
+0       290.97      322.87       132.73       15     208/208     6041.59 / 257 / 6507.0
+25      210.63      214.63        29.06        2      34/34       811.54 / 34  / 1012.5
+50      207.03      210.76        26.06        2      34/34       765.13 / 34  / 1012.5
+100     231.60      236.78        37.55        2      34/34       975.53 / 34  / 1012.5
+```
+
+This supports the intended trade-off:
+
+```text
+margin=0 is too reactive:
+    it follows the candidate table and repeatedly pays movement.
+
+margin=25/50 is the sweet spot on this window:
+    it rejects low-value budget-up diffs and avoids most reload/transform.
+
+margin=100 still avoids movement:
+    but it starts to lose speed, consistent with keeping a lower-budget plan
+    longer than necessary.
+```
