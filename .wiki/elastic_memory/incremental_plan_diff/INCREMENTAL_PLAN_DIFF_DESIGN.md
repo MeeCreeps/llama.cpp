@@ -539,13 +539,36 @@ The first runtime selector:
 ```
 
 The `diff-graph-expand` mode is wired to the same selector as a placeholder for
-the next stage.  The current implementation records aggregate diff statistics
-but does not yet accept/reject subgraphs independently.
+the next stage.
+
+Second implementation:
+
+```text
+LLAMA_ELASTIC_ONLINE_MODE=diff-graph-expand
+```
+
+The first graph expansion pass is intentionally conservative:
+
+```text
+1. Build layer/component diff groups from Diff(S_runtime, P_candidate).
+2. Consider only safe promotion diffs:
+       current=disk -> target=cpu/gpu
+   Rejecting these diffs can only reduce memory pressure.
+3. Compute group score:
+       steady_gain(horizon) - transition_weight * transition_cost
+4. Reject low-score groups by keeping those weights on disk and recomputing a
+   simple load/xform timeline.
+```
+
+This is not the full graph method yet.  It is the first executable expand /
+accept / reject loop and provides the runtime metadata needed to analyze
+whether graph-level decisions are useful.
 
 Smoke artifact:
 
 ```text
 .wiki/elastic_memory/incremental_plan_diff/artifacts/candidate_select_smoke_10s_v2
+.wiki/elastic_memory/incremental_plan_diff/artifacts/diff_graph_expand_smoke_10s
 ```
 
 Smoke result:
@@ -561,4 +584,13 @@ The log confirms runtime candidate selection without remote CP-SAT:
 [elastic-candidate] budget=4096 table_budget=4096 candidate=0
 score=516.315 transition=89.562 changed=100
 load=112.5MB prepare=112.5MB evict=828.0MB
+```
+
+Diff graph smoke:
+
+```text
+method: diff-graph-expand
+rc: 0
+raw ms/token: 1561.18
+provider_get_ms_total: 160.058
 ```

@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <limits>
+#include <cmath>
 #include <nlohmann/json.hpp>
 #include <cerrno>
 
@@ -381,6 +382,172 @@ static double elastic_candidate_transition_cost(elastic_online_solver_state * s,
     return cost;
 }
 
+static std::string elastic_current_loc_from_flags(uint32_t flags) {
+    if (elastic_state_has(flags, "GPU")) return "gpu";
+    if (elastic_state_has(flags, "CPU")) return "cpu";
+    return "disk";
+}
+
+static std::string elastic_diff_group_key(const std::string & name, int layer) {
+    std::string component = "other";
+    if (name.find(".attn_") != std::string::npos) component = "attn";
+    else if (name.find(".ffn_") != std::string::npos) component = "ffn";
+    else if (name.find("output") != std::string::npos) component = "output";
+    return "layer:" + std::to_string(layer) + "/" + component;
+}
+
+static void elastic_recompute_plan_events_from_weights(nlohmann::json & plan, int prefetch_distance) {
+    nlohmann::json timeline = nlohmann::json::array();
+    for (const auto & w : plan.value("weights", nlohmann::json::array())) {
+        if (!w.is_object()) continue;
+        if (w.value("pinned", false)) continue;
+        const std::string loc = w.value("location", std::string("disk"));
+        if (loc != "disk") continue;
+        const int id = w.value("weight_id", -1);
+        if (id < 0) continue;
+        const int anchor_id = id > std::max(1, prefetch_distance) ? id - std::max(1, prefetch_distance) : 0;
+        timeline.push_back({
+            {"kind", "load"}, {"weight_id", id}, {"from_loc", "disk"}, {"to_loc", "cpu"},
+            {"engine", "disk"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
+        });
+        timeline.push_back({
+            {"kind", "xform"}, {"weight_id", id}, {"from_loc", "cpu"}, {"to_loc", "cpu"},
+            {"engine", "cpu"}, {"anchor_op_id", anchor_id}, {"overlap_group", -1},
+        });
+    }
+    plan["timeline"] = std::move(timeline);
+    if (plan.contains("schedule") && plan["schedule"].is_object()) {
+        plan["schedule"]["events"] = nlohmann::json::array();
+        plan["schedule"]["kind"] = "none";
+        plan["schedule"]["status"] = "diff_graph_recomputed_timeline";
+    }
+}
+
+static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, nlohmann::json & plan) {
+    struct node {
+        std::string key;
+        std::vector<int> weight_ids;
+        double transition_ms = 0.0;
+        double steady_gain_ms = 0.0;
+        double load_mb = 0.0;
+        double prepare_mb = 0.0;
+        int changed = 0;
+        int rejected = 0;
+    };
+
+    const double horizon = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_DIFF_HORIZON_TOKENS");
+        const double v = e && *e ? std::atof(e) : 32.0;
+        return v > 1.0 ? v : 1.0;
+    }();
+    const double accept_margin = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_DIFF_ACCEPT_MARGIN_MS");
+        return e && *e ? std::atof(e) : 0.0;
+    }();
+
+    std::unordered_map<std::string, node> groups;
+    std::unordered_map<int, std::string> current_loc_by_id;
+    std::unordered_map<int, std::string> target_loc_by_id;
+
+    for (const auto & w : plan.value("weights", nlohmann::json::array())) {
+        if (!w.is_object()) continue;
+        const std::string name = w.value("name", std::string());
+        if (name.empty() || w.value("pinned", false)) continue;
+        const int id = w.value("weight_id", -1);
+        if (id < 0) continue;
+        const int layer = w.value("layer", -1);
+        const size_t bytes = (size_t) w.value("byte_size", 0);
+        const double mb = bytes / 1024.0 / 1024.0;
+        const std::string target = w.value("location", std::string("disk"));
+
+        llama_elastic_weight_state st{};
+        if (llama_weight_get_state(s->ctx, name.c_str(), &st) != 0) st.flags = 0;
+        const std::string cur = elastic_current_loc_from_flags(st.flags);
+        current_loc_by_id[id] = cur;
+        target_loc_by_id[id] = target;
+        if (cur == target) continue;
+
+        // First implementation: only make safe local decisions for promotions
+        // from disk/non-resident to CPU/GPU. Rejecting these can only reduce
+        // memory pressure and transition work.
+        if (cur != "disk" || (target != "gpu" && target != "cpu")) continue;
+
+        const std::string key = elastic_diff_group_key(name, layer);
+        node & g = groups[key];
+        g.key = key;
+        g.weight_ids.push_back(id);
+        g.changed++;
+        g.load_mb += mb;
+        g.prepare_mb += mb;
+        if (target == "gpu") {
+            g.transition_ms += elastic_gpu_reload_cost(s, name, bytes);
+            const double old_ms = elastic_backend_path_cost(s, "CPU", name, bytes, st.flags);
+            const double new_ms = elastic_compute_cost(s, "OpenCL", name, bytes);
+            if (std::isfinite(old_ms) && std::isfinite(new_ms)) {
+                g.steady_gain_ms += horizon * std::max(0.0, old_ms - new_ms);
+            }
+        } else {
+            g.transition_ms += elastic_stage_cost(s, "CPU_Elastic", "LOAD", name, bytes);
+            g.transition_ms += elastic_stage_cost(s, "CPU_Elastic", "XFORM", name, bytes);
+        }
+    }
+
+    std::unordered_set<int> reject_ids;
+    nlohmann::json group_log = nlohmann::json::array();
+    for (auto & kv : groups) {
+        node & g = kv.second;
+        const double score = g.steady_gain_ms - s->transition_weight * g.transition_ms;
+        const bool reject = score <= accept_margin;
+        if (reject) {
+            for (int id : g.weight_ids) reject_ids.insert(id);
+            g.rejected = (int) g.weight_ids.size();
+        }
+        group_log.push_back({
+            {"key", g.key},
+            {"changed", g.changed},
+            {"rejected", g.rejected},
+            {"transition_ms", g.transition_ms},
+            {"steady_gain_ms", g.steady_gain_ms},
+            {"score_ms", score},
+            {"load_mb", g.load_mb},
+            {"prepare_mb", g.prepare_mb},
+            {"decision", reject ? "reject" : "accept"},
+        });
+    }
+    if (reject_ids.empty()) {
+        plan["diff_graph"] = {{"mode", "expand_accept"}, {"groups", group_log}, {"rejected_weights", 0}};
+        LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=0 horizon=%.1f margin=%.3f\n",
+                groups.size(), horizon, accept_margin);
+        return;
+    }
+
+    for (auto & w : plan["weights"]) {
+        if (!w.is_object()) continue;
+        const int id = w.value("weight_id", -1);
+        if (reject_ids.find(id) == reject_ids.end()) continue;
+        w["location"] = "disk";
+        w["xform"] = "none";
+    }
+
+    for (auto & op : plan["ops"]) {
+        if (!op.is_object()) continue;
+        const int id = op.value("weight_id", -1);
+        if (reject_ids.find(id) == reject_ids.end()) continue;
+        op["compute_backend"] = "cpu";
+    }
+
+    elastic_recompute_plan_events_from_weights(plan, s->prefetch_distance);
+    plan["diff_graph"] = {
+        {"mode", "expand_accept"},
+        {"horizon_tokens", horizon},
+        {"accept_margin_ms", accept_margin},
+        {"groups", group_log},
+        {"rejected_weights", (int) reject_ids.size()},
+    };
+    LOG_INF("[elastic-diff-graph] groups=%zu rejected_weights=%zu horizon=%.1f margin=%.3f\n",
+            groups.size(), reject_ids.size(), horizon, accept_margin);
+}
+
 static bool elastic_online_generate_candidate_select(elastic_online_solver_state * s, int64_t budget_mib,
                                                      const std::string & plan_path) {
     if (!s || s->candidate_dir.empty()) return false;
@@ -457,6 +624,12 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         }
     }
     if (best_plan.is_null()) return false;
+
+    if (s->mode == "diff-graph-expand") {
+        elastic_diff_graph_expand_plan(s, best_plan);
+        best_transition = elastic_candidate_transition_cost(s, best_plan, &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
+        best_score = best_plan.value("pred_per_token_ms", 0.0) + s->transition_weight * best_transition;
+    }
 
     best_plan["online_selection"] = {
         {"mode", s->mode},
