@@ -757,3 +757,81 @@ budget changes to B_t
 candidate j reuses more of S_runtime than offline P0
 candidate j wins despite a slightly higher steady cost
 ```
+
+Oscillating trace result:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_scores_120s_candidate
+
+trace:
+    trace_06_user_204_10min_x1.csv
+    source window: 180 s
+    bench seconds: 120 s
+    min/mean/max budget: 4008.2 / 4615.7 / 5705.9 MiB
+    buckets: 3840..5632 MiB
+
+candidate-select, transition_weight=0.1:
+    online calls: 26
+    selected candidates: candidate 0 = 25, candidate 3 = 1
+    provider_get_ms_total: 367.63
+    apply_count: 24
+    planned load/xform: 366 / 366
+    direct_read: 13999.08 ms, 415 calls, 11191.5 MiB
+```
+
+The first switch selected a non-zero candidate because it had much lower
+transition cost:
+
+```text
+budget=4608
+candidate 0 score=271.946 transition=120.495 changed=77
+candidate 1 score=270.599 transition=95.558  changed=63
+candidate 2 score=270.245 transition=88.433  changed=59
+candidate 3 score=269.803 transition=83.839  changed=59
+selected: candidate 3
+```
+
+This validates the core mechanism: the online selector can choose a slightly
+worse steady plan when it better matches current residency.
+
+Transition-weight sweep smoke:
+
+```text
+artifact:
+    .wiki/elastic_memory/incremental_plan_diff/artifacts/oscillating_distance32_tw1_120s_candidate
+
+candidate-select, transition_weight=1.0:
+    online calls: 27
+    selected candidates: candidate 0 = 21, candidate 1 = 3, candidate 2 = 1, candidate 3 = 2
+    provider_get_ms_total: 358.58
+    apply_count: 26
+    planned load/xform: 424 / 424
+    direct_read: 14056.00 ms, 473 calls, 10737.0 MiB
+```
+
+Interpretation:
+
+```text
+Increasing transition_weight makes the selector choose non-zero candidates
+more often, but it is not automatically faster.  A too-large transition weight
+can prefer plans with lower immediate transition score but more future load
+events under oscillating budgets.
+```
+
+The next evaluation should sweep:
+
+```text
+transition_weight in {0.1, 0.25, 0.5, 1.0}
+candidate_min_distance in {16, 32, 48}
+```
+
+and compare:
+
+```text
+candidate id distribution
+planned load/xform/evict
+direct read ms and MiB
+apply_ms_total
+raw and exec ms/token under cooled runs
+```
