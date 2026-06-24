@@ -3954,17 +3954,24 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     }
                 }
                 bm = elastic::wbm_get(&est->wbm, src_wbm_idx);
-                cl_mem new_buf = static_cast<cl_mem>(bm->backend_handle);
-                if (!is_soa) {
+                cl_mem new_buf = bm ? static_cast<cl_mem>(bm->backend_handle) : nullptr;
+                if (!is_soa && new_buf) {
                     src_extra_generic->data_device = new_buf;
-                }
-                // SOA 回调内部已经更新过 ctx->buffer 槽位（parent 替换），这里只
-                // 对非 SOA 路径补 ctx_slot 同步。
-                if (!is_soa) {
                     ggml_opencl_elastic_update_ctx_slot(src->buffer, src_ctx_slot, new_buf);
                 }
                 est->n_reloads_total += 1;
                 est->bytes_reloaded_total += bm->byte_size;
+            }
+            // A staged TRANSFER may materialize ordinary OpenCL tensors before
+            // the foreground ensure path runs.  Keep the tensor extra/ctx slot in
+            // sync even when WBM already marks the block resident.
+            bm = elastic::wbm_get(&est->wbm, src_wbm_idx);
+            if (!is_soa && bm && bm->resident && bm->backend_handle) {
+                cl_mem resident_buf = static_cast<cl_mem>(bm->backend_handle);
+                if (src_extra_generic->data_device != resident_buf) {
+                    src_extra_generic->data_device = resident_buf;
+                    ggml_opencl_elastic_update_ctx_slot(src->buffer, src_ctx_slot, resident_buf);
+                }
             }
             elastic::wbm_touch(&est->wbm, src_wbm_idx, est->current_token);
         }
