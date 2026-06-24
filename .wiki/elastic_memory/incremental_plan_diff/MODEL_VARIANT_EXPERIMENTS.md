@@ -82,6 +82,7 @@ Current local GGUF files:
 | `/home/myid/hz85760/model/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_0.gguf` | 1.92 GB | smaller control |
 | `/home/myid/hz85760/model/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q8_0.gguf` | 3.42 GB | quantization control |
 | `/home/myid/hz85760/model/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-f16.gguf` | 6.43 GB | larger memory-footprint control |
+| `/home/myid/hz85760/model/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_0.gguf` | 7.93 GiB | downloaded 14B Q4_0 pressure model |
 
 Important caveat:
 
@@ -93,6 +94,35 @@ not for claiming larger-model scaling.
 
 For a true larger-model experiment, add a 13B/14B Q4/Q5 GGUF and generate its
 planner artifacts.
+
+Current 14B status:
+
+```text
+model:
+    Qwen2.5-14B-Instruct Q4_0
+
+source:
+    mashima/Qwen2.5-14B-Instruct-Q4_0-GGUF
+
+local path:
+    /home/myid/hz85760/model/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_0.gguf
+
+phone path:
+    /data/local/tmp/hyzheng/elastic/qwen2.5-14b-instruct-q4_0.gguf
+
+load smoke:
+    OP12 loads the GGUF and can generate a token without elastic plan apply.
+
+planner meta:
+    runtime/plan/model_meta/Qwen2.5-14B-Instruct-Q4_0.weights_ops.json
+    336 planned core matmul weights
+    planned core weight footprint: 7087.5 MiB
+```
+
+The current Qwen14 elastic-plan smoke reaches `llama_plan_load_json` for
+`plan_4608MiB.json`, but the short `static-max` n=1 runner did not produce a
+perf footer.  Treat this as a runtime smoke/debug state, not a completed speed
+result.
 
 ## Required Artifacts Per Model / Quantization
 
@@ -128,6 +158,14 @@ Existing ready-to-use artifacts:
         runtime/plan/model_meta/Llama-3.2-3B-Instruct-q4_0.weights_ops.json
     cost_dir:
         runtime/plan/profiles/android-opencl/Llama-3.2-3B-Instruct-q4_0
+
+14B Q4_0:
+    model_meta:
+        runtime/plan/model_meta/Qwen2.5-14B-Instruct-Q4_0.weights_ops.json
+    cost_dir:
+        runtime/plan/profiles/android-opencl/Qwen2.5-14B-Instruct-Q4_0
+        currently compute-profile based; stage profile should be rerun before
+        treating speed results as final
 ```
 
 For 3B Q8_0 and 3B f16, first run the profiling/artifact pipeline.

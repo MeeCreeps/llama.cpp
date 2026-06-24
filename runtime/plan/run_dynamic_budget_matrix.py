@@ -92,6 +92,13 @@ class TraceWindow:
     max_bucket_mib: int
 
 
+@dataclass
+class StaticTrace:
+    local: Path
+    remote_name: str
+    budget_mib: int
+
+
 def run(cmd: list[str], *, check: bool = True, timeout: float | None = None, stdout: Any = subprocess.PIPE) -> subprocess.CompletedProcess[str]:
     print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
     return subprocess.run(cmd, check=check, timeout=timeout, text=True, stdout=stdout, stderr=subprocess.STDOUT)
@@ -276,6 +283,19 @@ def write_window_trace(
         min_bucket_mib=bucket_floor(min_mib, bucket_mib),
         max_bucket_mib=bucket_ceil(max_mib, bucket_mib),
     )
+
+
+def write_static_trace(trace: TraceWindow, out_dir: Path, kind: str) -> StaticTrace:
+    if kind not in {"min", "max"}:
+        raise ValueError(f"unknown static trace kind: {kind}")
+    budget = trace.min_bucket_mib if kind == "min" else trace.max_bucket_mib
+    out = out_dir / f"{trace.local.stem}_static_{kind}_{budget}MiB.csv"
+    with out.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["t_sec", "mem_available_mb"])
+        writer.writerow(["0", str(budget)])
+        writer.writerow([f"{max(trace.replay_span, 1.0):.3f}".rstrip("0").rstrip("."), str(budget)])
+    return StaticTrace(local=out, remote_name=out.name, budget_mib=budget)
 
 
 def build_budget_list(traces: list[TraceWindow], bucket_mib: int, extra_max_mib: int) -> list[int]:
@@ -833,6 +853,16 @@ def main() -> None:
         )
         for p in sources
     ]
+    static_traces = {
+        (t.local.name, "static-min"): write_static_trace(t, trace_dir, "min")
+        for t in traces
+    }
+    static_traces.update(
+        {
+            (t.local.name, "static-max"): write_static_trace(t, trace_dir, "max")
+            for t in traces
+        }
+    )
     budgets = build_budget_list(traces, args.bucket_mib, args.extra_max_budget_mib)
 
     need_offline_table = methods_need_offline_table(args.methods)
@@ -923,6 +953,9 @@ def main() -> None:
             adb(args.adb_serial, ["push", str(table_dir) + "/.", args.phone_plan_dir + "/"])
         for t in traces:
             adb(args.adb_serial, ["push", str(t.local), f"{args.remote_dir}/{t.remote_name}"])
+            for method in ("static-min", "static-max"):
+                st = static_traces[(t.local.name, method)]
+                adb(args.adb_serial, ["push", str(st.local), f"{args.remote_dir}/{st.remote_name}"])
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     rows: list[dict[str, Any]] = [] if args.no_resume else read_existing_csv(summary_dir / "results.csv")
@@ -946,7 +979,10 @@ def main() -> None:
                         timeout=args.adb_timeout_s,
                         retries=args.adb_retries,
                     )
-                env = make_method_env(args, method, t, f"{args.remote_dir}/{t.remote_name}", work)
+                remote_trace = f"{args.remote_dir}/{t.remote_name}"
+                if method in {"static-min", "static-max"}:
+                    remote_trace = f"{args.remote_dir}/{static_traces[(t.local.name, method)].remote_name}"
+                env = make_method_env(args, method, t, remote_trace, work)
                 argv = [
                     "./llama-cli",
                     "-m",

@@ -1,0 +1,11 @@
+{
+  "boundary_records": 0,
+  "device": "android-opencl",
+  "input_rows": 6669,
+  "model": "Qwen2.5-14B-Instruct-Q4_0",
+  "op_records": 3190,
+  "source_csv": [
+    "runtime/plan/generated/Qwen2.5-14B-Instruct-Q4_0/csv/opencl_compute.csv"
+  ],
+  "stage_records": 0
+}

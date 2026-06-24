@@ -1,0 +1,9 @@
+{
+  "device": "android-opencl",
+  "input_rows": 6669,
+  "model": "Qwen2.5-14B-Instruct-Q4_0",
+  "records": [],
+  "source_csv": [
+    "runtime/plan/generated/Qwen2.5-14B-Instruct-Q4_0/csv/opencl_compute.csv"
+  ]
+}
