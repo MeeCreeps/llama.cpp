@@ -7,6 +7,7 @@ Baselines:
 * online     : remote CP-SAT, current residency state is sent to the host solver.
 * mru        : native online MRU eviction baseline.
 * static-min : one fixed plan built for the lowest budget bucket of each trace.
+* static-max : one fixed plan built for the highest budget bucket of each trace.
 
 The runner creates low-memory 10-minute source windows from trace CSVs, optionally
 replays them faster for practical phone experiments, pushes all needed artifacts,
@@ -453,13 +454,13 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
         "",
         "## Trace Windows",
         "",
-        "| trace | source start s | source span s | replay span s | rows | min MiB | mean MiB | max MiB | min bucket |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| trace | source start s | source span s | replay span s | rows | min MiB | mean MiB | max MiB | min bucket | max bucket |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for t in traces:
         lines.append(
             f"| {t.local.name} | {t.source_start:.0f} | {t.source_span:.0f} | {t.replay_span:.1f} | {t.rows} | "
-            f"{t.min_mib:.1f} | {t.mean_mib:.1f} | {t.max_mib:.1f} | {t.min_bucket_mib} |"
+            f"{t.min_mib:.1f} | {t.mean_mib:.1f} | {t.max_mib:.1f} | {t.min_bucket_mib} | {t.max_bucket_mib} |"
         )
     lines += [
         "",
@@ -560,10 +561,11 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         common["GGML_ELASTIC_DYNAMIC"] = "1"
     if method == "offline":
         common["LLAMA_ELASTIC_DIR"] = args.phone_plan_dir
-    elif method == "static-min":
+    elif method in {"static-min", "static-max"}:
+        static_budget = trace.min_bucket_mib if method == "static-min" else trace.max_bucket_mib
         common.update(
             {
-                "LLAMA_ELASTIC_APPLY": f"{args.phone_plan_dir}/plan_{trace.min_bucket_mib}MiB.json",
+                "LLAMA_ELASTIC_APPLY": f"{args.phone_plan_dir}/plan_{static_budget}MiB.json",
                 "LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE": "0",
                 "LLAMA_ELASTIC_DEFER_STAGE": "0",
                 "GGML_ELASTIC_ASYNC_STAGE_LOAD": "0",
@@ -706,7 +708,7 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
 
 def methods_need_offline_table(methods: str) -> bool:
     selected = {m.strip() for m in methods.split(",") if m.strip()}
-    return bool(selected & {"offline", "static-min", "candidate-select", "diff-graph-expand", "diff-tree-ideal"})
+    return bool(selected & {"offline", "static-min", "static-max", "candidate-select", "diff-graph-expand", "diff-tree-ideal"})
 
 
 def stop_remote_server(args: argparse.Namespace, proc: subprocess.Popen[str] | None) -> None:
@@ -737,7 +739,7 @@ def main() -> None:
     ap.add_argument("--cost-dir", type=Path, default=ROOT / "runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01")
     ap.add_argument("--trace-glob", default="trace/traces_9g/trace_*.csv")
     ap.add_argument("--trace-filter", default="", help="substring filter for trace filenames")
-    ap.add_argument("--methods", default="offline,online,mru,static-min")
+    ap.add_argument("--methods", default="offline,online,mru,static-min,static-max")
     ap.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
     ap.add_argument("--window-sec", type=float, default=600.0)
     ap.add_argument("--window-stride-sec", type=float, default=10.0)
