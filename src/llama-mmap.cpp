@@ -572,6 +572,26 @@ struct direct_io_handle {
 };
 static std::mutex g_direct_mtx;
 static std::unordered_map<std::string, direct_io_handle> g_direct_handles;
+
+static int llama_pread_full_direct(int fd, void * dst, size_t len, size_t file_offset, const char * tag) {
+    char * out = static_cast<char *>(dst);
+    size_t done = 0;
+    while (done < len) {
+        ssize_t rd = pread(fd, out + done, len - done, file_offset + done);
+        if (rd < 0) {
+            fprintf(stderr, "[llama_pread_direct %s] pread fail: %s\n", tag, strerror(errno));
+            return -3;
+        }
+        if (rd == 0) {
+            fprintf(stderr, "[llama_pread_direct %s] short read: got %zu / %zu at offset=%zu\n",
+                    tag, done, len, file_offset);
+            return -4;
+        }
+        done += (size_t) rd;
+    }
+    return 0;
+}
+
 int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size_t len) {
 #if defined(__linux__) || defined(__ANDROID__)
     std::lock_guard<std::mutex> lk(g_direct_mtx);
@@ -595,9 +615,7 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
     const bool offset_aligned = (file_offset % blk) == 0;
     const bool len_aligned    = (len % blk) == 0;
     if (dst_aligned && offset_aligned && len_aligned && len > 0) {
-        ssize_t rd = pread(h.fd, dst, len, file_offset);
-        if (rd < 0) { fprintf(stderr, "[llama_pread_direct fastpath] pread fail: %s\n", strerror(errno)); return -3; }
-        return 0;
+        return llama_pread_full_direct(h.fd, dst, len, file_offset, "fastpath");
     }
 
     // Split path: 头尾用 bounce 处理对齐, 中间 (如果对齐) 直接 pread 到 dst.
@@ -617,9 +635,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
             if (posix_memalign(&h.bounce, blk, need) != 0) { h.bcap = 0; return -2; }
             h.bcap = need;
         }
-        if (pread(h.fd, h.bounce, need, head_off_aligned) < 0) {
-            fprintf(stderr, "[llama_pread_direct head-only] pread fail: %s\n", strerror(errno)); return -3;
-        }
+        int rc = llama_pread_full_direct(h.fd, h.bounce, need, head_off_aligned, "head-only");
+        if (rc != 0) return rc;
         memcpy(dst, (char*)h.bounce + head_skip, len);
         return 0;
     }
@@ -634,9 +651,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
             if (posix_memalign(&h.bounce, blk, blk) != 0) { h.bcap = 0; return -2; }
             h.bcap = blk;
         }
-        if (pread(h.fd, h.bounce, blk, head_off_aligned) < 0) {
-            fprintf(stderr, "[llama_pread_direct head] pread fail: %s\n", strerror(errno)); return -3;
-        }
+        int rc = llama_pread_full_direct(h.fd, h.bounce, blk, head_off_aligned, "head");
+        if (rc != 0) return rc;
         memcpy(dst_c, (char*)h.bounce + head_skip, head_block_size);
     }
 
@@ -652,8 +668,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
     if (mid_size > 0) {
         if ((reinterpret_cast<uintptr_t>(mid_dst) % blk) == 0) {
             // mid_dst blk-aligned → direct pread, 零 memcpy
-            ssize_t rd = pread(h.fd, mid_dst, mid_size, mid_file_off);
-            if (rd < 0) { fprintf(stderr, "[llama_pread_direct mid] pread fail: %s\n", strerror(errno)); return -3; }
+            int rc = llama_pread_full_direct(h.fd, mid_dst, mid_size, mid_file_off, "mid");
+            if (rc != 0) return rc;
         } else {
             // 罕见: dst 不 blk-aligned, 中段也 bounce. 跟旧路径等效.
             if (h.bcap < mid_size) {
@@ -662,9 +678,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
                 if (posix_memalign(&h.bounce, blk, mid_size) != 0) { h.bcap = 0; return -2; }
                 h.bcap = mid_size;
             }
-            if (pread(h.fd, h.bounce, mid_size, mid_file_off) < 0) {
-                fprintf(stderr, "[llama_pread_direct mid-bounce] pread fail: %s\n", strerror(errno)); return -3;
-            }
+            int rc = llama_pread_full_direct(h.fd, h.bounce, mid_size, mid_file_off, "mid-bounce");
+            if (rc != 0) return rc;
             memcpy(mid_dst, h.bounce, mid_size);
         }
     }
@@ -678,9 +693,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
             if (posix_memalign(&h.bounce, blk, blk) != 0) { h.bcap = 0; return -2; }
             h.bcap = blk;
         }
-        if (pread(h.fd, h.bounce, blk, tail_file_off) < 0) {
-            fprintf(stderr, "[llama_pread_direct tail] pread fail: %s\n", strerror(errno)); return -3;
-        }
+        int rc = llama_pread_full_direct(h.fd, h.bounce, blk, tail_file_off, "tail");
+        if (rc != 0) return rc;
         memcpy(mid_dst + mid_size, h.bounce, tail_size);
     }
 

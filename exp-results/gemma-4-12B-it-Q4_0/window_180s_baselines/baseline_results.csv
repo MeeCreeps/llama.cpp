@@ -1,0 +1,7 @@
+method,source_artifact,status,raw_ms_per_token,exec_ms_per_token,eval_runs,apply_count,planned_evict_load_xfer_xform,direct_read_mb,direct_read_mb_per_token,online_calls_failures,anchor_failures,gpu_before_after_c
+static-min,run_all_20260629,ok+anchor_failures,3193.22,3193.22,57,0,0/248/248/248,290336.1,5093.62,n/a/n/a,960,39.1/51.9
+static-max,run_all_20260629,ok+anchor_failures,2514.30,2514.30,72,0,0/192/192/192,288138.5,4001.92,n/a/n/a,1200,51.2/53.1
+offline,run_all_20260629,ok,1044.27,1189.61,156,8,0/1835/1835/1835,197174.0,1263.94,n/a/n/a,0,52.7/53.5
+online,run_all_20260629,ok+anchor_failures,3783.52,3397.62,44,3,0/691/691/691,151689.4,3447.49,3/0,752,52.7/58.5
+diff-tree-ideal,run_all_20260629,ok,2138.42,2236.72,80,3,0/530/211/530,102308.9,1278.86,3/0,0,58.5/57.4
+mru,run_all_20260629,ok,1796.64,1796.59,101,6,0/0/0/0,205568.2,2035.33,6/0,0,56.6/57.0

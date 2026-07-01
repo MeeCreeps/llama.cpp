@@ -201,7 +201,18 @@ private:
         }
         pending_ = false;
         auto result = pending_future_.get();
-        if (result.first != current_budget_mib) {
+        static const int64_t async_max_stale_mib = []() {
+            const char * e = std::getenv("GGML_ELASTIC_CALLBACK_ASYNC_MAX_STALE_MB");
+            if (!e || !*e) return (int64_t) 512;
+            const long long v = std::atoll(e);
+            return v >= 0 ? (int64_t) v : (int64_t) 512;
+        }();
+        // A stale async result is safe when it was solved for a budget no
+        // larger than the current budget, but a very old low-budget plan can
+        // destroy performance after memory recovers. Accept only bounded-stale
+        // conservative results; reject plans that are too high or too old.
+        if (result.first > current_budget_mib ||
+            (async_max_stale_mib > 0 && current_budget_mib - result.first > async_max_stale_mib)) {
             return nullptr;
         }
         auto plan = std::move(result.second);

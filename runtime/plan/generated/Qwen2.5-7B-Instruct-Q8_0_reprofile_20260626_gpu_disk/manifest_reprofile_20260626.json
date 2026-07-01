@@ -1,0 +1,15 @@
+{
+  "cost_dir": "runtime/plan/profiles/android-opencl/Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk",
+  "csv_rows": {
+    "opencl_compute.csv": 8340,
+    "opencl_reload_legacy.csv": 8255,
+    "opencl_stage.csv": 10200
+  },
+  "model": "/data/local/tmp/hyzheng/elastic/Qwen2.5-7B-Instruct-Q8_0.gguf",
+  "model_tag": "Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk",
+  "notes": [
+    "OpenCL compute, OpenCL stage, and OpenCL legacy reload were remeasured on 3C15AU002CL00000.",
+    "CPU profiles intentionally excluded because online rerun uses allowed_placements=gpu,disk_gpu."
+  ],
+  "source": "manual OpenCL-only reprofile for online CP gpu,disk_gpu rerun"
+}

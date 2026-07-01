@@ -1,0 +1,41 @@
+{
+  "bottleneck": "greedy",
+  "budget_mib": 1280,
+  "cost_model": {
+    "allowed_placements": [
+      "cpu",
+      "disk_cpu",
+      "disk_gpu",
+      "gpu"
+    ],
+    "backend_choice": "multi_backend_placement",
+    "cp_objective": "resource_makespan",
+    "cpu_elastic_compute_measured": true,
+    "cpu_elastic_stage_measured": false,
+    "cpu_fallback_enabled": true,
+    "disk_gpu_reload_multiplier": 4.0,
+    "disk_reload_multiplier": 1.0,
+    "exclude_plan_count": 0,
+    "legacy_reload_ensure_available": false,
+    "legacy_reload_ensure_used": false,
+    "min_placement_distance": 0,
+    "movement_cost": "fine_stage_path",
+    "opencl_compute_measured": true,
+    "opencl_stage_measured": false,
+    "overlap_model": "pipeline",
+    "transition_weight": 0.0
+  },
+  "kv_bytes": 268435456,
+  "misc_bytes": 134217728,
+  "ops": [],
+  "pred_per_token_ms": 0.0,
+  "schedule": {
+    "events": [],
+    "kind": "none",
+    "objective_ms": null,
+    "status": "OPTIMAL"
+  },
+  "schema_version": 1,
+  "timeline": [],
+  "weights": []
+}

@@ -313,7 +313,7 @@ ReconcileStats PlanExecutor::apply(const ExecPlan & plan) {
     // defer_stage_events=true 时只计数/建索引, 由 decode/runtime 到达 anchor 后
     // 通过 events_for_anchor() 精确触发。
     st.n_schedule_events = (int) projected_schedule_events_.size();
-    st.used_interval_schedule = use_interval_schedule();
+    st.used_interval_schedule = use_interval_schedule() && !projected_schedule_events_.empty();
     st.n_overlap_events = st.used_interval_schedule ? st.n_schedule_events : (int) plan.timeline.size();
     if (st.used_interval_schedule) {
         for (const auto & e : projected_schedule_events_) {

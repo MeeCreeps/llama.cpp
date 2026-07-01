@@ -1,0 +1,13 @@
+{
+  "device": "android-opencl",
+  "input_rows": 40136,
+  "model": "Qwen2.5-0.5B-Instruct-Q8_0",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-0.5B-Instruct-Q8_0/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-0.5B-Instruct-Q8_0/csv/opencl_stage.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-0.5B-Instruct-Q8_0/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-0.5B-Instruct-Q8_0/csv/cpu_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-0.5B-Instruct-Q8_0/csv/cpu_stage.csv"
+  ]
+}

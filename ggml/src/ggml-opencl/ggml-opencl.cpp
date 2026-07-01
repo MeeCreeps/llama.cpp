@@ -2932,12 +2932,12 @@ struct ggml_opencl_elastic_state {
     size_t misc_overhead  = static_cast<size_t>(256) * 1024 * 1024;
     int    evict_check_interval = 8;
 
-    // Baseline (spec §5)：静态 target = M_floor - kv - misc，整个 run 不变。
+    // Baseline (spec §5)：静态 target = M_floor - kv - misc - safety，整个 run 不变。
     // bw_inited 后在 lazy_init 里算一次。bw 没启用时为 0，等价于关闭 evict。
     size_t static_target_bytes = 0;
 
     // Dynamic mode (GGML_ELASTIC_DYNAMIC=1): graph_compute 时实时算
-    // target = B(t)*MB - kv - misc + extra_target_bytes (跟 budget trace 走)。
+    // target = B(t)*MB - kv - misc - safety + extra_target_bytes (跟 budget trace 走)。
     // extra_target_bytes 单独累加 EMBED_OUTSIDE_BUDGET 等 extras, 跟 static 路径平行
     // (static 路径把 extras 加进 static_target_bytes; dynamic 路径用 extra_target_bytes)。
     bool   dynamic_target       = false;
@@ -3171,7 +3171,11 @@ static int opencl_sched_movement_request(const char *name, bool evict, void * /*
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     if (!bm) return -3;
     if (evict) {
-        if (llama_weight_runtime_desired_query(name) == LLAMA_WEIGHT_RUNTIME_GPU) return 0;
+        static const bool runtime_mru_cache = []() {
+            const char * e = std::getenv("LLAMA_ELASTIC_RUNTIME_MRU_CACHE");
+            return e && *e && *e != '0';
+        }();
+        if (!runtime_mru_cache && llama_weight_runtime_desired_query(name) == LLAMA_WEIGHT_RUNTIME_GPU) return 0;
         if (!bm->resident) return 0;
         opencl_wait_async_xform(s, idx);
         bm = elastic::wbm_get(&s->wbm, idx);
@@ -3618,6 +3622,8 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
 
     s->kv_bytes      = ggml_opencl_env_mb("GGML_ELASTIC_KV_MB",   128);
     s->misc_overhead = ggml_opencl_env_mb("GGML_ELASTIC_MISC_MB", 256);
+    const size_t safety_overhead = ggml_opencl_env_mb("GGML_ELASTIC_SAFETY_MB", 0);
+    s->misc_overhead += safety_overhead;
     if (const char *iv = std::getenv("GGML_ELASTIC_EVICT_INTERVAL")) {
         int v = atoi(iv);
         if (v >= 1) s->evict_check_interval = v;
@@ -3635,7 +3641,7 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                 s->dynamic_target = true;
             }
             GGML_LOG_INFO("ggml_opencl elastic: BudgetWatcher trace=%s 初始 B(t)=%zu MB "
-                          "M_floor=%zu MB → static_target=%zu MB mode=%s (kv=%zu MB misc=%zu MB)\n",
+                          "M_floor=%zu MB → static_target=%zu MB mode=%s (kv=%zu MB misc+safety=%zu MB)\n",
                           csv, elastic::budget_watcher_get(&s->bw), s->bw.m_floor_mb,
                           s->static_target_bytes / 1024 / 1024,
                           s->dynamic_target ? "DYNAMIC" : "static",
@@ -3797,7 +3803,7 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         }
     }
 
-    GGML_LOG_INFO("ggml_opencl elastic: 单例就绪 (kv=%zu MB misc=%zu MB interval=%d)\n",
+    GGML_LOG_INFO("ggml_opencl elastic: 单例就绪 (kv=%zu MB misc+safety=%zu MB interval=%d)\n",
                   s->kv_bytes / 1024 / 1024, s->misc_overhead / 1024 / 1024, s->evict_check_interval);
 }
 
@@ -4055,7 +4061,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             }();
             if (!s_no_auto_evict_periodic &&
                 (int)(est->n_op_dispatched % est->evict_check_interval) == 0) {
-                // Baseline 静态：target = M_floor - kv - misc。
+                // Baseline 静态：target = M_floor - kv - misc - safety。
                 // 若 GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET=1，把 pool cap 从 target
                 // 里扣掉，让 working_set + cached_bytes ≤ target，严格合规。
                 static const bool s_pool_counts_budget = []() {
@@ -4903,6 +4909,13 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
 
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
+static bool ggml_opencl_elastic_evict_during_load_enabled();
+static void ggml_opencl_elastic_evict_to_initial_budget(
+        elastic::weight_buffer_manager * wbm,
+        elastic::wbm_opencl_ctx * octx,
+        size_t target_bytes,
+        int exclude_idx);
+
 // 公共注册逻辑：SOA tensor (q4_0/q8_0/mxfp4) 注册到 WBM + 绑定 evict/reload 回调。
 // 三个 SOA extra 类型有同名字段 wbm_idx / ctx_slot / parent_buffer，模板就够；
 // 不同的转换 kernel / sub-buffer 字段在调用方的闭包里处理。
@@ -4999,6 +5012,10 @@ static void ggml_opencl_elastic_register_soa(
                           nbytes / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
         }
     }
+
+    if (ggml_opencl_elastic_evict_during_load_enabled()) {
+        ggml_opencl_elastic_evict_to_initial_budget(&s->wbm, &s->octx, s->static_target_bytes, -1);
+    }
 }
 
 // 公共 reload helper：pool 命中复用 parent / 否则 alloc。
@@ -5007,6 +5024,35 @@ static void ggml_opencl_elastic_register_soa(
 // → 之后会被发给两个 resident tensor → 互相覆盖数据 → corruption)。
 static std::unordered_map<cl_mem, char> s_soa_pooled_parents;
 static uint64_t s_soa_double_evict = 0, s_soa_double_handout = 0;
+
+static bool ggml_opencl_elastic_evict_during_load_enabled() {
+    const char * e = std::getenv("GGML_ELASTIC_EVICT_DURING_LOAD");
+    return !(e && *e == '0');
+}
+
+static void ggml_opencl_elastic_evict_to_initial_budget(
+        elastic::weight_buffer_manager * wbm,
+        elastic::wbm_opencl_ctx * octx,
+        size_t target_bytes,
+        int exclude_idx) {
+    if (!wbm || !octx || target_bytes == 0) return;
+    if (wbm->resident_bytes <= target_bytes) return;
+
+    std::vector<int> victims;
+    const int n = elastic::wbm_evict_to_byte_budget(wbm, target_bytes, exclude_idx, &victims);
+    if (n <= 0) return;
+    const int released = elastic::wbmcl_evict_batch(octx, victims.data(), n);
+    auto * s = ggml_opencl_elastic();
+    if (s) {
+        s->n_evicts_total += released;
+        for (int i = 0; i < released && i < n; ++i) {
+            const std::string name = opencl_name_for_idx(s, victims[i]);
+            if (!name.empty()) {
+                llama_weight_runtime_mark_evicted(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+            }
+        }
+    }
+}
 
 static cl_mem ggml_opencl_elastic_alloc_or_pool_parent(
         elastic::wbm_opencl_ctx *octx, cl_context cl_ctx, size_t nbytes) {
@@ -5440,7 +5486,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                                 }
                                 if (e.q) clReleaseMemObject((cl_mem)e.q);
                                 if (e.d) clReleaseMemObject((cl_mem)e.d);
-                                if (e.parent) clReleaseMemObject((cl_mem)e.parent);
+                                if (e.parent) {
+                                    s_soa_pooled_parents.erase((cl_mem)e.parent);
+                                    clReleaseMemObject((cl_mem)e.parent);
+                                }
                                 octx->n_releases += 3;
                                 octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
                             } else {
@@ -5472,13 +5521,31 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     // double-evict 检测: 该 parent 已在 pool 里? (= bug: 它仍被某 resident
                     // tensor 使用却被当成可复用) → 跳过 push 避免 double-handout。
                     if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
-                        s_soa_double_evict++;
-                        std::fprintf(stderr, "[soa-pool] DOUBLE-EVICT parent=%p idx=%d (已在池中, 跳过)\n",
-                                     (void*)e.parent, idx);
-                        // 不重复入池; 但仍需 mark_evicted + 清 extra 指针
-                        cap_extra->parent_buffer = nullptr; cap_extra->d = nullptr; cap_extra->q = nullptr;
-                        elastic::wbm_mark_evicted(octx->wbm, idx);
-                        return 0;
+                        bool actually_in_pool = false;
+                        auto pit = octx->soa_pool_by_size.find(nbytes);
+                        if (pit != octx->soa_pool_by_size.end()) {
+                            for (const auto & pooled : pit->second) {
+                                if ((cl_mem) pooled.parent == (cl_mem) e.parent) {
+                                    actually_in_pool = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (actually_in_pool) {
+                            s_soa_double_evict++;
+                            std::fprintf(stderr, "[soa-pool] DOUBLE-EVICT parent=%p idx=%d (already pooled, skip)\n",
+                                         (void*)e.parent, idx);
+                            // 不重复入池; 但仍需 mark_evicted + 清 extra 指针
+                            cap_extra->parent_buffer = nullptr; cap_extra->d = nullptr; cap_extra->q = nullptr;
+                            elastic::wbm_mark_evicted(octx->wbm, idx);
+                            return 0;
+                        }
+                        // The tracking set can become stale if a pooled parent
+                        // was released while trimming the cache and the driver
+                        // later reused the same cl_mem handle value. Recover the
+                        // set and keep this resident buffer eligible for reuse.
+                        s_soa_pooled_parents.erase((cl_mem)e.parent);
+                        s_soa_pooled_parents.insert({(cl_mem)e.parent, 1});
                     }
                     octx->soa_pool_by_size[nbytes].push_back(e);
                     octx->retain_order_sizes.push_back(nbytes);
@@ -5612,6 +5679,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 }();
                 static thread_local std::vector<char> direct_scratch;
                 const void *src_for_dma = host_ptr;
+                bool src_is_direct_scratch = false;
                 detail_t0 = detail_now_us();
                 {
                     std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
@@ -5648,6 +5716,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             octx->foreground_direct_read_us += (uint64_t) direct_dt;
                             octx->foreground_direct_read_bytes += nbytes;
                             src_for_dma = direct_scratch.data();
+                            src_is_direct_scratch = true;
                             static const bool s_cache_foreground_load = []() {
                                 const char *e = std::getenv("GGML_ELASTIC_CACHE_FOREGROUND_LOAD");
                                 return !(e && *e == "0"[0]);
@@ -5844,6 +5913,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                                                    elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
                                                    nbytes);
                 if (xfer_q != cap_q) clFlush(xfer_q);
+                if (src_is_direct_scratch) {
+                    clWaitForEvents(1, &write_ev);
+                }
                 if (prev_use_ev) clReleaseEvent(prev_use_ev);
 
                 // GGML_ELASTIC_RELOAD_ON_XFER=1: convert + transpose 也跑在
@@ -6081,8 +6153,84 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_context cap_ctx = context;
             cl_command_queue cap_q = queue;
 
-            auto evict_fn = [octx, cap_extra, nbytes]() -> int {
+            auto evict_fn = [octx, cap_extra, cap_q, nbytes]() -> int {
                 int idx = cap_extra->wbm_idx;
+                if (octx->retain_cl_mem && cap_extra->parent_buffer) {
+                    if (octx->cache_byte_limit > 0) {
+                        while (octx->cached_bytes + nbytes > octx->cache_byte_limit &&
+                               !octx->retain_order_sizes.empty()) {
+                            size_t old_sz = octx->retain_order_sizes.front();
+                            octx->retain_order_sizes.pop_front();
+                            auto pit = octx->soa_pool_by_size.find(old_sz);
+                            if (pit != octx->soa_pool_by_size.end() && !pit->second.empty()) {
+                                auto e = pit->second.back(); pit->second.pop_back();
+                                if (e.ready_event) {
+                                    cl_event ready = (cl_event) e.ready_event;
+                                    clWaitForEvents(1, &ready);
+                                    clReleaseEvent(ready);
+                                }
+                                if (e.q) clReleaseMemObject((cl_mem)e.q);
+                                if (e.d) clReleaseMemObject((cl_mem)e.d);
+                                if (e.parent) {
+                                    s_soa_pooled_parents.erase((cl_mem)e.parent);
+                                    clReleaseMemObject((cl_mem)e.parent);
+                                }
+                                octx->n_releases += 3;
+                                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+                            } else {
+                                auto sit = octx->retained_buffers_by_size.find(old_sz);
+                                if (sit != octx->retained_buffers_by_size.end() && !sit->second.empty()) {
+                                    cl_mem ob = (cl_mem)sit->second.back(); sit->second.pop_back();
+                                    clReleaseMemObject(ob);
+                                    octx->n_releases += 1;
+                                    octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+                                }
+                            }
+                        }
+                    }
+                    elastic::soa_pool_entry e;
+                    e.parent = cap_extra->parent_buffer;
+                    e.d      = cap_extra->d;
+                    e.q      = cap_extra->q;
+                    // Q8 retained parent reuse is only safe after prior compute
+                    // queue users have drained.  The xfer queue may immediately
+                    // run the convert kernel after this parent leaves the pool.
+                    cl_event ready = nullptr;
+                    if (clEnqueueMarkerWithWaitList(cap_q, 0, nullptr, &ready) == CL_SUCCESS && ready) {
+                        e.ready_event = ready;
+                    }
+                    if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
+                        bool actually_in_pool = false;
+                        auto pit = octx->soa_pool_by_size.find(nbytes);
+                        if (pit != octx->soa_pool_by_size.end()) {
+                            for (const auto & pooled : pit->second) {
+                                if ((cl_mem) pooled.parent == (cl_mem) e.parent) {
+                                    actually_in_pool = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (actually_in_pool) {
+                            s_soa_double_evict++;
+                            std::fprintf(stderr, "[soa-pool-q8] DOUBLE-EVICT parent=%p idx=%d (already pooled, skip)\n",
+                                         (void*)e.parent, idx);
+                            cap_extra->parent_buffer = nullptr; cap_extra->d = nullptr; cap_extra->q = nullptr;
+                            elastic::wbm_mark_evicted(octx->wbm, idx);
+                            return 0;
+                        }
+                        s_soa_pooled_parents.erase((cl_mem)e.parent);
+                        s_soa_pooled_parents.insert({(cl_mem)e.parent, 1});
+                    }
+                    octx->soa_pool_by_size[nbytes].push_back(e);
+                    octx->retain_order_sizes.push_back(nbytes);
+                    octx->cached_bytes += nbytes;
+                    cap_extra->parent_buffer = nullptr;
+                    cap_extra->d = nullptr;
+                    cap_extra->q = nullptr;
+                    octx->bytes_evicted_total += nbytes;
+                    elastic::wbm_mark_evicted(octx->wbm, idx);
+                    return 0;
+                }
                 cap_extra->reset();
                 ggml_opencl_elastic_evict_parent_pool_or_release(octx, cap_extra->parent_buffer, nbytes, idx);
                 cap_extra->parent_buffer = nullptr;
@@ -6102,9 +6250,65 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 };
                 std::lock_guard<std::mutex> staging_guard(octx->soa_staging_mtx);
                 uint64_t detail_t0 = detail_now_us();
-                cl_mem new_parent = ggml_opencl_elastic_alloc_or_pool_parent(octx, cap_ctx, nbytes);
-                detail_record(elastic::wbmcl_stage_detail_kind::PARENT_ALLOC, detail_t0, nbytes);
-                if (!new_parent) return -1;
+                cl_mem new_parent = nullptr;
+                bool soa_hit = false;
+                bool parent_from_pool = false;
+                static const bool s_pool_sync = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_POOL_SYNC");
+                    return e && *e && *e != '0';
+                }();
+                if (s_pool_sync) clFinish(cap_q);
+                static const bool s_no_soa_hit = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_NO_SOA_HIT");
+                    return e && *e && *e != '0';
+                }();
+                bool tried_soa_pool = false;
+                if (octx->retain_cl_mem && !s_no_soa_hit) {
+                    tried_soa_pool = true;
+                    auto it = octx->soa_pool_by_size.find(nbytes);
+                    if (it != octx->soa_pool_by_size.end() && !it->second.empty()) {
+                        octx->soa_pool_hit++;
+                        auto e = it->second.back(); it->second.pop_back();
+                        if (e.ready_event) {
+                            cl_event ready = (cl_event) e.ready_event;
+                            clWaitForEvents(1, &ready);
+                            clReleaseEvent(ready);
+                        }
+                        new_parent = (cl_mem)e.parent;
+                        parent_from_pool = true;
+                        s_soa_pooled_parents.erase((cl_mem)e.parent);
+                        static const bool s_parent_only = []() {
+                            const char *e2 = std::getenv("GGML_ELASTIC_POOL_PARENT_ONLY");
+                            return !(e2 && *e2 == '0');
+                        }();
+                        if (s_parent_only) {
+                            if (e.q) clReleaseMemObject((cl_mem)e.q);
+                            if (e.d) clReleaseMemObject((cl_mem)e.d);
+                            soa_hit = false;
+                        } else {
+                            cap_extra->d = (cl_mem)e.d;
+                            cap_extra->q = (cl_mem)e.q;
+                            cap_extra->size_d = cap_size_d;
+                            cap_extra->size_q = cap_size_q;
+                            soa_hit = true;
+                        }
+                        for (auto lit = octx->retain_order_sizes.rbegin();
+                             lit != octx->retain_order_sizes.rend(); ++lit) {
+                            if (*lit == nbytes) { octx->retain_order_sizes.erase(std::next(lit).base()); break; }
+                        }
+                        octx->cached_bytes -= std::min(octx->cached_bytes, nbytes);
+                    }
+                }
+                if (tried_soa_pool && !new_parent) {
+                    octx->soa_pool_miss++;
+                }
+                detail_record(elastic::wbmcl_stage_detail_kind::SOA_POOL_LOOKUP, detail_t0, nbytes);
+                if (!new_parent) {
+                    detail_t0 = detail_now_us();
+                    new_parent = ggml_opencl_elastic_alloc_or_pool_parent(octx, cap_ctx, nbytes);
+                    detail_record(elastic::wbmcl_stage_detail_kind::PARENT_ALLOC, detail_t0, nbytes);
+                    if (!new_parent) return -1;
+                }
                 cap_extra->parent_buffer = new_parent;
                 if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
                     cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
@@ -6118,6 +6322,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 cl_command_queue xfer_q = octx->xfer_queue ? octx->xfer_queue : cap_q;
                 cl_event prev_use_ev = octx->soa_staging_slot_last_use_ev.empty() ? nullptr : octx->soa_staging_slot_last_use_ev[octx->soa_staging_current_slot];
                 const void *src_for_dma = host_ptr;
+                static const bool s_direct_io = []() {
+                    const char *e = std::getenv("GGML_ELASTIC_DIRECT_IO");
+                    return !(e && *e == '0');
+                }();
+                static thread_local std::vector<char> direct_scratch;
+                bool src_is_direct_scratch = false;
                 detail_t0 = detail_now_us();
                 elastic::wbmcl_wait_host_load(octx, idx);
                 {
@@ -6125,6 +6335,77 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     auto staged = octx->host_staging_by_idx.find(idx);
                     if (staged != octx->host_staging_by_idx.end() && staged->second.size() >= nbytes) {
                         src_for_dma = staged->second.data();
+                    }
+                }
+                if (src_for_dma == host_ptr && s_direct_io) {
+                    auto reg = llama_mmap_registry_find(host_ptr);
+                    octx->direct_read_calls++;
+                    auto direct_t0 = std::chrono::steady_clock::now();
+                    int rc = -1;
+                    if (!reg.filename.empty()) {
+                        size_t file_offset = (const char*)host_ptr - (const char*)reg.base;
+                        if (direct_scratch.size() < nbytes) direct_scratch.resize(nbytes);
+                        rc = llama_pread_direct(reg.filename.c_str(), direct_scratch.data(), file_offset, nbytes);
+                        static const bool s_verify_direct = []() {
+                            const char * e = std::getenv("GGML_ELASTIC_DIRECT_VERIFY");
+                            return e && *e && *e != '0';
+                        }();
+                        if (rc == 0 && s_verify_direct &&
+                            std::memcmp(direct_scratch.data(), host_ptr, nbytes) != 0) {
+                            const unsigned char * a = (const unsigned char *) direct_scratch.data();
+                            const unsigned char * b = (const unsigned char *) host_ptr;
+                            size_t mismatch = 0;
+                            while (mismatch < nbytes && a[mismatch] == b[mismatch]) {
+                                mismatch++;
+                            }
+                            static std::atomic<int> s_q8_direct_mismatch_logs{0};
+                            if (s_q8_direct_mismatch_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                                std::fprintf(stderr,
+                                             "[direct-io-q8] verify mismatch idx=%d file_off=%zu rel=%zu direct=%02x mmap=%02x, fallback mmap\n",
+                                             idx, file_offset, mismatch,
+                                             mismatch < nbytes ? a[mismatch] : 0,
+                                             mismatch < nbytes ? b[mismatch] : 0);
+                            }
+                            rc = -5;
+                        }
+                    }
+                    auto direct_dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - direct_t0).count();
+                    octx->direct_read_us += (uint64_t) direct_dt;
+                    if (rc == 0) {
+                        octx->direct_read_ok++;
+                        octx->direct_read_bytes += nbytes;
+                        octx->foreground_direct_read_calls++;
+                        octx->foreground_direct_read_us += (uint64_t) direct_dt;
+                        octx->foreground_direct_read_bytes += nbytes;
+                        src_for_dma = direct_scratch.data();
+                        src_is_direct_scratch = true;
+                        static const bool s_cache_foreground_load = []() {
+                            const char *e = std::getenv("GGML_ELASTIC_CACHE_FOREGROUND_LOAD");
+                            return !(e && *e == '0');
+                        }();
+                        if (octx->async_stage_load && s_cache_foreground_load) {
+                            {
+                                std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+                                auto &staged = octx->host_staging_by_idx[idx];
+                                staged.assign(direct_scratch.data(), direct_scratch.data() + nbytes);
+                            }
+                            {
+                                std::lock_guard<std::mutex> load_lock(octx->async_load_mtx);
+                                octx->async_load_state[idx] = 2;
+                            }
+                        }
+                    } else {
+                        octx->direct_read_fail++;
+                        if (reg.filename.empty()) {
+                            static std::atomic<int> s_q8_direct_reg_miss_logs{0};
+                            if (s_q8_direct_reg_miss_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                                std::fprintf(stderr, "[direct-io-q8] mmap registry miss idx=%d size=%zu, fallback mmap\n",
+                                             idx, nbytes);
+                            }
+                        } else {
+                            std::fprintf(stderr, "[direct-io-q8] pread_direct rc=%d, fallback mmap\n", rc);
+                        }
                     }
                 }
                 detail_record(elastic::wbmcl_stage_detail_kind::HOST_SRC, detail_t0, nbytes);
@@ -6145,27 +6426,32 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                                                    elastic::wbmcl_device_event_kind::TRANSFER_WRITE,
                                                    nbytes);
                 if (xfer_q != cap_q) clFlush(xfer_q);
+                if (src_is_direct_scratch) {
+                    clWaitForEvents(1, &write_ev);
+                }
                 if (prev_use_ev) clReleaseEvent(prev_use_ev);
 
                 detail_t0 = detail_now_us();
-                cl_buffer_region region = {0, cap_size_d};
-                cap_extra->d = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
-                                                 CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-                if (err != CL_SUCCESS) { clReleaseMemObject(new_parent); return -4; }
-                region = {cap_size_d, cap_size_q};
-                cap_extra->q = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
-                                                 CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-                if (err != CL_SUCCESS) { clReleaseMemObject(cap_extra->d); cap_extra->d = nullptr;
-                                         clReleaseMemObject(new_parent); return -5; }
-                cap_extra->size_q = cap_size_q;
-                cap_extra->size_d = cap_size_d;
+                if (!soa_hit) {
+                    cl_buffer_region region = {0, cap_size_d};
+                    cap_extra->d = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                    if (err != CL_SUCCESS) { clReleaseMemObject(new_parent); return -4; }
+                    region = {cap_size_d, cap_size_q};
+                    cap_extra->q = clCreateSubBuffer(new_parent, CL_MEM_READ_WRITE,
+                                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+                    if (err != CL_SUCCESS) { clReleaseMemObject(cap_extra->d); cap_extra->d = nullptr;
+                                             clReleaseMemObject(new_parent); return -5; }
+                    cap_extra->size_q = cap_size_q;
+                    cap_extra->size_d = cap_size_d;
+                }
                 detail_record(elastic::wbmcl_stage_detail_kind::SUBBUFFER, detail_t0, nbytes);
                 static const bool s_reload_on_xfer = []() {
                     const char *e = std::getenv("GGML_ELASTIC_RELOAD_ON_XFER");
                     return e && *e && *e != '0';
                 }();
-                cl_command_queue kernel_q = s_reload_on_xfer ? xfer_q : cap_q;
-                if (!s_reload_on_xfer) {
+                cl_command_queue kernel_q = (s_reload_on_xfer && !parent_from_pool) ? xfer_q : cap_q;
+                if (kernel_q == cap_q) {
                     detail_t0 = detail_now_us();
                     cl_int berr = clEnqueueBarrierWithWaitList(cap_q, 1, &write_ev, nullptr);
                     detail_record(elastic::wbmcl_stage_detail_kind::BARRIER_ENQUEUE, detail_t0, nbytes);
@@ -6350,6 +6636,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             GGML_LOG_INFO("ggml_opencl elastic: pin unplanned output (%zu MB) inside budget -> target=%zu MB\n",
                                           size / 1024 / 1024, s->static_target_bytes / 1024 / 1024);
                         }
+                    }
+
+                    if (ggml_opencl_elastic_evict_during_load_enabled()) {
+                        ggml_opencl_elastic_evict_to_initial_budget(&s->wbm, &s->octx, s->static_target_bytes, -1);
                     }
                 }
             }
@@ -9403,59 +9693,100 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     int padding;
     // <--------------------------------------------> //
 
-    // q8_0 x fp32 decode fast path
-    if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 && N == 1) {
+    // q8_0 x fp32 decode fast path. Some Adreno drivers accept the
+    // IMAGE1D_BUFFER objects but produce wrong logits, so keep the safe buffer
+    // kernel as the Adreno default.  The env override is left for experiments.
+    static const bool s_disable_q8_image_fast_path_env = []() {
+        const char * e = std::getenv("GGML_OPENCL_DISABLE_Q8_IMAGE_FAST_PATH");
+        return e && *e && *e != '0';
+    }();
+    static const bool s_enable_q8_image_fast_path_env = []() {
+        const char * e = std::getenv("GGML_OPENCL_ENABLE_Q8_IMAGE_FAST_PATH");
+        return e && *e && *e != '0';
+    }();
+    const bool disable_q8_image_fast_path =
+        s_disable_q8_image_fast_path_env ||
+        (backend_ctx->gpu_family == ADRENO && !s_enable_q8_image_fast_path_env);
+    if (!disable_q8_image_fast_path && src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 && N == 1) {
         img_fmt_1d = { CL_R, CL_UNSIGNED_INT32 };
         memset(&img_desc_1d, 0, sizeof(img_desc_1d));
         img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc_1d.image_width = M * K / 4;
         img_desc_1d.buffer = extra0_q8_0->q;
         A_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
-        CL_CHECK(status);
+        cl_int q8_image_status = status;
 
-        region.origin = offset1;
-        region.size = K * N * sizeof(float);
-        B_sub_buffer = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
-        CL_CHECK(status);
+        if (q8_image_status == CL_SUCCESS) {
+            region.origin = offset1;
+            region.size = K * N * sizeof(float);
+            B_sub_buffer = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+            q8_image_status = status;
+        }
 
-        img_fmt_1d = { CL_RGBA, CL_FLOAT };
-        memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_width = K * N / 4;
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.buffer = B_sub_buffer;
-        B_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
-        CL_CHECK(status);
+        if (q8_image_status == CL_SUCCESS) {
+            img_fmt_1d = { CL_RGBA, CL_FLOAT };
+            memset(&img_desc_1d, 0, sizeof(img_desc_1d));
+            img_desc_1d.image_width = K * N / 4;
+            img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc_1d.buffer = B_sub_buffer;
+            B_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
+            q8_image_status = status;
+        }
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q8_0_f32;
+        if (q8_image_status == CL_SUCCESS) {
+            kernel = backend_ctx->kernel_gemv_noshuffle_q8_0_f32;
 
-        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_image1d));
-        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
-        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &B_image1d));
-        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
-        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
-        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
-        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
-        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
-        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
-        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
-        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
-        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
-        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_image1d));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &B_image1d));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 
-        const size_t wavesize = backend_ctx->adreno_wave_size;
-        const size_t n_simdgroup = 16;
-        size_t local_work_size[3] = { wavesize, n_simdgroup, 1 };
-        size_t global_work_size[3] = { (size_t) CEIL_DIV(M, wavesize) * wavesize, n_simdgroup, 1 };
+            const size_t wavesize = backend_ctx->adreno_wave_size;
+            const size_t n_simdgroup = 16;
+            size_t local_work_size[3] = { wavesize, n_simdgroup, 1 };
+            size_t global_work_size[3] = { (size_t) CEIL_DIV(M, wavesize) * wavesize, n_simdgroup, 1 };
 
-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
-        CL_CHECK(clReleaseMemObject(A_image1d));
-        CL_CHECK(clReleaseMemObject(B_sub_buffer));
-        CL_CHECK(clReleaseMemObject(B_image1d));
+            CL_CHECK(clReleaseMemObject(A_image1d));
+            CL_CHECK(clReleaseMemObject(B_sub_buffer));
+            CL_CHECK(clReleaseMemObject(B_image1d));
 
-        return;
+            return;
+        }
+
+        static std::once_flag q8_image_fallback_once;
+        std::call_once(q8_image_fallback_once, [&]() {
+            std::fprintf(stderr,
+                         "ggml_opencl: Q8_0 image fast path unavailable, falling back to buffer matvec "
+                         "(status=%d tensor=%s M=%d K=%d N=%d width=%zu)\n",
+                         (int) q8_image_status,
+                         src0 && src0->name[0] ? src0->name : "(unnamed)",
+                         M,
+                         K,
+                         N,
+                         (size_t) M * (size_t) K / 4);
+        });
+        if (A_image1d) {
+            CL_CHECK(clReleaseMemObject(A_image1d));
+        }
+        if (B_sub_buffer) {
+            CL_CHECK(clReleaseMemObject(B_sub_buffer));
+        }
+        if (B_image1d) {
+            CL_CHECK(clReleaseMemObject(B_image1d));
+        }
     }
 
     // q4_0 x fp32

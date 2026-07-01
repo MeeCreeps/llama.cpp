@@ -1,0 +1,13 @@
+{
+  "device": "android-opencl",
+  "input_rows": 166765,
+  "model": "gemma-4-12B-it-Q4_0_reprofile_20260629",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-12B-it-Q4_0_reprofile_20260629/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-12B-it-Q4_0_reprofile_20260629/csv/opencl_stage.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-12B-it-Q4_0_reprofile_20260629/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-12B-it-Q4_0_reprofile_20260629/csv/cpu_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-12B-it-Q4_0_reprofile_20260629/csv/cpu_stage.csv"
+  ]
+}

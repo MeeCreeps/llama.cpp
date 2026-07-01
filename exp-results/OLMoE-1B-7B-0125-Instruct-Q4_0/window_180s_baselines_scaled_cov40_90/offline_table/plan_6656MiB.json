@@ -1,0 +1,3946 @@
+{
+  "bottleneck": "cp_sat",
+  "budget_mib": 6656,
+  "cost_model": {
+    "allowed_placements": [
+      "cpu",
+      "disk_cpu",
+      "disk_gpu",
+      "gpu"
+    ],
+    "backend_choice": "multi_backend_placement",
+    "base_transition_weight": 0.1,
+    "calibration": {},
+    "cp_objective": "resource_makespan",
+    "cpu_elastic_compute_measured": true,
+    "cpu_elastic_stage_measured": true,
+    "cpu_fallback_enabled": true,
+    "disk_gpu_reload_multiplier": 4.0,
+    "disk_reload_multiplier": 1.0,
+    "exclude_plan_count": 0,
+    "legacy_reload_ensure_available": true,
+    "legacy_reload_ensure_used": false,
+    "min_placement_distance": 0,
+    "movement_cost": "fine_stage_path",
+    "opencl_compute_measured": true,
+    "opencl_stage_measured": true,
+    "overlap_model": "pipeline",
+    "transition_horizon_tokens": 1.0,
+    "transition_weight": 0.0
+  },
+  "kv_bytes": 536870912,
+  "misc_bytes": 268435456,
+  "ops": [
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_k.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_output.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_q.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_v.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_k_norm.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_norm.weight",
+      "op_id": 5,
+      "weight_id": 5
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_q_norm.weight",
+      "op_id": 6,
+      "weight_id": 6
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_down_exps.weight",
+      "op_id": 7,
+      "weight_id": 7
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_gate_exps.weight",
+      "op_id": 8,
+      "weight_id": 8
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_gate_inp.weight",
+      "op_id": 9,
+      "weight_id": 9
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_norm.weight",
+      "op_id": 10,
+      "weight_id": 10
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_up_exps.weight",
+      "op_id": 11,
+      "weight_id": 11
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_k.weight",
+      "op_id": 12,
+      "weight_id": 12
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_output.weight",
+      "op_id": 13,
+      "weight_id": 13
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_q.weight",
+      "op_id": 14,
+      "weight_id": 14
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_v.weight",
+      "op_id": 15,
+      "weight_id": 15
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_k_norm.weight",
+      "op_id": 16,
+      "weight_id": 16
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_norm.weight",
+      "op_id": 17,
+      "weight_id": 17
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.attn_q_norm.weight",
+      "op_id": 18,
+      "weight_id": 18
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.ffn_down_exps.weight",
+      "op_id": 19,
+      "weight_id": 19
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.ffn_gate_exps.weight",
+      "op_id": 20,
+      "weight_id": 20
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.ffn_gate_inp.weight",
+      "op_id": 21,
+      "weight_id": 21
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.ffn_norm.weight",
+      "op_id": 22,
+      "weight_id": 22
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.1.ffn_up_exps.weight",
+      "op_id": 23,
+      "weight_id": 23
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_k.weight",
+      "op_id": 24,
+      "weight_id": 24
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_output.weight",
+      "op_id": 25,
+      "weight_id": 25
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_q.weight",
+      "op_id": 26,
+      "weight_id": 26
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_v.weight",
+      "op_id": 27,
+      "weight_id": 27
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_k_norm.weight",
+      "op_id": 28,
+      "weight_id": 28
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_norm.weight",
+      "op_id": 29,
+      "weight_id": 29
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.attn_q_norm.weight",
+      "op_id": 30,
+      "weight_id": 30
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.2.ffn_down_exps.weight",
+      "op_id": 31,
+      "weight_id": 31
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.ffn_gate_exps.weight",
+      "op_id": 32,
+      "weight_id": 32
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.ffn_gate_inp.weight",
+      "op_id": 33,
+      "weight_id": 33
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.ffn_norm.weight",
+      "op_id": 34,
+      "weight_id": 34
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 2,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.2.ffn_up_exps.weight",
+      "op_id": 35,
+      "weight_id": 35
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_k.weight",
+      "op_id": 36,
+      "weight_id": 36
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_output.weight",
+      "op_id": 37,
+      "weight_id": 37
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_q.weight",
+      "op_id": 38,
+      "weight_id": 38
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_v.weight",
+      "op_id": 39,
+      "weight_id": 39
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_k_norm.weight",
+      "op_id": 40,
+      "weight_id": 40
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_norm.weight",
+      "op_id": 41,
+      "weight_id": 41
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.attn_q_norm.weight",
+      "op_id": 42,
+      "weight_id": 42
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.ffn_down_exps.weight",
+      "op_id": 43,
+      "weight_id": 43
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.ffn_gate_exps.weight",
+      "op_id": 44,
+      "weight_id": 44
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.ffn_gate_inp.weight",
+      "op_id": 45,
+      "weight_id": 45
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.3.ffn_norm.weight",
+      "op_id": 46,
+      "weight_id": 46
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 3,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.3.ffn_up_exps.weight",
+      "op_id": 47,
+      "weight_id": 47
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_k.weight",
+      "op_id": 48,
+      "weight_id": 48
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_output.weight",
+      "op_id": 49,
+      "weight_id": 49
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_q.weight",
+      "op_id": 50,
+      "weight_id": 50
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_v.weight",
+      "op_id": 51,
+      "weight_id": 51
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_k_norm.weight",
+      "op_id": 52,
+      "weight_id": 52
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_norm.weight",
+      "op_id": 53,
+      "weight_id": 53
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.attn_q_norm.weight",
+      "op_id": 54,
+      "weight_id": 54
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.ffn_down_exps.weight",
+      "op_id": 55,
+      "weight_id": 55
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.4.ffn_gate_exps.weight",
+      "op_id": 56,
+      "weight_id": 56
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.ffn_gate_inp.weight",
+      "op_id": 57,
+      "weight_id": 57
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.ffn_norm.weight",
+      "op_id": 58,
+      "weight_id": 58
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 4,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.4.ffn_up_exps.weight",
+      "op_id": 59,
+      "weight_id": 59
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_k.weight",
+      "op_id": 60,
+      "weight_id": 60
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_output.weight",
+      "op_id": 61,
+      "weight_id": 61
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_q.weight",
+      "op_id": 62,
+      "weight_id": 62
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_v.weight",
+      "op_id": 63,
+      "weight_id": 63
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_k_norm.weight",
+      "op_id": 64,
+      "weight_id": 64
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_norm.weight",
+      "op_id": 65,
+      "weight_id": 65
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.attn_q_norm.weight",
+      "op_id": 66,
+      "weight_id": 66
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.5.ffn_down_exps.weight",
+      "op_id": 67,
+      "weight_id": 67
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.5.ffn_gate_exps.weight",
+      "op_id": 68,
+      "weight_id": 68
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.ffn_gate_inp.weight",
+      "op_id": 69,
+      "weight_id": 69
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.5.ffn_norm.weight",
+      "op_id": 70,
+      "weight_id": 70
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 5,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.5.ffn_up_exps.weight",
+      "op_id": 71,
+      "weight_id": 71
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_k.weight",
+      "op_id": 72,
+      "weight_id": 72
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_output.weight",
+      "op_id": 73,
+      "weight_id": 73
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_q.weight",
+      "op_id": 74,
+      "weight_id": 74
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_v.weight",
+      "op_id": 75,
+      "weight_id": 75
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_k_norm.weight",
+      "op_id": 76,
+      "weight_id": 76
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_norm.weight",
+      "op_id": 77,
+      "weight_id": 77
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.attn_q_norm.weight",
+      "op_id": 78,
+      "weight_id": 78
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.6.ffn_down_exps.weight",
+      "op_id": 79,
+      "weight_id": 79
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.6.ffn_gate_exps.weight",
+      "op_id": 80,
+      "weight_id": 80
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.ffn_gate_inp.weight",
+      "op_id": 81,
+      "weight_id": 81
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.6.ffn_norm.weight",
+      "op_id": 82,
+      "weight_id": 82
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 6,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.6.ffn_up_exps.weight",
+      "op_id": 83,
+      "weight_id": 83
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_k.weight",
+      "op_id": 84,
+      "weight_id": 84
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_output.weight",
+      "op_id": 85,
+      "weight_id": 85
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_q.weight",
+      "op_id": 86,
+      "weight_id": 86
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_v.weight",
+      "op_id": 87,
+      "weight_id": 87
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_k_norm.weight",
+      "op_id": 88,
+      "weight_id": 88
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_norm.weight",
+      "op_id": 89,
+      "weight_id": 89
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.attn_q_norm.weight",
+      "op_id": 90,
+      "weight_id": 90
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.7.ffn_down_exps.weight",
+      "op_id": 91,
+      "weight_id": 91
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.7.ffn_gate_exps.weight",
+      "op_id": 92,
+      "weight_id": 92
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.ffn_gate_inp.weight",
+      "op_id": 93,
+      "weight_id": 93
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.7.ffn_norm.weight",
+      "op_id": 94,
+      "weight_id": 94
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 7,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.7.ffn_up_exps.weight",
+      "op_id": 95,
+      "weight_id": 95
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_k.weight",
+      "op_id": 96,
+      "weight_id": 96
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_output.weight",
+      "op_id": 97,
+      "weight_id": 97
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_q.weight",
+      "op_id": 98,
+      "weight_id": 98
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_v.weight",
+      "op_id": 99,
+      "weight_id": 99
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_k_norm.weight",
+      "op_id": 100,
+      "weight_id": 100
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_norm.weight",
+      "op_id": 101,
+      "weight_id": 101
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.attn_q_norm.weight",
+      "op_id": 102,
+      "weight_id": 102
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.ffn_down_exps.weight",
+      "op_id": 103,
+      "weight_id": 103
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.8.ffn_gate_exps.weight",
+      "op_id": 104,
+      "weight_id": 104
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.ffn_gate_inp.weight",
+      "op_id": 105,
+      "weight_id": 105
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.8.ffn_norm.weight",
+      "op_id": 106,
+      "weight_id": 106
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 8,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.8.ffn_up_exps.weight",
+      "op_id": 107,
+      "weight_id": 107
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_k.weight",
+      "op_id": 108,
+      "weight_id": 108
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_output.weight",
+      "op_id": 109,
+      "weight_id": 109
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_q.weight",
+      "op_id": 110,
+      "weight_id": 110
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_v.weight",
+      "op_id": 111,
+      "weight_id": 111
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_k_norm.weight",
+      "op_id": 112,
+      "weight_id": 112
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_norm.weight",
+      "op_id": 113,
+      "weight_id": 113
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.attn_q_norm.weight",
+      "op_id": 114,
+      "weight_id": 114
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.9.ffn_down_exps.weight",
+      "op_id": 115,
+      "weight_id": 115
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.9.ffn_gate_exps.weight",
+      "op_id": 116,
+      "weight_id": 116
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.ffn_gate_inp.weight",
+      "op_id": 117,
+      "weight_id": 117
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.9.ffn_norm.weight",
+      "op_id": 118,
+      "weight_id": 118
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 9,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.9.ffn_up_exps.weight",
+      "op_id": 119,
+      "weight_id": 119
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_k.weight",
+      "op_id": 120,
+      "weight_id": 120
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_output.weight",
+      "op_id": 121,
+      "weight_id": 121
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_q.weight",
+      "op_id": 122,
+      "weight_id": 122
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_v.weight",
+      "op_id": 123,
+      "weight_id": 123
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_k_norm.weight",
+      "op_id": 124,
+      "weight_id": 124
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_norm.weight",
+      "op_id": 125,
+      "weight_id": 125
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.attn_q_norm.weight",
+      "op_id": 126,
+      "weight_id": 126
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.10.ffn_down_exps.weight",
+      "op_id": 127,
+      "weight_id": 127
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.10.ffn_gate_exps.weight",
+      "op_id": 128,
+      "weight_id": 128
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.ffn_gate_inp.weight",
+      "op_id": 129,
+      "weight_id": 129
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.10.ffn_norm.weight",
+      "op_id": 130,
+      "weight_id": 130
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 10,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.10.ffn_up_exps.weight",
+      "op_id": 131,
+      "weight_id": 131
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_k.weight",
+      "op_id": 132,
+      "weight_id": 132
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_output.weight",
+      "op_id": 133,
+      "weight_id": 133
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_q.weight",
+      "op_id": 134,
+      "weight_id": 134
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_v.weight",
+      "op_id": 135,
+      "weight_id": 135
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_k_norm.weight",
+      "op_id": 136,
+      "weight_id": 136
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_norm.weight",
+      "op_id": 137,
+      "weight_id": 137
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.attn_q_norm.weight",
+      "op_id": 138,
+      "weight_id": 138
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.11.ffn_down_exps.weight",
+      "op_id": 139,
+      "weight_id": 139
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.11.ffn_gate_exps.weight",
+      "op_id": 140,
+      "weight_id": 140
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.ffn_gate_inp.weight",
+      "op_id": 141,
+      "weight_id": 141
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.11.ffn_norm.weight",
+      "op_id": 142,
+      "weight_id": 142
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 11,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.11.ffn_up_exps.weight",
+      "op_id": 143,
+      "weight_id": 143
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_k.weight",
+      "op_id": 144,
+      "weight_id": 144
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_output.weight",
+      "op_id": 145,
+      "weight_id": 145
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_q.weight",
+      "op_id": 146,
+      "weight_id": 146
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_v.weight",
+      "op_id": 147,
+      "weight_id": 147
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_k_norm.weight",
+      "op_id": 148,
+      "weight_id": 148
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_norm.weight",
+      "op_id": 149,
+      "weight_id": 149
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.attn_q_norm.weight",
+      "op_id": 150,
+      "weight_id": 150
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.ffn_down_exps.weight",
+      "op_id": 151,
+      "weight_id": 151
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.12.ffn_gate_exps.weight",
+      "op_id": 152,
+      "weight_id": 152
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.ffn_gate_inp.weight",
+      "op_id": 153,
+      "weight_id": 153
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.12.ffn_norm.weight",
+      "op_id": 154,
+      "weight_id": 154
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 12,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.12.ffn_up_exps.weight",
+      "op_id": 155,
+      "weight_id": 155
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_k.weight",
+      "op_id": 156,
+      "weight_id": 156
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_output.weight",
+      "op_id": 157,
+      "weight_id": 157
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_q.weight",
+      "op_id": 158,
+      "weight_id": 158
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_v.weight",
+      "op_id": 159,
+      "weight_id": 159
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_k_norm.weight",
+      "op_id": 160,
+      "weight_id": 160
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_norm.weight",
+      "op_id": 161,
+      "weight_id": 161
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.attn_q_norm.weight",
+      "op_id": 162,
+      "weight_id": 162
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.13.ffn_down_exps.weight",
+      "op_id": 163,
+      "weight_id": 163
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.13.ffn_gate_exps.weight",
+      "op_id": 164,
+      "weight_id": 164
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.ffn_gate_inp.weight",
+      "op_id": 165,
+      "weight_id": 165
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.13.ffn_norm.weight",
+      "op_id": 166,
+      "weight_id": 166
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 13,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.13.ffn_up_exps.weight",
+      "op_id": 167,
+      "weight_id": 167
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_k.weight",
+      "op_id": 168,
+      "weight_id": 168
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_output.weight",
+      "op_id": 169,
+      "weight_id": 169
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_q.weight",
+      "op_id": 170,
+      "weight_id": 170
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_v.weight",
+      "op_id": 171,
+      "weight_id": 171
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_k_norm.weight",
+      "op_id": 172,
+      "weight_id": 172
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_norm.weight",
+      "op_id": 173,
+      "weight_id": 173
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.attn_q_norm.weight",
+      "op_id": 174,
+      "weight_id": 174
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.14.ffn_down_exps.weight",
+      "op_id": 175,
+      "weight_id": 175
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.14.ffn_gate_exps.weight",
+      "op_id": 176,
+      "weight_id": 176
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.ffn_gate_inp.weight",
+      "op_id": 177,
+      "weight_id": 177
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.14.ffn_norm.weight",
+      "op_id": 178,
+      "weight_id": 178
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 14,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.14.ffn_up_exps.weight",
+      "op_id": 179,
+      "weight_id": 179
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_k.weight",
+      "op_id": 180,
+      "weight_id": 180
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_output.weight",
+      "op_id": 181,
+      "weight_id": 181
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_q.weight",
+      "op_id": 182,
+      "weight_id": 182
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_v.weight",
+      "op_id": 183,
+      "weight_id": 183
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_k_norm.weight",
+      "op_id": 184,
+      "weight_id": 184
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_norm.weight",
+      "op_id": 185,
+      "weight_id": 185
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.attn_q_norm.weight",
+      "op_id": 186,
+      "weight_id": 186
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.15.ffn_down_exps.weight",
+      "op_id": 187,
+      "weight_id": 187
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.15.ffn_gate_exps.weight",
+      "op_id": 188,
+      "weight_id": 188
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.ffn_gate_inp.weight",
+      "op_id": 189,
+      "weight_id": 189
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.15.ffn_norm.weight",
+      "op_id": 190,
+      "weight_id": 190
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": 15,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "blk.15.ffn_up_exps.weight",
+      "op_id": 191,
+      "weight_id": 191
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": -1,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "output.weight",
+      "op_id": 192,
+      "weight_id": 192
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": -1,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "output_norm.weight",
+      "op_id": 193,
+      "weight_id": 193
+    },
+    {
+      "compute_backend": "gpu",
+      "dispatch": "static",
+      "layer": -1,
+      "migrate": false,
+      "migrate_from": "gpu",
+      "migrate_xform": "none",
+      "name": "token_embd.weight",
+      "op_id": 194,
+      "weight_id": 194
+    }
+  ],
+  "pred_per_token_ms": 113.39230806249986,
+  "schedule": {
+    "events": [],
+    "kind": "none",
+    "objective_ms": null,
+    "status": "OPTIMAL"
+  },
+  "schema_version": 1,
+  "timeline": [],
+  "weights": [
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_k.weight",
+      "pinned": false,
+      "weight_id": 0,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_output.weight",
+      "pinned": false,
+      "weight_id": 1,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_q.weight",
+      "pinned": false,
+      "weight_id": 2,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_v.weight",
+      "pinned": false,
+      "weight_id": 3,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 4,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 5,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 6,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 0,
+      "location": "gpu",
+      "name": "blk.0.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 7,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 8,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 9,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 10,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 0,
+      "location": "cpu",
+      "name": "blk.0.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 11,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_k.weight",
+      "pinned": false,
+      "weight_id": 12,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_output.weight",
+      "pinned": false,
+      "weight_id": 13,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_q.weight",
+      "pinned": false,
+      "weight_id": 14,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_v.weight",
+      "pinned": false,
+      "weight_id": 15,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 16,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 17,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 18,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 19,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 20,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 21,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 22,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 1,
+      "location": "cpu",
+      "name": "blk.1.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 23,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_k.weight",
+      "pinned": false,
+      "weight_id": 24,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_output.weight",
+      "pinned": false,
+      "weight_id": 25,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_q.weight",
+      "pinned": false,
+      "weight_id": 26,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_v.weight",
+      "pinned": false,
+      "weight_id": 27,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 28,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 29,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 30,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 2,
+      "location": "gpu",
+      "name": "blk.2.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 31,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 32,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 33,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 34,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 2,
+      "location": "cpu",
+      "name": "blk.2.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 35,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_k.weight",
+      "pinned": false,
+      "weight_id": 36,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_output.weight",
+      "pinned": false,
+      "weight_id": 37,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_q.weight",
+      "pinned": false,
+      "weight_id": 38,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_v.weight",
+      "pinned": false,
+      "weight_id": 39,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 40,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 41,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 42,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 43,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 44,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 45,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "location": "cpu",
+      "name": "blk.3.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 46,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 3,
+      "location": "gpu",
+      "name": "blk.3.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 47,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_k.weight",
+      "pinned": false,
+      "weight_id": 48,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_output.weight",
+      "pinned": false,
+      "weight_id": 49,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_q.weight",
+      "pinned": false,
+      "weight_id": 50,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_v.weight",
+      "pinned": false,
+      "weight_id": 51,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 52,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 53,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 54,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 55,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 4,
+      "location": "gpu",
+      "name": "blk.4.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 56,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 57,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 58,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 4,
+      "location": "cpu",
+      "name": "blk.4.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 59,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_k.weight",
+      "pinned": false,
+      "weight_id": 60,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_output.weight",
+      "pinned": false,
+      "weight_id": 61,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_q.weight",
+      "pinned": false,
+      "weight_id": 62,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_v.weight",
+      "pinned": false,
+      "weight_id": 63,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 64,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 65,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 66,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 5,
+      "location": "gpu",
+      "name": "blk.5.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 67,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 5,
+      "location": "gpu",
+      "name": "blk.5.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 68,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 69,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "location": "cpu",
+      "name": "blk.5.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 70,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 5,
+      "location": "gpu",
+      "name": "blk.5.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 71,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_k.weight",
+      "pinned": false,
+      "weight_id": 72,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_output.weight",
+      "pinned": false,
+      "weight_id": 73,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_q.weight",
+      "pinned": false,
+      "weight_id": 74,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_v.weight",
+      "pinned": false,
+      "weight_id": 75,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 76,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 77,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 78,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 6,
+      "location": "gpu",
+      "name": "blk.6.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 79,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 6,
+      "location": "gpu",
+      "name": "blk.6.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 80,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 81,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "location": "cpu",
+      "name": "blk.6.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 82,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 6,
+      "location": "gpu",
+      "name": "blk.6.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 83,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_k.weight",
+      "pinned": false,
+      "weight_id": 84,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_output.weight",
+      "pinned": false,
+      "weight_id": 85,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_q.weight",
+      "pinned": false,
+      "weight_id": 86,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_v.weight",
+      "pinned": false,
+      "weight_id": 87,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 88,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 89,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 90,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 7,
+      "location": "gpu",
+      "name": "blk.7.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 91,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 7,
+      "location": "gpu",
+      "name": "blk.7.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 92,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 93,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "location": "cpu",
+      "name": "blk.7.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 94,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 7,
+      "location": "gpu",
+      "name": "blk.7.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 95,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_k.weight",
+      "pinned": false,
+      "weight_id": 96,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_output.weight",
+      "pinned": false,
+      "weight_id": 97,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_q.weight",
+      "pinned": false,
+      "weight_id": 98,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_v.weight",
+      "pinned": false,
+      "weight_id": 99,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 100,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 101,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 102,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 103,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 8,
+      "location": "gpu",
+      "name": "blk.8.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 104,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 105,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "location": "cpu",
+      "name": "blk.8.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 106,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 8,
+      "location": "gpu",
+      "name": "blk.8.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 107,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_k.weight",
+      "pinned": false,
+      "weight_id": 108,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_output.weight",
+      "pinned": false,
+      "weight_id": 109,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_q.weight",
+      "pinned": false,
+      "weight_id": 110,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_v.weight",
+      "pinned": false,
+      "weight_id": 111,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 112,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 113,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 114,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 9,
+      "location": "gpu",
+      "name": "blk.9.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 115,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 9,
+      "location": "gpu",
+      "name": "blk.9.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 116,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 117,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "location": "cpu",
+      "name": "blk.9.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 118,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 9,
+      "location": "gpu",
+      "name": "blk.9.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 119,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_k.weight",
+      "pinned": false,
+      "weight_id": 120,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_output.weight",
+      "pinned": false,
+      "weight_id": 121,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_q.weight",
+      "pinned": false,
+      "weight_id": 122,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_v.weight",
+      "pinned": false,
+      "weight_id": 123,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 124,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 125,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 126,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 10,
+      "location": "gpu",
+      "name": "blk.10.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 127,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 10,
+      "location": "gpu",
+      "name": "blk.10.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 128,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 129,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "location": "cpu",
+      "name": "blk.10.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 130,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 10,
+      "location": "gpu",
+      "name": "blk.10.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 131,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_k.weight",
+      "pinned": false,
+      "weight_id": 132,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_output.weight",
+      "pinned": false,
+      "weight_id": 133,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_q.weight",
+      "pinned": false,
+      "weight_id": 134,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_v.weight",
+      "pinned": false,
+      "weight_id": 135,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 136,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 137,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 138,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 11,
+      "location": "gpu",
+      "name": "blk.11.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 139,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 11,
+      "location": "gpu",
+      "name": "blk.11.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 140,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 141,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "location": "cpu",
+      "name": "blk.11.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 142,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 11,
+      "location": "gpu",
+      "name": "blk.11.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 143,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_k.weight",
+      "pinned": false,
+      "weight_id": 144,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_output.weight",
+      "pinned": false,
+      "weight_id": 145,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_q.weight",
+      "pinned": false,
+      "weight_id": 146,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_v.weight",
+      "pinned": false,
+      "weight_id": 147,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 148,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 149,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 150,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 151,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 12,
+      "location": "gpu",
+      "name": "blk.12.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 152,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 153,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "location": "cpu",
+      "name": "blk.12.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 154,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 12,
+      "location": "gpu",
+      "name": "blk.12.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 155,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_k.weight",
+      "pinned": false,
+      "weight_id": 156,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_output.weight",
+      "pinned": false,
+      "weight_id": 157,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_q.weight",
+      "pinned": false,
+      "weight_id": 158,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_v.weight",
+      "pinned": false,
+      "weight_id": 159,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 160,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 161,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 162,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 13,
+      "location": "gpu",
+      "name": "blk.13.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 163,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 13,
+      "location": "gpu",
+      "name": "blk.13.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 164,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 165,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "location": "cpu",
+      "name": "blk.13.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 166,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 13,
+      "location": "gpu",
+      "name": "blk.13.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 167,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_k.weight",
+      "pinned": false,
+      "weight_id": 168,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_output.weight",
+      "pinned": false,
+      "weight_id": 169,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_q.weight",
+      "pinned": false,
+      "weight_id": 170,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_v.weight",
+      "pinned": false,
+      "weight_id": 171,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 172,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 173,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 174,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 14,
+      "location": "gpu",
+      "name": "blk.14.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 175,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 14,
+      "location": "gpu",
+      "name": "blk.14.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 176,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 177,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "location": "cpu",
+      "name": "blk.14.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 178,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 14,
+      "location": "gpu",
+      "name": "blk.14.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 179,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_k.weight",
+      "pinned": false,
+      "weight_id": 180,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_output.weight",
+      "pinned": false,
+      "weight_id": 181,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_q.weight",
+      "pinned": false,
+      "weight_id": 182,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_v.weight",
+      "pinned": false,
+      "weight_id": 183,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_k_norm.weight",
+      "pinned": false,
+      "weight_id": 184,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_norm.weight",
+      "pinned": false,
+      "weight_id": 185,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.attn_q_norm.weight",
+      "pinned": false,
+      "weight_id": 186,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 15,
+      "location": "gpu",
+      "name": "blk.15.ffn_down_exps.weight",
+      "pinned": false,
+      "weight_id": 187,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 15,
+      "location": "gpu",
+      "name": "blk.15.ffn_gate_exps.weight",
+      "pinned": false,
+      "weight_id": 188,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 524288,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.ffn_gate_inp.weight",
+      "pinned": false,
+      "weight_id": 189,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "location": "cpu",
+      "name": "blk.15.ffn_norm.weight",
+      "pinned": false,
+      "weight_id": 190,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 75497472,
+      "layer": 15,
+      "location": "gpu",
+      "name": "blk.15.ffn_up_exps.weight",
+      "pinned": false,
+      "weight_id": 191,
+      "xform": "gpu_convert"
+    },
+    {
+      "byte_size": 84510720,
+      "layer": -1,
+      "location": "gpu",
+      "name": "output.weight",
+      "pinned": false,
+      "weight_id": 192,
+      "xform": "none"
+    },
+    {
+      "byte_size": 8192,
+      "layer": -1,
+      "location": "cpu",
+      "name": "output_norm.weight",
+      "pinned": false,
+      "weight_id": 193,
+      "xform": "cpu_repack"
+    },
+    {
+      "byte_size": 57950208,
+      "layer": -1,
+      "location": "gpu",
+      "name": "token_embd.weight",
+      "pinned": false,
+      "weight_id": 194,
+      "xform": "gpu_convert"
+    }
+  ]
+}

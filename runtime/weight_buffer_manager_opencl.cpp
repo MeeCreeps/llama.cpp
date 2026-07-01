@@ -120,11 +120,28 @@ bool async_load_on_evict_enabled() {
     return enabled;
 }
 
+bool async_stage_load_legacy_unbounded_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_UNSAFE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+bool async_stage_load_bounded_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_BOUNDED");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
 
 bool release_stage_after_xform_enabled() {
     static const bool enabled = []() {
         const char *e = std::getenv("GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM");
-        return e && *e && *e != '0';
+        if (e && *e) return *e != '0';
+        return true;
     }();
     return enabled;
 }
@@ -165,19 +182,65 @@ size_t async_stage_prepare_max_pending() {
     return max_pending;
 }
 
+size_t async_stage_load_max_pending_bytes() {
+    static const size_t max_pending_bytes = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_MAX_PENDING_MB");
+        long long mib = e && *e ? atoll(e) : 128;
+        if (mib < 0) mib = 0;
+        return static_cast<size_t>(mib) * 1024ull * 1024ull;
+    }();
+    return max_pending_bytes;
+}
+
+size_t async_stage_load_max_pending_count() {
+    static const size_t max_pending_count = []() {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_MAX_PENDING_COUNT");
+        long long v = e && *e ? atoll(e) : 2;
+        if (v < 0) v = 0;
+        return static_cast<size_t>(v);
+    }();
+    return max_pending_count;
+}
+
+size_t async_stage_load_max_staged_bytes() {
+    static const size_t max_staged_bytes = []() -> size_t {
+        const char * e = std::getenv("GGML_ELASTIC_ASYNC_LOAD_MAX_STAGED_MB");
+        if (e && *e) {
+            long long mib = atoll(e);
+            if (mib < 0) mib = 0;
+            return static_cast<size_t>(mib) * 1024ull * 1024ull;
+        }
+        return async_stage_load_max_pending_bytes();
+    }();
+    return max_staged_bytes;
+}
+
+size_t host_staging_active_bytes_locked(wbm_opencl_ctx * octx) {
+    if (!octx) return 0;
+    size_t bytes = 0;
+    for (const auto & kv : octx->host_staging_by_idx) {
+        bytes += kv.second.size();
+    }
+    return bytes;
+}
+
 void release_host_staging(wbm_opencl_ctx *octx, int idx) {
     if (!octx) return;
+    bool released = false;
     {
         std::lock_guard<std::mutex> lock(octx->host_staging_mtx);
         auto it = octx->host_staging_by_idx.find(idx);
         if (it == octx->host_staging_by_idx.end()) return;
         host_staging_pool_put(octx, std::move(it->second));
         octx->host_staging_by_idx.erase(it);
+        released = true;
     }
     if (octx->async_stage_load) {
         std::lock_guard<std::mutex> lock(octx->async_load_mtx);
         octx->async_load_state.erase(idx);
+        octx->async_load_bytes_by_idx.erase(idx);
     }
+    if (released) octx->async_load_cv.notify_all();
 }
 
 }  // namespace
@@ -227,13 +290,37 @@ int wbmcl_init(wbm_opencl_ctx *octx,
         const char * e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_LOAD");
         return e && *e && *e != '0';
     }();
+    if (octx->async_stage_load &&
+        !async_stage_load_bounded_enabled() &&
+        !async_stage_load_legacy_unbounded_enabled()) {
+        std::fprintf(stderr,
+                     "ggml_opencl elastic: async stage LOAD disabled by fail-safe "
+                     "(set GGML_ELASTIC_ASYNC_LOAD_BOUNDED=1 for bounded experimental path)\n");
+        octx->async_stage_load = false;
+    } else if (octx->async_stage_load && async_stage_load_bounded_enabled() &&
+               !async_stage_load_legacy_unbounded_enabled()) {
+        std::fprintf(stderr,
+                     "ggml_opencl elastic: async stage LOAD bounded "
+                     "(pending_cap=%zuMiB pending_count=%zu staged_cap=%zuMiB; "
+                     "set GGML_ELASTIC_ASYNC_LOAD_UNSAFE=1 for legacy unbounded path)\n",
+                     async_stage_load_max_pending_bytes() / 1024 / 1024,
+                     async_stage_load_max_pending_count(),
+                     async_stage_load_max_staged_bytes() / 1024 / 1024);
+    }
     octx->async_load_shutdown = false;
     octx->async_load_queue.clear();
     octx->async_load_state.clear();
+    octx->async_load_bytes_by_idx.clear();
     octx->async_load_enqueued = 0;
     octx->async_load_completed = 0;
     octx->async_load_waits = 0;
     octx->async_load_wait_us = 0;
+    octx->async_load_pending_bytes = 0;
+    octx->async_load_max_pending_bytes_seen = 0;
+    octx->async_load_max_pending_count_seen = 0;
+    octx->async_load_throttle_waits = 0;
+    octx->async_load_throttle_wait_us = 0;
+    octx->async_load_throttle_skipped = 0;
     octx->async_soa_reload_worker_started = false;
     octx->async_soa_reload_queue.clear();
     octx->async_soa_reload_state.clear();
@@ -287,13 +374,17 @@ int wbmcl_init(wbm_opencl_ctx *octx,
                 const int rc = wbmcl_load_host(octx, idx);
                 {
                     std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+                    auto bit = octx->async_load_bytes_by_idx.find(idx);
+                    if (bit != octx->async_load_bytes_by_idx.end()) {
+                        octx->async_load_pending_bytes -= std::min(octx->async_load_pending_bytes, bit->second);
+                        octx->async_load_bytes_by_idx.erase(bit);
+                    }
                     octx->async_load_state[idx] = rc == 0 ? 2 : rc;
                     octx->async_load_completed++;
                 }
                 octx->async_load_cv.notify_all();
             }
         });
-        octx->async_load_worker.detach();
     }
     return 0;
 }
@@ -403,11 +494,21 @@ void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
     if (octx->async_stage_load) {
         const double wait_ms = octx->async_load_wait_us / 1000.0;
         const double avg_wait = octx->async_load_waits ? wait_ms / octx->async_load_waits : 0.0;
-        std::fprintf(out, "async load worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms\n",
+        const double throttle_ms = octx->async_load_throttle_wait_us / 1000.0;
+        const double throttle_avg = octx->async_load_throttle_waits ? throttle_ms / octx->async_load_throttle_waits : 0.0;
+        std::fprintf(out,
+                     "async load worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms "
+                     "throttle_waits=%llu throttle_total=%.3f ms throttle_avg=%.3f ms throttle_skipped=%llu "
+                     "max_pending=%zu MB max_pending_count=%zu\n",
                      (unsigned long long) octx->async_load_enqueued,
                      (unsigned long long) octx->async_load_completed,
                      (unsigned long long) octx->async_load_waits,
-                     wait_ms, avg_wait);
+                     wait_ms, avg_wait,
+                     (unsigned long long) octx->async_load_throttle_waits,
+                     throttle_ms, throttle_avg,
+                     (unsigned long long) octx->async_load_throttle_skipped,
+                     octx->async_load_max_pending_bytes_seen / 1024 / 1024,
+                     octx->async_load_max_pending_count_seen);
     }
     if (async_stage_prepare_enabled() || octx->async_soa_reload_worker_started ||
         octx->async_soa_reload_enqueued > 0 || octx->async_soa_reload_completed > 0) {
@@ -780,11 +881,56 @@ int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
             return 0;
         }
     }
+    size_t staged_bytes = 0;
+    const bool legacy_unbounded = async_stage_load_legacy_unbounded_enabled();
+    const size_t max_staged_bytes = legacy_unbounded ? 0 : async_stage_load_max_staged_bytes();
+    if (max_staged_bytes > 0) {
+        std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
+        staged_bytes = host_staging_active_bytes_locked(octx);
+    }
     {
-        std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+        std::unique_lock<std::mutex> lock(octx->async_load_mtx);
         auto it = octx->async_load_state.find(idx);
         if (it != octx->async_load_state.end() && it->second == 1) return 0;
+        if (max_staged_bytes > 0 &&
+            staged_bytes + octx->async_load_pending_bytes + meta->byte_size > max_staged_bytes &&
+            (staged_bytes + octx->async_load_pending_bytes > 0 || meta->byte_size > max_staged_bytes)) {
+            octx->async_load_throttle_skipped++;
+            return 0;
+        }
+        const size_t max_pending_bytes = legacy_unbounded ? 0 : async_stage_load_max_pending_bytes();
+        const size_t max_pending_count = legacy_unbounded ? 0 : async_stage_load_max_pending_count();
+        if ((max_pending_bytes > 0 || max_pending_count > 0) && meta->byte_size > 0) {
+            const uint64_t wait_t0 = now_us();
+            bool waited = false;
+            octx->async_load_cv.wait(lock, [&]() {
+                if (octx->async_load_shutdown) return true;
+                const size_t pending_count = octx->async_load_bytes_by_idx.size();
+                const bool bytes_ok =
+                    max_pending_bytes == 0 ||
+                    octx->async_load_pending_bytes + meta->byte_size <= max_pending_bytes ||
+                    octx->async_load_pending_bytes == 0;
+                const bool count_ok =
+                    max_pending_count == 0 ||
+                    pending_count < max_pending_count ||
+                    pending_count == 0;
+                const bool ok = bytes_ok && count_ok;
+                if (!ok) waited = true;
+                return ok;
+            });
+            if (waited) {
+                octx->async_load_throttle_waits++;
+                octx->async_load_throttle_wait_us += now_us() - wait_t0;
+            }
+        }
+        if (octx->async_load_shutdown) return -10;
         octx->async_load_state[idx] = 1;
+        octx->async_load_bytes_by_idx[idx] = meta->byte_size;
+        octx->async_load_pending_bytes += meta->byte_size;
+        octx->async_load_max_pending_bytes_seen =
+            std::max(octx->async_load_max_pending_bytes_seen, octx->async_load_pending_bytes);
+        octx->async_load_max_pending_count_seen =
+            std::max(octx->async_load_max_pending_count_seen, octx->async_load_bytes_by_idx.size());
         octx->async_load_queue.push_back(idx);
         octx->async_load_enqueued++;
     }
@@ -1044,6 +1190,7 @@ int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
             rc = 0;
         } else if (async_stage_prepare_enabled() && wbmcl_wait_soa_reload(octx, idx) == 0 &&
                    (meta = wbm_get(octx->wbm, idx)) && meta->resident) {
+            if (release_stage_after_xform_enabled()) release_host_staging(octx, idx);
             rc = 0;
         } else if (it->second.xform_fn) {
             rc = it->second.xform_fn();

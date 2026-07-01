@@ -1,0 +1,7 @@
+method,artifact,status,raw_ms_per_token,exec_ms_per_token,eval_runs,apply_count,evict_planned,load_planned,transfer_planned,xform_planned,direct_read_mb,direct_read_mb_per_forward,online_calls,online_failures,thermal_gpu_max_c_before,thermal_gpu_max_c_after
+static-min,trace04_start0_180s_core_20260627,ok,1780.24,1780.2373529411764,102,0,0,110,1,110,233228.0,2286.549019607843,,,37.2,49.2
+static-max,trace04_start0_180s_static_max_fair_20260627,ok,1337.73,1337.730814814815,135,0,0,94,1,94,174425.6,1292.0414814814815,,,46.5,51.2
+offline,trace04_start0_180s_offline_rerun_20260627,ok,1282.2,1318.990115942029,138,3,0,260,3,260,167997.7,1217.3746376811596,,,40.3,50.8
+diff-tree-ideal,trace04_start0_180s_diff_tree_fair_20260627,ok,1124.86,1162.954608974359,156,3,0,198,1,198,106484.1,682.5903846153847,3,0,44.6,56.2
+online,trace04_start0_180s_online_rerun_20260627,ok,1229.31,1140.7477338129497,139,3,0,150,150,150,239355.0,1721.978417266187,3,0,43.4,63.6
+mru,trace04_start0_180s_mru_20260627,ok,1612.44,1611.9620982142858,112,3,0,0,0,0,191684.5,1711.46875,3,0,52.3,50.8

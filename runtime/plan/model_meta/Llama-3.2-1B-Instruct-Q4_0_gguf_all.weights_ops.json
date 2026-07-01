@@ -1,0 +1,2618 @@
+{
+  "ops": [
+    {
+      "layer": 0,
+      "name": "blk.0.attn_k.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_output.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_q.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_v.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.ffn_down.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.ffn_gate.weight",
+      "op_id": 5,
+      "weight_id": 5
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.ffn_up.weight",
+      "op_id": 6,
+      "weight_id": 6
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_norm.weight",
+      "op_id": 7,
+      "weight_id": 7
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.ffn_norm.weight",
+      "op_id": 8,
+      "weight_id": 8
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_k.weight",
+      "op_id": 9,
+      "weight_id": 9
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_output.weight",
+      "op_id": 10,
+      "weight_id": 10
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_q.weight",
+      "op_id": 11,
+      "weight_id": 11
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_v.weight",
+      "op_id": 12,
+      "weight_id": 12
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.ffn_down.weight",
+      "op_id": 13,
+      "weight_id": 13
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.ffn_gate.weight",
+      "op_id": 14,
+      "weight_id": 14
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.ffn_up.weight",
+      "op_id": 15,
+      "weight_id": 15
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_norm.weight",
+      "op_id": 16,
+      "weight_id": 16
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.ffn_norm.weight",
+      "op_id": 17,
+      "weight_id": 17
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_k.weight",
+      "op_id": 18,
+      "weight_id": 18
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_output.weight",
+      "op_id": 19,
+      "weight_id": 19
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_q.weight",
+      "op_id": 20,
+      "weight_id": 20
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_v.weight",
+      "op_id": 21,
+      "weight_id": 21
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.ffn_down.weight",
+      "op_id": 22,
+      "weight_id": 22
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.ffn_gate.weight",
+      "op_id": 23,
+      "weight_id": 23
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.ffn_up.weight",
+      "op_id": 24,
+      "weight_id": 24
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_norm.weight",
+      "op_id": 25,
+      "weight_id": 25
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.ffn_norm.weight",
+      "op_id": 26,
+      "weight_id": 26
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_k.weight",
+      "op_id": 27,
+      "weight_id": 27
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_output.weight",
+      "op_id": 28,
+      "weight_id": 28
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_q.weight",
+      "op_id": 29,
+      "weight_id": 29
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_v.weight",
+      "op_id": 30,
+      "weight_id": 30
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.ffn_down.weight",
+      "op_id": 31,
+      "weight_id": 31
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.ffn_gate.weight",
+      "op_id": 32,
+      "weight_id": 32
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.ffn_up.weight",
+      "op_id": 33,
+      "weight_id": 33
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_norm.weight",
+      "op_id": 34,
+      "weight_id": 34
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.ffn_norm.weight",
+      "op_id": 35,
+      "weight_id": 35
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_k.weight",
+      "op_id": 36,
+      "weight_id": 36
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_output.weight",
+      "op_id": 37,
+      "weight_id": 37
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_q.weight",
+      "op_id": 38,
+      "weight_id": 38
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_v.weight",
+      "op_id": 39,
+      "weight_id": 39
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.ffn_down.weight",
+      "op_id": 40,
+      "weight_id": 40
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.ffn_gate.weight",
+      "op_id": 41,
+      "weight_id": 41
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.ffn_up.weight",
+      "op_id": 42,
+      "weight_id": 42
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_norm.weight",
+      "op_id": 43,
+      "weight_id": 43
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.ffn_norm.weight",
+      "op_id": 44,
+      "weight_id": 44
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_k.weight",
+      "op_id": 45,
+      "weight_id": 45
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_output.weight",
+      "op_id": 46,
+      "weight_id": 46
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_q.weight",
+      "op_id": 47,
+      "weight_id": 47
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_v.weight",
+      "op_id": 48,
+      "weight_id": 48
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.ffn_down.weight",
+      "op_id": 49,
+      "weight_id": 49
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.ffn_gate.weight",
+      "op_id": 50,
+      "weight_id": 50
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.ffn_up.weight",
+      "op_id": 51,
+      "weight_id": 51
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_norm.weight",
+      "op_id": 52,
+      "weight_id": 52
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.ffn_norm.weight",
+      "op_id": 53,
+      "weight_id": 53
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_k.weight",
+      "op_id": 54,
+      "weight_id": 54
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_output.weight",
+      "op_id": 55,
+      "weight_id": 55
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_q.weight",
+      "op_id": 56,
+      "weight_id": 56
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_v.weight",
+      "op_id": 57,
+      "weight_id": 57
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.ffn_down.weight",
+      "op_id": 58,
+      "weight_id": 58
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.ffn_gate.weight",
+      "op_id": 59,
+      "weight_id": 59
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.ffn_up.weight",
+      "op_id": 60,
+      "weight_id": 60
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_norm.weight",
+      "op_id": 61,
+      "weight_id": 61
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.ffn_norm.weight",
+      "op_id": 62,
+      "weight_id": 62
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_k.weight",
+      "op_id": 63,
+      "weight_id": 63
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_output.weight",
+      "op_id": 64,
+      "weight_id": 64
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_q.weight",
+      "op_id": 65,
+      "weight_id": 65
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_v.weight",
+      "op_id": 66,
+      "weight_id": 66
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.ffn_down.weight",
+      "op_id": 67,
+      "weight_id": 67
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.ffn_gate.weight",
+      "op_id": 68,
+      "weight_id": 68
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.ffn_up.weight",
+      "op_id": 69,
+      "weight_id": 69
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_norm.weight",
+      "op_id": 70,
+      "weight_id": 70
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.ffn_norm.weight",
+      "op_id": 71,
+      "weight_id": 71
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_k.weight",
+      "op_id": 72,
+      "weight_id": 72
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_output.weight",
+      "op_id": 73,
+      "weight_id": 73
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_q.weight",
+      "op_id": 74,
+      "weight_id": 74
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_v.weight",
+      "op_id": 75,
+      "weight_id": 75
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.ffn_down.weight",
+      "op_id": 76,
+      "weight_id": 76
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.ffn_gate.weight",
+      "op_id": 77,
+      "weight_id": 77
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.ffn_up.weight",
+      "op_id": 78,
+      "weight_id": 78
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_norm.weight",
+      "op_id": 79,
+      "weight_id": 79
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.ffn_norm.weight",
+      "op_id": 80,
+      "weight_id": 80
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_k.weight",
+      "op_id": 81,
+      "weight_id": 81
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_output.weight",
+      "op_id": 82,
+      "weight_id": 82
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_q.weight",
+      "op_id": 83,
+      "weight_id": 83
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_v.weight",
+      "op_id": 84,
+      "weight_id": 84
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.ffn_down.weight",
+      "op_id": 85,
+      "weight_id": 85
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.ffn_gate.weight",
+      "op_id": 86,
+      "weight_id": 86
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.ffn_up.weight",
+      "op_id": 87,
+      "weight_id": 87
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_norm.weight",
+      "op_id": 88,
+      "weight_id": 88
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.ffn_norm.weight",
+      "op_id": 89,
+      "weight_id": 89
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_k.weight",
+      "op_id": 90,
+      "weight_id": 90
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_output.weight",
+      "op_id": 91,
+      "weight_id": 91
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_q.weight",
+      "op_id": 92,
+      "weight_id": 92
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_v.weight",
+      "op_id": 93,
+      "weight_id": 93
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.ffn_down.weight",
+      "op_id": 94,
+      "weight_id": 94
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.ffn_gate.weight",
+      "op_id": 95,
+      "weight_id": 95
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.ffn_up.weight",
+      "op_id": 96,
+      "weight_id": 96
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_norm.weight",
+      "op_id": 97,
+      "weight_id": 97
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.ffn_norm.weight",
+      "op_id": 98,
+      "weight_id": 98
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_k.weight",
+      "op_id": 99,
+      "weight_id": 99
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_output.weight",
+      "op_id": 100,
+      "weight_id": 100
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_q.weight",
+      "op_id": 101,
+      "weight_id": 101
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_v.weight",
+      "op_id": 102,
+      "weight_id": 102
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.ffn_down.weight",
+      "op_id": 103,
+      "weight_id": 103
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.ffn_gate.weight",
+      "op_id": 104,
+      "weight_id": 104
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.ffn_up.weight",
+      "op_id": 105,
+      "weight_id": 105
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_norm.weight",
+      "op_id": 106,
+      "weight_id": 106
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.ffn_norm.weight",
+      "op_id": 107,
+      "weight_id": 107
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_k.weight",
+      "op_id": 108,
+      "weight_id": 108
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_output.weight",
+      "op_id": 109,
+      "weight_id": 109
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_q.weight",
+      "op_id": 110,
+      "weight_id": 110
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_v.weight",
+      "op_id": 111,
+      "weight_id": 111
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.ffn_down.weight",
+      "op_id": 112,
+      "weight_id": 112
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.ffn_gate.weight",
+      "op_id": 113,
+      "weight_id": 113
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.ffn_up.weight",
+      "op_id": 114,
+      "weight_id": 114
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_norm.weight",
+      "op_id": 115,
+      "weight_id": 115
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.ffn_norm.weight",
+      "op_id": 116,
+      "weight_id": 116
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_k.weight",
+      "op_id": 117,
+      "weight_id": 117
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_output.weight",
+      "op_id": 118,
+      "weight_id": 118
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_q.weight",
+      "op_id": 119,
+      "weight_id": 119
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_v.weight",
+      "op_id": 120,
+      "weight_id": 120
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.ffn_down.weight",
+      "op_id": 121,
+      "weight_id": 121
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.ffn_gate.weight",
+      "op_id": 122,
+      "weight_id": 122
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.ffn_up.weight",
+      "op_id": 123,
+      "weight_id": 123
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_norm.weight",
+      "op_id": 124,
+      "weight_id": 124
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.ffn_norm.weight",
+      "op_id": 125,
+      "weight_id": 125
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_k.weight",
+      "op_id": 126,
+      "weight_id": 126
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_output.weight",
+      "op_id": 127,
+      "weight_id": 127
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_q.weight",
+      "op_id": 128,
+      "weight_id": 128
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_v.weight",
+      "op_id": 129,
+      "weight_id": 129
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.ffn_down.weight",
+      "op_id": 130,
+      "weight_id": 130
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.ffn_gate.weight",
+      "op_id": 131,
+      "weight_id": 131
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.ffn_up.weight",
+      "op_id": 132,
+      "weight_id": 132
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_norm.weight",
+      "op_id": 133,
+      "weight_id": 133
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.ffn_norm.weight",
+      "op_id": 134,
+      "weight_id": 134
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_k.weight",
+      "op_id": 135,
+      "weight_id": 135
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_output.weight",
+      "op_id": 136,
+      "weight_id": 136
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_q.weight",
+      "op_id": 137,
+      "weight_id": 137
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_v.weight",
+      "op_id": 138,
+      "weight_id": 138
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.ffn_down.weight",
+      "op_id": 139,
+      "weight_id": 139
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.ffn_gate.weight",
+      "op_id": 140,
+      "weight_id": 140
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.ffn_up.weight",
+      "op_id": 141,
+      "weight_id": 141
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_norm.weight",
+      "op_id": 142,
+      "weight_id": 142
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.ffn_norm.weight",
+      "op_id": 143,
+      "weight_id": 143
+    },
+    {
+      "layer": -1,
+      "name": "output_norm.weight",
+      "op_id": 144,
+      "weight_id": 144
+    },
+    {
+      "layer": -1,
+      "name": "rope_freqs.weight",
+      "op_id": 145,
+      "weight_id": 145
+    },
+    {
+      "layer": -1,
+      "name": "token_embd.weight",
+      "op_id": 146,
+      "weight_id": 146
+    }
+  ],
+  "weights": [
+    {
+      "byte_size": 589824,
+      "layer": 0,
+      "name": "blk.0.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 0
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "name": "blk.0.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 1
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 0,
+      "name": "blk.0.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 2
+    },
+    {
+      "byte_size": 589824,
+      "layer": 0,
+      "name": "blk.0.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 3
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 0,
+      "name": "blk.0.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 4
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 0,
+      "name": "blk.0.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 5
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 0,
+      "name": "blk.0.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 6
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "name": "blk.0.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 7
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "name": "blk.0.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 8
+    },
+    {
+      "byte_size": 589824,
+      "layer": 1,
+      "name": "blk.1.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 9
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "name": "blk.1.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 10
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 1,
+      "name": "blk.1.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 11
+    },
+    {
+      "byte_size": 589824,
+      "layer": 1,
+      "name": "blk.1.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 12
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 1,
+      "name": "blk.1.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 13
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 1,
+      "name": "blk.1.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 14
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 1,
+      "name": "blk.1.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 15
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "name": "blk.1.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 16
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "name": "blk.1.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 17
+    },
+    {
+      "byte_size": 589824,
+      "layer": 2,
+      "name": "blk.2.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 18
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "name": "blk.2.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 19
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 2,
+      "name": "blk.2.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 20
+    },
+    {
+      "byte_size": 589824,
+      "layer": 2,
+      "name": "blk.2.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 21
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 2,
+      "name": "blk.2.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 22
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 2,
+      "name": "blk.2.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 23
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 2,
+      "name": "blk.2.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 24
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "name": "blk.2.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 25
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "name": "blk.2.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 26
+    },
+    {
+      "byte_size": 589824,
+      "layer": 3,
+      "name": "blk.3.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 27
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "name": "blk.3.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 28
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 3,
+      "name": "blk.3.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 29
+    },
+    {
+      "byte_size": 589824,
+      "layer": 3,
+      "name": "blk.3.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 30
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 3,
+      "name": "blk.3.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 31
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 3,
+      "name": "blk.3.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 32
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 3,
+      "name": "blk.3.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 33
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "name": "blk.3.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 34
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "name": "blk.3.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 35
+    },
+    {
+      "byte_size": 589824,
+      "layer": 4,
+      "name": "blk.4.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 36
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "name": "blk.4.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 37
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 4,
+      "name": "blk.4.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 38
+    },
+    {
+      "byte_size": 589824,
+      "layer": 4,
+      "name": "blk.4.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 39
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 4,
+      "name": "blk.4.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 40
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 4,
+      "name": "blk.4.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 41
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 4,
+      "name": "blk.4.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 42
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "name": "blk.4.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 43
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "name": "blk.4.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 44
+    },
+    {
+      "byte_size": 589824,
+      "layer": 5,
+      "name": "blk.5.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 45
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "name": "blk.5.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 46
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 5,
+      "name": "blk.5.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 47
+    },
+    {
+      "byte_size": 589824,
+      "layer": 5,
+      "name": "blk.5.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 48
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 5,
+      "name": "blk.5.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 49
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 5,
+      "name": "blk.5.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 50
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 5,
+      "name": "blk.5.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 51
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "name": "blk.5.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 52
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "name": "blk.5.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 53
+    },
+    {
+      "byte_size": 589824,
+      "layer": 6,
+      "name": "blk.6.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 54
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "name": "blk.6.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 55
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 6,
+      "name": "blk.6.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 56
+    },
+    {
+      "byte_size": 589824,
+      "layer": 6,
+      "name": "blk.6.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 57
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 6,
+      "name": "blk.6.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 58
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 6,
+      "name": "blk.6.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 59
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 6,
+      "name": "blk.6.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 60
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "name": "blk.6.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 61
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "name": "blk.6.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 62
+    },
+    {
+      "byte_size": 589824,
+      "layer": 7,
+      "name": "blk.7.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 63
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "name": "blk.7.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 64
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 7,
+      "name": "blk.7.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 65
+    },
+    {
+      "byte_size": 589824,
+      "layer": 7,
+      "name": "blk.7.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 66
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 7,
+      "name": "blk.7.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 67
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 7,
+      "name": "blk.7.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 68
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 7,
+      "name": "blk.7.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 69
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "name": "blk.7.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 70
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "name": "blk.7.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 71
+    },
+    {
+      "byte_size": 589824,
+      "layer": 8,
+      "name": "blk.8.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 72
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "name": "blk.8.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 73
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 8,
+      "name": "blk.8.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 74
+    },
+    {
+      "byte_size": 589824,
+      "layer": 8,
+      "name": "blk.8.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 75
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 8,
+      "name": "blk.8.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 76
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 8,
+      "name": "blk.8.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 77
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 8,
+      "name": "blk.8.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 78
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "name": "blk.8.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 79
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "name": "blk.8.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 80
+    },
+    {
+      "byte_size": 589824,
+      "layer": 9,
+      "name": "blk.9.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 81
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "name": "blk.9.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 82
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 9,
+      "name": "blk.9.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 83
+    },
+    {
+      "byte_size": 589824,
+      "layer": 9,
+      "name": "blk.9.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 84
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 9,
+      "name": "blk.9.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 85
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 9,
+      "name": "blk.9.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 86
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 9,
+      "name": "blk.9.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 87
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "name": "blk.9.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 88
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "name": "blk.9.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 89
+    },
+    {
+      "byte_size": 589824,
+      "layer": 10,
+      "name": "blk.10.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 90
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "name": "blk.10.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 91
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 10,
+      "name": "blk.10.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 92
+    },
+    {
+      "byte_size": 589824,
+      "layer": 10,
+      "name": "blk.10.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 93
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 10,
+      "name": "blk.10.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 94
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 10,
+      "name": "blk.10.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 95
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 10,
+      "name": "blk.10.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 96
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "name": "blk.10.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 97
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "name": "blk.10.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 98
+    },
+    {
+      "byte_size": 589824,
+      "layer": 11,
+      "name": "blk.11.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 99
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "name": "blk.11.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 100
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 11,
+      "name": "blk.11.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 101
+    },
+    {
+      "byte_size": 589824,
+      "layer": 11,
+      "name": "blk.11.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 102
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 11,
+      "name": "blk.11.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 103
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 11,
+      "name": "blk.11.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 104
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 11,
+      "name": "blk.11.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 105
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "name": "blk.11.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 106
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "name": "blk.11.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 107
+    },
+    {
+      "byte_size": 589824,
+      "layer": 12,
+      "name": "blk.12.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 108
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "name": "blk.12.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 109
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 12,
+      "name": "blk.12.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 110
+    },
+    {
+      "byte_size": 589824,
+      "layer": 12,
+      "name": "blk.12.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 111
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 12,
+      "name": "blk.12.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 112
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 12,
+      "name": "blk.12.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 113
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 12,
+      "name": "blk.12.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 114
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "name": "blk.12.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 115
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "name": "blk.12.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 116
+    },
+    {
+      "byte_size": 589824,
+      "layer": 13,
+      "name": "blk.13.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 117
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "name": "blk.13.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 118
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 13,
+      "name": "blk.13.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 119
+    },
+    {
+      "byte_size": 589824,
+      "layer": 13,
+      "name": "blk.13.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 120
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 13,
+      "name": "blk.13.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 121
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 13,
+      "name": "blk.13.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 122
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 13,
+      "name": "blk.13.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 123
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "name": "blk.13.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 124
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "name": "blk.13.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 125
+    },
+    {
+      "byte_size": 589824,
+      "layer": 14,
+      "name": "blk.14.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 126
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "name": "blk.14.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 127
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 14,
+      "name": "blk.14.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 128
+    },
+    {
+      "byte_size": 589824,
+      "layer": 14,
+      "name": "blk.14.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 129
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 14,
+      "name": "blk.14.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 130
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 14,
+      "name": "blk.14.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 131
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 14,
+      "name": "blk.14.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 132
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "name": "blk.14.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 133
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "name": "blk.14.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 134
+    },
+    {
+      "byte_size": 589824,
+      "layer": 15,
+      "name": "blk.15.attn_k.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 135
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "name": "blk.15.attn_output.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 136
+    },
+    {
+      "byte_size": 2359296,
+      "layer": 15,
+      "name": "blk.15.attn_q.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_id": 137
+    },
+    {
+      "byte_size": 589824,
+      "layer": 15,
+      "name": "blk.15.attn_v.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        512
+      ],
+      "weight_id": 138
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 15,
+      "name": "blk.15.ffn_down.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        8192,
+        2048
+      ],
+      "weight_id": 139
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 15,
+      "name": "blk.15.ffn_gate.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 140
+    },
+    {
+      "byte_size": 9437184,
+      "layer": 15,
+      "name": "blk.15.ffn_up.weight",
+      "quant": "2",
+      "quant_name": "Q4_0",
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_id": 141
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "name": "blk.15.attn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 142
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "name": "blk.15.ffn_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 143
+    },
+    {
+      "byte_size": 8192,
+      "layer": -1,
+      "name": "output_norm.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        2048
+      ],
+      "weight_id": 144
+    },
+    {
+      "byte_size": 128,
+      "layer": -1,
+      "name": "rope_freqs.weight",
+      "quant": "0",
+      "quant_name": "F32",
+      "shape": [
+        32
+      ],
+      "weight_id": 145
+    },
+    {
+      "byte_size": 215470080,
+      "layer": -1,
+      "name": "token_embd.weight",
+      "quant": "14",
+      "quant_name": "Q6_K",
+      "shape": [
+        2048,
+        128256
+      ],
+      "weight_id": 146
+    }
+  ]
+}

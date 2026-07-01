@@ -224,6 +224,7 @@ def profile_command(
     mode: str,
     remote_trace: str | None,
     remote_plan: str | None = None,
+    flash_attn: str = "on",
 ) -> str:
     env = {
         "LD_LIBRARY_PATH": remote_dir,
@@ -249,6 +250,7 @@ def profile_command(
         "--temp",
         "0",
         "--no-warmup",
+        "-no-cnv",
     ]
 
     if mode == "opencl-compute":
@@ -260,7 +262,7 @@ def profile_command(
                 "GGML_OPENCL_ELASTIC": "1",
             }
         )
-        argv += ["-ngl", "99", "-fa", "on"]
+        argv += ["-ngl", "99", "-fa", flash_attn]
     elif mode == "opencl-reload":
         env.update(
             {
@@ -275,7 +277,7 @@ def profile_command(
         )
         if remote_trace:
             env["GGML_ELASTIC_BUDGET_CSV"] = remote_trace
-        argv += ["-ngl", "99", "-fa", "on"]
+        argv += ["-ngl", "99", "-fa", flash_attn]
     elif mode == "opencl-stage":
         if not remote_plan:
             raise ValueError("opencl-stage requires remote_plan")
@@ -290,7 +292,7 @@ def profile_command(
                 "LLAMA_ELASTIC_DEFER_STAGE": "0",
             }
         )
-        argv += ["-ngl", "99", "-fa", "on"]
+        argv += ["-ngl", "99", "-fa", flash_attn]
     elif mode == "cpu-compute":
         env.update(
             {
@@ -338,6 +340,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog.")
+    ap.add_argument("--flash-attn", choices=("on", "off", "auto"), default="on",
+                    help="flash-attention mode for OpenCL profiling phases")
     ap.add_argument("--allow-cpu-fallback", action="store_true", help="allow solver synthetic CPU cost if CPU profile is incomplete")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--skip-phone-profile", action="store_true", help="build from existing local CSVs in out-root/model-tag/csv")
@@ -417,6 +421,7 @@ def main() -> None:
                 mode=mode,
                 remote_trace=remote_trace,
                 remote_plan=remote_opencl_stage_plan if mode == "opencl-stage" else remote_cpu_stage_plan if mode == "cpu-stage" else None,
+                flash_attn=args.flash_attn,
             )
             commands.append({"phase": mode, "remote_shell": script})
             proc = adb_shell(args.adb_serial, script, dry_run=args.dry_run, check=False)

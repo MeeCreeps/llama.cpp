@@ -1,0 +1,127 @@
+{
+  "candidate_diversity": "distance",
+  "candidate_min_distance": 32,
+  "index": [
+    {
+      "budget_mib": 3072,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_3072MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 1252.8687745000009
+        }
+      ],
+      "file": "plan_3072MiB.json"
+    },
+    {
+      "budget_mib": 3328,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_3328MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 1037.7881020000002
+        }
+      ],
+      "file": "plan_3328MiB.json"
+    },
+    {
+      "budget_mib": 3584,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_3584MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 834.0283600000001
+        }
+      ],
+      "file": "plan_3584MiB.json"
+    },
+    {
+      "budget_mib": 3840,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_3840MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 618.0925074999999
+        }
+      ],
+      "file": "plan_3840MiB.json"
+    },
+    {
+      "budget_mib": 4096,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_4096MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 406.02780999999993
+        }
+      ],
+      "file": "plan_4096MiB.json"
+    },
+    {
+      "budget_mib": 4352,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_4352MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 203.74378749999983
+        }
+      ],
+      "file": "plan_4352MiB.json"
+    },
+    {
+      "budget_mib": 4608,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_4608MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 121.49145249999997
+        }
+      ],
+      "file": "plan_4608MiB.json"
+    },
+    {
+      "budget_mib": 4864,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_4864MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 121.49145249999997
+        }
+      ],
+      "file": "plan_4864MiB.json"
+    }
+  ],
+  "top_k": 1
+}

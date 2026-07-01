@@ -40,6 +40,8 @@ def main() -> None:
                     help="append output.weight when result_output compute profile exists")
     ap.add_argument("--output-weight-byte-size", type=int, default=0,
                     help="byte size for output.weight; required when --include-output-weight is used without GGUF extraction")
+    ap.add_argument("--max-layer-exclusive", type=int, default=None,
+                    help="drop blk.N weights with N >= this value; useful for GGUFs that carry inactive extra tensors")
     args = ap.parse_args()
 
     by_name: dict[str, dict] = {}
@@ -82,22 +84,26 @@ def main() -> None:
     weights = []
     ops = []
     for i, name in enumerate(ordered_names):
+        layer = layer_of(name)
+        if args.max_layer_exclusive is not None and layer >= args.max_layer_exclusive:
+            continue
         rec = by_name[name]
+        weight_id = len(weights)
         weights.append(
             {
-                "weight_id": i,
+                "weight_id": weight_id,
                 "name": name,
-                "layer": layer_of(name),
+                "layer": layer,
                 "byte_size": int(rec.get("byte_size", 0)),
                 "quant": rec.get("quant", ""),
             }
         )
         ops.append(
             {
-                "op_id": i,
+                "op_id": weight_id,
                 "name": name,
-                "layer": layer_of(name),
-                "weight_id": i,
+                "layer": layer,
+                "weight_id": weight_id,
             }
         )
 

@@ -1,0 +1,10 @@
+{
+  "device": "android-opencl",
+  "input_rows": 11300,
+  "model": "Llama-3.2-3B-Instruct-f16",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-3B-Instruct-f16/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-3B-Instruct-f16/csv/opencl_stage.csv"
+  ]
+}

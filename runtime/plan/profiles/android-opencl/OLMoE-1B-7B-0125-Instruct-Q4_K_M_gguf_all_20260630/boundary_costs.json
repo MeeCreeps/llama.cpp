@@ -1,0 +1,13 @@
+{
+  "device": "android-opencl",
+  "input_rows": 26720,
+  "model": "OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630",
+  "records": [],
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630/csv/opencl_stage.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630/csv/cpu_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_gguf_all_20260630/csv/cpu_stage.csv"
+  ]
+}

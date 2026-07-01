@@ -387,6 +387,7 @@ private:
     void elastic_install_runtime_dispatch();                   // M5:装 per-op runtime dispatch hook
     void elastic_fire_anchor_op(int op_id, const char * reason);// 按 graph op index 触发 staged pipeline events
     bool elastic_mru_cache_pre_op(const struct ggml_tensor * op);
+    bool elastic_mru_cache_access_weight(const char * raw_name);
     void elastic_mru_cache_reset();
     void elastic_mru_cache_flush_pending_evict();
     size_t elastic_mru_cache_budget_bytes() const;

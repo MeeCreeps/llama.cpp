@@ -95,6 +95,8 @@ struct params {
     int gpu_rounds = 256;
     int pipeline_items = 24;
     int pipeline_slots = 4;
+    int prefetch_slots = 4;
+    std::string pipeline_gpu_mode = "full";
     bool pipeline = false;
     bool pipeline_only = false;
 };
@@ -117,10 +119,14 @@ static void usage(const char * argv0) {
         "  --m <int>              q4_0 GPU transform M dimension, default 4096\n"
         "  --cpu-rounds <int>     CPU compute loop rounds, default 16\n"
         "  --gpu-rounds <int>     GPU compute kernel rounds, default 256\n"
+        "  --prefetch-slots <int> ring slots for async disk prefetch, default 4\n"
         "  --pipeline             also run disk->CPU-xform->GPU-xform->GPU-compute pipeline\n"
         "  --pipeline-only        skip pairwise contention tests and only run the pipeline\n"
         "  --pipeline-items <int> number of items through the pipeline, default 24\n"
         "  --pipeline-slots <int> ring slots, default 4; use 1 for no-overlap baseline\n"
+        "  --pipeline-gpu-mode <full|kernels-only>\n"
+        "                         full runs GPU write + transpose + copy-back, default\n"
+        "                         kernels-only runs transpose kernels only with preloaded GPU buffers\n"
         "  --iters <int>          timed iterations, default 20\n"
         "  --warmup <int>         warmup iterations, default 3\n"
         "  --platform <int>       OpenCL platform index, default 0\n"
@@ -160,6 +166,8 @@ static params parse(int argc, char ** argv) {
             p.cpu_rounds = std::atoi(need("--cpu-rounds"));
         } else if (a == "--gpu-rounds") {
             p.gpu_rounds = std::atoi(need("--gpu-rounds"));
+        } else if (a == "--prefetch-slots") {
+            p.prefetch_slots = std::atoi(need("--prefetch-slots"));
         } else if (a == "--pipeline") {
             p.pipeline = true;
         } else if (a == "--pipeline-only") {
@@ -169,6 +177,8 @@ static params parse(int argc, char ** argv) {
             p.pipeline_items = std::atoi(need("--pipeline-items"));
         } else if (a == "--pipeline-slots") {
             p.pipeline_slots = std::atoi(need("--pipeline-slots"));
+        } else if (a == "--pipeline-gpu-mode") {
+            p.pipeline_gpu_mode = need("--pipeline-gpu-mode");
         } else if (a == "--iters") {
             p.iters = std::atoi(need("--iters"));
         } else if (a == "--warmup") {
@@ -188,8 +198,11 @@ static params parse(int argc, char ** argv) {
         p.gpu_compute_mb <= 0 || p.cpu_rounds <= 0 || p.gpu_rounds <= 0) {
         throw std::runtime_error("invalid non-positive benchmark parameter");
     }
-    if (p.pipeline_items <= 0 || p.pipeline_slots < 1) {
-        throw std::runtime_error("invalid pipeline item/slot count");
+    if (p.pipeline_items <= 0 || p.pipeline_slots < 1 || p.prefetch_slots < 1) {
+        throw std::runtime_error("invalid pipeline item/slot/prefetch count");
+    }
+    if (p.pipeline_gpu_mode != "full" && p.pipeline_gpu_mode != "kernels-only") {
+        throw std::runtime_error("--pipeline-gpu-mode must be full or kernels-only");
     }
     if (p.k % 32 != 0) {
         throw std::runtime_error("--k must be a multiple of 32 for q4_0");
@@ -429,6 +442,158 @@ struct disk_load_stage {
         if (got != ssize_t(n)) {
             throw std::runtime_error("pipeline pread O_DIRECT short read/error");
         }
+    }
+};
+
+struct disk_async_prefetch_stage {
+    struct slot {
+        void * data = nullptr;
+        bool full = false;
+    };
+
+    int fd = -1;
+    size_t file_size = 0;
+    size_t bytes = 0;
+    size_t align = 4096;
+    std::vector<slot> slots;
+    std::thread worker;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stop = false;
+    bool started = false;
+    size_t fill_idx = 0;
+    size_t consume_idx = 0;
+    std::exception_ptr worker_error;
+    std::mt19937_64 rng{3};
+
+    disk_async_prefetch_stage(const std::string & path, size_t nbytes, int nslots) : bytes(nbytes) {
+        fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+        if (fd < 0) {
+            throw std::runtime_error("failed to open async O_DIRECT file: " + path + " errno=" + std::to_string(errno));
+        }
+        struct stat st {};
+        if (fstat(fd, &st) != 0) {
+            throw std::runtime_error("async fstat failed");
+        }
+        file_size = size_t(st.st_size);
+        align = std::max<size_t>(4096, size_t(st.st_blksize));
+        bytes = align_up(bytes, align);
+        if (file_size <= bytes) {
+            throw std::runtime_error("file is smaller than requested async load chunk");
+        }
+        slots.resize(size_t(nslots));
+        for (slot & s : slots) {
+            if (posix_memalign(&s.data, align, bytes) != 0) {
+                throw std::runtime_error("posix_memalign failed for async disk buffer");
+            }
+        }
+    }
+
+    disk_async_prefetch_stage(const disk_async_prefetch_stage &) = delete;
+    disk_async_prefetch_stage & operator=(const disk_async_prefetch_stage &) = delete;
+
+    ~disk_async_prefetch_stage() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+        for (slot & s : slots) {
+            if (s.data) free(s.data);
+        }
+        if (fd >= 0) close(fd);
+    }
+
+    void start_worker() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!started) {
+            started = true;
+            worker = std::thread([this] { run_worker(); });
+        }
+    }
+
+    void run_worker() {
+        try {
+            while (true) {
+                slot * s = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return stop || !slots[fill_idx].full; });
+                    if (stop) {
+                        return;
+                    }
+                    s = &slots[fill_idx];
+                }
+
+                const size_t max_off = file_size - bytes;
+                const size_t nslots = max_off / align;
+                const off_t off = off_t((rng() % std::max<size_t>(nslots, 1)) * align);
+                ssize_t got = pread(fd, s->data, bytes, off);
+                if (got != ssize_t(bytes)) {
+                    throw std::runtime_error("async pread O_DIRECT short read/error");
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    s->full = true;
+                    fill_idx = (fill_idx + 1) % slots.size();
+                }
+                cv.notify_all();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                worker_error = std::current_exception();
+                stop = true;
+            }
+            cv.notify_all();
+        }
+    }
+
+    void operator()() {
+        start_worker();
+        slot * s = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return stop || slots[consume_idx].full; });
+            if (worker_error) {
+                std::rethrow_exception(worker_error);
+            }
+            if (stop && !slots[consume_idx].full) {
+                throw std::runtime_error("async prefetch worker stopped");
+            }
+            s = &slots[consume_idx];
+        }
+        volatile uint8_t sink = static_cast<uint8_t *>(s->data)[0];
+        (void) sink;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            s->full = false;
+            consume_idx = (consume_idx + 1) % slots.size();
+        }
+        cv.notify_all();
+    }
+};
+
+struct cpu_mem_load_stage {
+    std::vector<uint8_t> src;
+    std::vector<uint8_t> dst;
+
+    explicit cpu_mem_load_stage(size_t bytes) :
+        src(std::max<size_t>(bytes, 4096)),
+        dst(src.size()) {
+        for (size_t i = 0; i < src.size(); ++i) {
+            src[i] = uint8_t(i * 19u + 7u);
+        }
+    }
+
+    void operator()() {
+        std::memcpy(dst.data(), src.data(), src.size());
+        volatile uint8_t sink = dst[src.size() / 2];
+        (void) sink;
     }
 };
 
@@ -739,6 +904,97 @@ struct gpu_xform_kernels_stage {
     }
 };
 
+struct gpu_convert_only_stage {
+    cl_command_queue q = nullptr;
+    size_t blocks = 0;
+    std::vector<uint8_t> host;
+    cl_buffer src;
+    cl_buffer qbuf;
+    cl_buffer dbuf;
+    cl_kernel_wrap convert;
+
+    gpu_convert_only_stage(cl_env & e, int k, int m) :
+        q(e.xform_q),
+        blocks(size_t(k) * size_t(m) / 32),
+        host(blocks * 18),
+        src(e.context, host.size(), CL_MEM_READ_WRITE),
+        qbuf(e.context, blocks * 16, CL_MEM_READ_WRITE),
+        dbuf(e.context, blocks * 2, CL_MEM_READ_WRITE),
+        convert(e.cvt, "kernel_convert_block_q4_0_noshuffle") {
+        for (size_t i = 0; i < host.size(); ++i) {
+            host[i] = uint8_t(i * 31u + 7u);
+        }
+        CL_CHECK(clEnqueueWriteBuffer(q, src.mem, CL_TRUE, 0, host.size(), host.data(), 0, nullptr, nullptr));
+        set_arg(convert.k, 0, src.mem);
+        set_arg(convert.k, 1, qbuf.mem);
+        set_arg(convert.k, 2, dbuf.mem);
+    }
+
+    void operator()() {
+        const size_t conv_lws[3] = { 64, 1, 1 };
+        const size_t conv_gws[3] = { align_up(blocks, conv_lws[0]), 1, 1 };
+        CL_CHECK(clEnqueueNDRangeKernel(q, convert.k, 1, nullptr, conv_gws, conv_lws, 0, nullptr, nullptr));
+        CL_CHECK(clFinish(q));
+    }
+};
+
+struct gpu_transpose_only_stage {
+    cl_command_queue q = nullptr;
+    int k_dim = 0;
+    int m_dim = 0;
+    size_t blocks = 0;
+    std::vector<uint8_t> host_q;
+    std::vector<uint8_t> host_d;
+    cl_buffer qbuf;
+    cl_buffer dbuf;
+    cl_buffer tmp_q;
+    cl_buffer tmp_d;
+    cl_kernel_wrap tr_q;
+    cl_kernel_wrap tr_d;
+
+    gpu_transpose_only_stage(cl_env & e, int k, int m) :
+        q(e.xform_q),
+        k_dim(k),
+        m_dim(m),
+        blocks(size_t(k) * size_t(m) / 32),
+        host_q(blocks * 16),
+        host_d(blocks * 2),
+        qbuf(e.context, host_q.size(), CL_MEM_READ_WRITE),
+        dbuf(e.context, host_d.size(), CL_MEM_READ_WRITE),
+        tmp_q(e.context, host_q.size(), CL_MEM_READ_WRITE),
+        tmp_d(e.context, host_d.size(), CL_MEM_READ_WRITE),
+        tr_q(e.transpose, "kernel_transpose_16_buf_tiled"),
+        tr_d(e.transpose, "kernel_transpose_16_buf_tiled") {
+        for (size_t i = 0; i < host_q.size(); ++i) {
+            host_q[i] = uint8_t(i * 17u + 3u);
+        }
+        for (size_t i = 0; i < host_d.size(); ++i) {
+            host_d[i] = uint8_t(i * 29u + 5u);
+        }
+        CL_CHECK(clEnqueueWriteBuffer(q, qbuf.mem, CL_TRUE, 0, host_q.size(), host_q.data(), 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueWriteBuffer(q, dbuf.mem, CL_TRUE, 0, host_d.size(), host_d.data(), 0, nullptr, nullptr));
+        set_arg(tr_q.k, 0, qbuf.mem);
+        set_arg(tr_q.k, 1, tmp_q.mem);
+        const int q_stride = k_dim / 4;
+        set_scalar(tr_q.k, 2, q_stride);
+        set_scalar(tr_q.k, 3, m_dim);
+        set_arg(tr_d.k, 0, dbuf.mem);
+        set_arg(tr_d.k, 1, tmp_d.mem);
+        const int d_stride = k_dim / 32;
+        set_scalar(tr_d.k, 2, d_stride);
+        set_scalar(tr_d.k, 3, m_dim);
+    }
+
+    void operator()() {
+        const size_t tr_lws[3] = { 16, 16, 1 };
+        const size_t q_gws[3] = { size_t(align_up(k_dim / 4, 16)), size_t(align_up(m_dim, 16)), 1 };
+        const size_t d_gws[3] = { size_t(align_up(k_dim / 32, 16)), size_t(align_up(m_dim, 16)), 1 };
+        CL_CHECK(clEnqueueNDRangeKernel(q, tr_q.k, 3, nullptr, q_gws, tr_lws, 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueNDRangeKernel(q, tr_d.k, 3, nullptr, d_gws, tr_lws, 0, nullptr, nullptr));
+        CL_CHECK(clFinish(q));
+    }
+};
+
 struct pipeline_gpu_xform_stage {
     struct slot_buffers {
         cl_buffer qbuf;
@@ -753,19 +1009,33 @@ struct pipeline_gpu_xform_stage {
     size_t blocks = 0;
     size_t q_bytes = 0;
     size_t d_bytes = 0;
+    bool kernels_only = false;
     std::vector<slot_buffers> bufs;
+    std::vector<uint8_t> preload_q;
+    std::vector<uint8_t> preload_d;
     cl_kernel_wrap tr_q;
     cl_kernel_wrap tr_d;
 
-    pipeline_gpu_xform_stage(cl_env & e, int k, int m, int slots) :
+    pipeline_gpu_xform_stage(cl_env & e, int k, int m, int slots, bool kernels_only_) :
         q(e.xform_q),
         k_dim(k),
         m_dim(m),
         blocks(size_t(k) * size_t(m) / 32),
         q_bytes(blocks * 16),
         d_bytes(blocks * 2),
+        kernels_only(kernels_only_),
         tr_q(e.transpose, "kernel_transpose_16_buf_tiled"),
         tr_d(e.transpose, "kernel_transpose_16_buf_tiled") {
+        if (kernels_only) {
+            preload_q.resize(q_bytes);
+            preload_d.resize(d_bytes);
+            for (size_t j = 0; j < preload_q.size(); ++j) {
+                preload_q[j] = uint8_t(j * 17u + 3u);
+            }
+            for (size_t j = 0; j < preload_d.size(); ++j) {
+                preload_d[j] = uint8_t(j * 29u + 5u);
+            }
+        }
         bufs.reserve(slots);
         for (int i = 0; i < slots; ++i) {
             slot_buffers b;
@@ -773,14 +1043,26 @@ struct pipeline_gpu_xform_stage {
             b.dbuf = cl_buffer(e.context, d_bytes, CL_MEM_READ_WRITE);
             b.tmp_q = cl_buffer(e.context, q_bytes, CL_MEM_READ_WRITE);
             b.tmp_d = cl_buffer(e.context, d_bytes, CL_MEM_READ_WRITE);
+            if (kernels_only) {
+                CL_CHECK(clEnqueueWriteBuffer(q, b.qbuf.mem, CL_FALSE, 0, q_bytes, preload_q.data(), 0, nullptr, nullptr));
+                CL_CHECK(clEnqueueWriteBuffer(q, b.dbuf.mem, CL_FALSE, 0, d_bytes, preload_d.data(), 0, nullptr, nullptr));
+            }
             bufs.push_back(std::move(b));
+        }
+        if (kernels_only) {
+            CL_CHECK(clFinish(q));
         }
     }
 
     void run(int slot, const uint8_t * host_q, const uint16_t * host_d) {
         slot_buffers & b = bufs[size_t(slot)];
-        CL_CHECK(clEnqueueWriteBuffer(q, b.qbuf.mem, CL_FALSE, 0, q_bytes, host_q, 0, nullptr, nullptr));
-        CL_CHECK(clEnqueueWriteBuffer(q, b.dbuf.mem, CL_FALSE, 0, d_bytes, host_d, 0, nullptr, nullptr));
+        if (!kernels_only) {
+            CL_CHECK(clEnqueueWriteBuffer(q, b.qbuf.mem, CL_FALSE, 0, q_bytes, host_q, 0, nullptr, nullptr));
+            CL_CHECK(clEnqueueWriteBuffer(q, b.dbuf.mem, CL_FALSE, 0, d_bytes, host_d, 0, nullptr, nullptr));
+        } else {
+            (void) host_q;
+            (void) host_d;
+        }
 
         set_arg(tr_q.k, 0, b.qbuf.mem);
         set_arg(tr_q.k, 1, b.tmp_q.mem);
@@ -797,9 +1079,11 @@ struct pipeline_gpu_xform_stage {
         const size_t q_gws[3] = { size_t(align_up(k_dim / 4, 16)), size_t(align_up(m_dim, 16)), 1 };
         const size_t d_gws[3] = { size_t(align_up(k_dim / 32, 16)), size_t(align_up(m_dim, 16)), 1 };
         CL_CHECK(clEnqueueNDRangeKernel(q, tr_q.k, 3, nullptr, q_gws, tr_lws, 0, nullptr, nullptr));
-        CL_CHECK(clEnqueueCopyBuffer(q, b.tmp_q.mem, b.qbuf.mem, 0, 0, q_bytes, 0, nullptr, nullptr));
         CL_CHECK(clEnqueueNDRangeKernel(q, tr_d.k, 3, nullptr, d_gws, tr_lws, 0, nullptr, nullptr));
-        CL_CHECK(clEnqueueCopyBuffer(q, b.tmp_d.mem, b.dbuf.mem, 0, 0, d_bytes, 0, nullptr, nullptr));
+        if (!kernels_only) {
+            CL_CHECK(clEnqueueCopyBuffer(q, b.tmp_q.mem, b.qbuf.mem, 0, 0, q_bytes, 0, nullptr, nullptr));
+            CL_CHECK(clEnqueueCopyBuffer(q, b.tmp_d.mem, b.dbuf.mem, 0, 0, d_bytes, 0, nullptr, nullptr));
+        }
         CL_CHECK(clFinish(q));
     }
 };
@@ -1005,7 +1289,8 @@ static void run_pipeline_bench(
     for (int i = 0; i < p.pipeline_slots; ++i) {
         slots.emplace_back(new pipe_slot(raw_aligned, blocks, disk.align));
     }
-    pipeline_gpu_xform_stage gpu_xform(cl, p.k, p.m, p.pipeline_slots);
+    const bool gpu_kernels_only = p.pipeline_gpu_mode == "kernels-only";
+    pipeline_gpu_xform_stage gpu_xform(cl, p.k, p.m, p.pipeline_slots, gpu_kernels_only);
 
     std::mutex mtx;
     std::condition_variable cv;
@@ -1104,8 +1389,8 @@ static void run_pipeline_bench(
     const double item_ms = wall / double(p.pipeline_items);
     const double serial_ms = load_m.busy_ms + cpu_m.busy_ms + gpu_m.busy_ms + compute_m.busy_ms;
     std::printf("\n");
-    std::printf("pipeline disk_load->cpu_xform->gpu_xform->gpu_compute items=%d slots=%d raw=%.1fMiB q=%.1fMiB d=%.1fMiB\n",
-        p.pipeline_items, p.pipeline_slots, double(raw_bytes) / double(MiB),
+    std::printf("pipeline disk_load->cpu_xform->gpu_xform->gpu_compute mode=%s items=%d slots=%d raw=%.1fMiB q=%.1fMiB d=%.1fMiB\n",
+        p.pipeline_gpu_mode.c_str(), p.pipeline_items, p.pipeline_slots, double(raw_bytes) / double(MiB),
         double(blocks * 16) / double(MiB), double(blocks * 2) / double(MiB));
     std::printf("pipeline wall=%8.3f ms item_avg=%8.3f ms serial_est=%8.3f ms speedup_vs_serial=%5.2f steady_items/s=%8.2f\n",
         wall, item_ms, serial_ms, wall > 0.0 ? serial_ms / wall : 0.0, double(p.pipeline_items) * 1000.0 / wall);
@@ -1128,6 +1413,7 @@ int main(int argc, char ** argv) {
         cl_env cl = init_opencl(p);
 
         std::unique_ptr<disk_load_stage> disk;
+        std::unique_ptr<disk_async_prefetch_stage> disk_async;
         if (!p.file.empty()) {
             size_t disk_bytes = size_t(p.load_mb) * MiB;
             if (p.pipeline) {
@@ -1135,7 +1421,9 @@ int main(int argc, char ** argv) {
                 disk_bytes = std::max(disk_bytes, pipe_raw_bytes + 4096);
             }
             disk.reset(new disk_load_stage(p.file, disk_bytes));
+            disk_async.reset(new disk_async_prefetch_stage(p.file, disk_bytes, p.prefetch_slots));
         }
+        cpu_mem_load_stage cpu_mem_load(size_t(p.load_mb) * MiB);
         cpu_xform_stage cpu_xform(size_t(p.cpu_xform_mb) * MiB);
         cpu_compute_stage cpu_compute(size_t(p.cpu_compute_mb) * MiB, p.cpu_rounds);
         gpu_write_stage gpu_write(cl, size_t(p.gpu_compute_mb) * MiB);
@@ -1143,18 +1431,24 @@ int main(int argc, char ** argv) {
         gpu_write_two_stage gpu_write_two(cl, p.k, p.m);
         gpu_xform_stage gpu_xform(cl, p.k, p.m);
         gpu_xform_kernels_stage gpu_xform_kernels(cl, p.k, p.m);
+        gpu_convert_only_stage gpu_convert_only(cl, p.k, p.m);
+        gpu_transpose_only_stage gpu_transpose_only(cl, p.k, p.m);
         gpu_compute_stage gpu_compute(cl, size_t(p.gpu_compute_mb) * MiB, p.gpu_rounds);
 
         std::vector<bench_stage> stages;
         if (disk) {
             stages.push_back({"disk_load", [&] { (*disk)(); }, 0.0});
+            stages.push_back({"disk_async_prefetch", [&] { (*disk_async)(); }, 0.0});
         }
+        stages.push_back({"cpu_mem_load", [&] { cpu_mem_load(); }, 0.0});
         stages.push_back({"cpu_xform", [&] { cpu_xform(); }, 0.0});
         stages.push_back({"gpu_write", [&] { gpu_write(); }, 0.0});
         stages.push_back({"gpu_write_raw", [&] { gpu_write_raw(); }, 0.0});
         stages.push_back({"gpu_write_two", [&] { gpu_write_two(); }, 0.0});
         stages.push_back({"gpu_xform", [&] { gpu_xform(); }, 0.0});
         stages.push_back({"gpu_xform_kernels", [&] { gpu_xform_kernels(); }, 0.0});
+        stages.push_back({"gpu_convert_only", [&] { gpu_convert_only(); }, 0.0});
+        stages.push_back({"gpu_transpose_only", [&] { gpu_transpose_only(); }, 0.0});
         stages.push_back({"cpu_compute", [&] { cpu_compute(); }, 0.0});
         stages.push_back({"gpu_compute", [&] { gpu_compute(); }, 0.0});
 
@@ -1167,12 +1461,16 @@ int main(int argc, char ** argv) {
             s.single_ms = st.med;
             double mb = 0.0;
             if (s.name == "disk_load") mb = p.load_mb;
+            if (s.name == "disk_async_prefetch") mb = p.load_mb;
+            if (s.name == "cpu_mem_load") mb = p.load_mb;
             if (s.name == "cpu_xform") mb = p.cpu_xform_mb;
             if (s.name == "gpu_write") mb = p.gpu_compute_mb;
             if (s.name == "gpu_write_raw") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
             if (s.name == "gpu_write_two") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
             if (s.name == "gpu_xform") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
             if (s.name == "gpu_xform_kernels") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
+            if (s.name == "gpu_convert_only") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
+            if (s.name == "gpu_transpose_only") mb = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
             if (s.name == "cpu_compute") mb = p.cpu_compute_mb;
             if (s.name == "gpu_compute") mb = p.gpu_compute_mb;
             print_single(s, st, mb);
@@ -1198,17 +1496,34 @@ int main(int argc, char ** argv) {
 
         std::printf("\n");
         run_pair("disk_load", "cpu_xform");
+        run_pair("disk_async_prefetch", "cpu_xform");
+        run_pair("cpu_mem_load", "cpu_xform");
         run_pair("disk_load", "gpu_xform");
+        run_pair("disk_async_prefetch", "gpu_xform");
+        run_pair("cpu_mem_load", "gpu_xform");
         run_pair("disk_load", "cpu_compute");
+        run_pair("disk_async_prefetch", "cpu_compute");
+        run_pair("cpu_mem_load", "cpu_compute");
         run_pair("disk_load", "gpu_compute");
+        run_pair("disk_async_prefetch", "gpu_compute");
+        run_pair("cpu_mem_load", "gpu_compute");
         run_pair("cpu_xform", "gpu_xform");
         run_pair("cpu_xform", "cpu_compute");
         run_pair("cpu_xform", "gpu_compute");
+        run_pair("gpu_write", "cpu_compute");
+        run_pair("gpu_write_raw", "cpu_compute");
+        run_pair("gpu_write_two", "cpu_compute");
+        run_pair("gpu_xform", "cpu_compute");
+        run_pair("gpu_xform_kernels", "cpu_compute");
+        run_pair("gpu_convert_only", "cpu_compute");
+        run_pair("gpu_transpose_only", "cpu_compute");
         run_pair("gpu_write", "gpu_compute");
         run_pair("gpu_write_raw", "gpu_compute");
         run_pair("gpu_write_two", "gpu_compute");
         run_pair("gpu_xform", "gpu_compute");
         run_pair("gpu_xform_kernels", "gpu_compute");
+        run_pair("gpu_convert_only", "gpu_compute");
+        run_pair("gpu_transpose_only", "gpu_compute");
         run_pair("cpu_compute", "gpu_compute");
 
         bench_stage * dl = find_stage("disk_load");

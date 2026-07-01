@@ -1,0 +1,97 @@
+{
+  "candidate_diversity": "distance",
+  "candidate_min_distance": 32,
+  "index": [
+    {
+      "budget_mib": 256,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_256MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 503.7819999999998
+        }
+      ],
+      "file": "plan_256MiB.json"
+    },
+    {
+      "budget_mib": 384,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_384MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 223.9290565000001
+        }
+      ],
+      "file": "plan_384MiB.json"
+    },
+    {
+      "budget_mib": 512,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_512MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 152.7417675
+        }
+      ],
+      "file": "plan_512MiB.json"
+    },
+    {
+      "budget_mib": 640,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_640MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 103.78408299999997
+        }
+      ],
+      "file": "plan_640MiB.json"
+    },
+    {
+      "budget_mib": 768,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_768MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 103.78408299999997
+        }
+      ],
+      "file": "plan_768MiB.json"
+    },
+    {
+      "budget_mib": 1024,
+      "candidates": [
+        {
+          "allowed_placements": "cpu,gpu,disk_cpu,disk_gpu",
+          "bottleneck": "cp_sat",
+          "candidate_id": 0,
+          "diversity": "distance",
+          "file": "plan_1024MiB.json",
+          "min_placement_distance": 0,
+          "pred_per_token_ms": 103.78408299999997
+        }
+      ],
+      "file": "plan_1024MiB.json"
+    }
+  ],
+  "top_k": 1
+}

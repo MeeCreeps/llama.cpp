@@ -1,0 +1,246 @@
+{
+  "bottleneck": "cpu_stage_probe",
+  "budget_mib": 1536,
+  "cost_model": {
+    "backend": "cpu",
+    "purpose": "fine_stage_profile_probe"
+  },
+  "kv_bytes": 0,
+  "misc_bytes": 0,
+  "ops": [
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_k.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_v.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_output.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.attn_q.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_down.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "compute_backend": "cpu",
+      "dispatch": "static",
+      "layer": 0,
+      "migrate": false,
+      "migrate_from": "cpu",
+      "migrate_xform": "none",
+      "name": "blk.0.ffn_gate.weight",
+      "op_id": 5,
+      "weight_id": 5
+    }
+  ],
+  "pred_per_token_ms": 0.0,
+  "schema_version": 1,
+  "timeline": [
+    {
+      "anchor_op_id": 0,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 0
+    },
+    {
+      "anchor_op_id": 0,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 0
+    },
+    {
+      "anchor_op_id": 1,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 1
+    },
+    {
+      "anchor_op_id": 1,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 1
+    },
+    {
+      "anchor_op_id": 2,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 2
+    },
+    {
+      "anchor_op_id": 2,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 2
+    },
+    {
+      "anchor_op_id": 3,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 3
+    },
+    {
+      "anchor_op_id": 3,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 3
+    },
+    {
+      "anchor_op_id": 4,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 4
+    },
+    {
+      "anchor_op_id": 4,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 4
+    },
+    {
+      "anchor_op_id": 5,
+      "engine": "disk",
+      "from_loc": "disk",
+      "kind": "load",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 5
+    },
+    {
+      "anchor_op_id": 5,
+      "engine": "cpu",
+      "from_loc": "cpu",
+      "kind": "xform",
+      "overlap_group": -1,
+      "to_loc": "cpu",
+      "weight_id": 5
+    }
+  ],
+  "weights": [
+    {
+      "byte_size": 2506752,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.attn_k.weight",
+      "pinned": false,
+      "weight_id": 0,
+      "xform": "none"
+    },
+    {
+      "byte_size": 2506752,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.attn_v.weight",
+      "pinned": false,
+      "weight_id": 1,
+      "xform": "none"
+    },
+    {
+      "byte_size": 5013504,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.attn_output.weight",
+      "pinned": false,
+      "weight_id": 2,
+      "xform": "none"
+    },
+    {
+      "byte_size": 5013504,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.attn_q.weight",
+      "pinned": false,
+      "weight_id": 3,
+      "xform": "none"
+    },
+    {
+      "byte_size": 22560768,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.ffn_down.weight",
+      "pinned": false,
+      "weight_id": 4,
+      "xform": "none"
+    },
+    {
+      "byte_size": 22560768,
+      "layer": 0,
+      "location": "disk",
+      "name": "blk.0.ffn_gate.weight",
+      "pinned": false,
+      "weight_id": 5,
+      "xform": "none"
+    }
+  ]
+}

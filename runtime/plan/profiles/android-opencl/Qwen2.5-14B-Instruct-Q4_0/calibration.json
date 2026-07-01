@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "model": "Qwen2.5-14B-Instruct-Q4_0",
+  "device_class": "android-opencl-large-model",
+  "source": "3C15AU002CL00000 trace28 pressure retest, 2026-06-25",
+  "notes": [
+    "The base profile has OpenCL compute records but no standalone stage records, so disk reload, transfer and transform used optimistic fallbacks.",
+    "On trace28, online CP selected disk_gpu for all disk weights and was much slower than diff-tree/current-base plans that used more disk_cpu and avoided transfer.",
+    "This calibration makes disk_gpu reload/prepare more expensive for 14B Q4 pressure planning while keeping CPU-resident and GPU-resident compute unchanged."
+  ],
+  "placement_multipliers": {
+    "disk_gpu": 4.0,
+    "disk_cpu": 1.0,
+    "gpu": 1.0,
+    "cpu": 1.0
+  },
+  "stage_multipliers": {
+    "OpenCL:TRANSFER": 2.0,
+    "OpenCL:XFORM": 1.5,
+    "OpenCL:SYNC": 4.0,
+    "CPU_Elastic:LOAD": 1.0,
+    "CPU_Elastic:XFORM": 1.0
+  },
+  "compute_multipliers": {
+    "OpenCL": 1.0,
+    "CPU_Elastic": 1.0
+  }
+}

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -218,11 +219,22 @@ def read_trace(path: Path) -> list[tuple[float, float]]:
     return rows
 
 
-def select_low_window(rows: list[tuple[float, float]], window_sec: float, stride_sec: float) -> tuple[float, float]:
+def select_low_window(
+    rows: list[tuple[float, float]],
+    window_sec: float,
+    stride_sec: float,
+    start_sec: float | None = None,
+) -> tuple[float, float]:
     if not rows:
         raise ValueError("empty trace")
     first = rows[0][0]
     last = rows[-1][0]
+    if start_sec is not None:
+        start = max(first, float(start_sec))
+        end = min(start + window_sec, last)
+        if end <= start:
+            raise ValueError(f"requested window start {start_sec} is outside trace range {first}..{last}")
+        return start, end
     if last - first <= window_sec:
         return first, last
 
@@ -248,9 +260,10 @@ def write_window_trace(
     stride_sec: float,
     replay_speedup: float,
     bucket_mib: int,
+    window_start_sec: float | None = None,
 ) -> TraceWindow:
     rows = read_trace(source)
-    start, end = select_low_window(rows, window_sec, stride_sec)
+    start, end = select_low_window(rows, window_sec, stride_sec, window_start_sec)
     window_rows = [(t, m) for t, m in rows if start <= t <= end]
     if not window_rows:
         raise ValueError(f"no rows selected for {source}")
@@ -344,6 +357,8 @@ def parse_log(path: Path, method: str) -> dict[str, Any]:
         result["status"] = "timeout"
     if "CANNOT LINK EXECUTABLE" in text or "No such file" in text or "failed" in text.lower() and "failures=0" not in text:
         result["status"] = "check_log"
+    if text and "__LLAMA_INNER_RC__" not in text and result["status"] == "ok":
+        result["status"] = "remote_incomplete"
 
     m = re.search(r"eval time =\s*([0-9.]+) ms /\s*(\d+) runs\s*\(\s*([0-9.]+) ms per token", text)
     if m:
@@ -518,13 +533,24 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], traces: list[TraceWin
     path.write_text("\n".join(lines) + "\n")
 
 
-def remote_shell_env(remote_dir: str, env: dict[str, str], argv: list[str]) -> str:
+def remote_shell_env(remote_dir: str, env: dict[str, str], argv: list[str], *, suppress_stdout: bool = False) -> str:
     exports = " ".join(f"export {k}={shell_quote(v)};" for k, v in env.items() if v is not None)
-    return f"cd {shell_quote(remote_dir)} && {exports} " + " ".join(shell_quote(x) for x in argv)
+    command = " ".join(shell_quote(x) for x in argv)
+    if suppress_stdout:
+        command += " 1>/dev/null"
+    script = (
+        f"cd {shell_quote(remote_dir)} && {exports} "
+        f"{command}; rc=$?; echo __LLAMA_INNER_RC__=$rc; exit $rc"
+    )
+    return script
 
 
 def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, remote_trace: str, work_dir: str) -> dict[str, str]:
     effective_safety_mib = args.safety_mib + args.pinned_extra_mib
+    allowed_for_method = args.mru_allowed_placements if method == "mru" else args.allowed_placements
+    placement_set = {s.strip().lower() for s in str(allowed_for_method).split(",") if s.strip()}
+    trace_rows = read_trace(trace.local)
+    initial_budget_mib = bucket_floor(trace_rows[0][1], args.bucket_mib) if trace_rows else trace.min_bucket_mib
     common = {
         "LD_LIBRARY_PATH": args.remote_dir,
         "GGML_OPENCL_DISABLE_ALLOC_HOST_PTR": "1",
@@ -539,15 +565,101 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         "GGML_ELASTIC_SAFETY_MB": str(effective_safety_mib),
         "LLAMA_ELASTIC_DEFER_STAGE": "0",
     }
+    if args.static_weight_mirror == "1" or (args.static_weight_mirror == "auto" and "cpu" in placement_set):
+        common["GGML_SCHED_STATIC_WEIGHT_MIRROR"] = "1"
     if args.pinned_extra_mib > 0:
         common["GGML_ELASTIC_PIN_UNPLANNED_OUTPUT_COUNTS_BUDGET"] = "1"
+    def enable_plan_pipeline(env: dict[str, str]) -> None:
+        env["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
+        env.setdefault("GGML_ELASTIC_ASYNC_STAGE_LOAD", "1")
+        env.setdefault("GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD", str(max(4, args.prefetch_distance)))
+        env.setdefault("GGML_ELASTIC_RELOAD_ON_XFER", "1")
+        env.setdefault("GGML_ELASTIC_XFER_EXTRA", "1")
+        env.setdefault("GGML_ELASTIC_NO_AUTO_EVICT", "1")
+        env.setdefault("LLAMA_ELASTIC_ANCHOR_REPEAT_PER_GRAPH", "1")
+        env.setdefault("LLAMA_ELASTIC_EVICT_DISK_WEIGHTS_PER_GRAPH", "0")
+        env.setdefault("GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM", "0")
+        env.setdefault("GGML_ELASTIC_CACHE_FOREGROUND_LOAD", "1")
+        env.setdefault("GGML_ELASTIC_SOA_STAGING_SLOTS", "4")
+        env.setdefault("GGML_ELASTIC_CL_RETAIN", "1")
+        env.setdefault("GGML_ELASTIC_CL_RETAIN_MB", "1024")
+        if args.interval_stage_kinds:
+            env["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = str(args.interval_stage_kinds)
+            stage_kinds = {s.strip().lower() for s in str(args.interval_stage_kinds).split(",") if s.strip()}
+            if "prepare" in stage_kinds or "all" in stage_kinds:
+                env.setdefault("GGML_ELASTIC_ASYNC_STAGE_PREPARE", "1")
+                env.setdefault("LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE", "1")
+    def enable_one_shot_transition_stages(env: dict[str, str]) -> None:
+        # Candidate/diff-tree plans encode transition work for a budget switch.
+        # That work must be paid once when the switch is applied.  Keep the
+        # per-graph disk eviction path enabled so DISK weights do not remain
+        # resident across tokens and accidentally exceed the active budget.
+        env["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "0"
+        env["LLAMA_ELASTIC_DEFER_STAGE"] = "0"
+        env["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = "none"
+        env["LLAMA_ELASTIC_ANCHOR_REPEAT_PER_GRAPH"] = "1"
+        env["LLAMA_ELASTIC_EVICT_DISK_WEIGHTS_PER_GRAPH"] = "1"
+        env["LLAMA_ELASTIC_PRELOAD_DISK_WEIGHTS_PER_GRAPH"] = "0"
+        env["GGML_ELASTIC_ASYNC_STAGE_LOAD"] = "0"
+        env["GGML_ELASTIC_ASYNC_STAGE_PREPARE"] = "0"
+        env["GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD"] = "0"
+        env["GGML_ELASTIC_RELOAD_ON_XFER"] = "0"
+        env["GGML_ELASTIC_XFER_EXTRA"] = "0"
+        env.setdefault("GGML_ELASTIC_NO_AUTO_EVICT", "1")
+        env.setdefault("GGML_ELASTIC_CACHE_FOREGROUND_LOAD", "1")
+        env.setdefault("GGML_ELASTIC_CL_RETAIN", "1")
+        env.setdefault("GGML_ELASTIC_CL_RETAIN_MB", "500")
+        env.setdefault("GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM", str(args.release_stage_after_xform))
+    def disable_plan_pipeline(env: dict[str, str], *, strict_cache: bool = False) -> None:
+        # Keep stage events deferred but do not project/trigger a staged
+        # pipeline.  Disk weights then reach the normal foreground ensure path.
+        env["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "0"
+        env["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
+        env["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = "none"
+        env["GGML_ELASTIC_ASYNC_STAGE_LOAD"] = "0"
+        env["GGML_ELASTIC_ASYNC_STAGE_PREPARE"] = "0"
+        env["GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD"] = "0"
+        env["GGML_ELASTIC_RELOAD_ON_XFER"] = "0"
+        env["GGML_ELASTIC_XFER_EXTRA"] = "0"
+        if strict_cache:
+            env["GGML_ELASTIC_CACHE_FOREGROUND_LOAD"] = "0"
+            env["GGML_ELASTIC_CL_RETAIN"] = "0"
+            env["GGML_ELASTIC_CL_RETAIN_MB"] = "0"
+            env["GGML_ELASTIC_NO_AUTO_EVICT"] = "0"
+            env["GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM"] = "1"
+    def enable_sync_plan_stages(env: dict[str, str], *, strict_cache: bool = False) -> None:
+        # Execute plan anchors synchronously: no async LOAD/PREPARE overlap, but
+        # still fire the load/prepare anchors so disk placements pay real IO and
+        # transform cost.  This is the strict fixed-budget baseline path.
+        env["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "1"
+        env["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
+        env["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = "load,prepare"
+        env["GGML_ELASTIC_ASYNC_STAGE_LOAD"] = "0"
+        env["GGML_ELASTIC_ASYNC_STAGE_PREPARE"] = "0"
+        env["GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD"] = "0"
+        env["GGML_ELASTIC_RELOAD_ON_XFER"] = "0"
+        env["GGML_ELASTIC_XFER_EXTRA"] = "0"
+        env["LLAMA_ELASTIC_ANCHOR_REPEAT_PER_GRAPH"] = "1"
+        env["LLAMA_ELASTIC_EVICT_DISK_WEIGHTS_PER_GRAPH"] = "1"
+        env["LLAMA_ELASTIC_ENABLE_CPU_XFORM_STAGE"] = "1"
+        env["LLAMA_ELASTIC_INTERVAL_INCLUDE_TRANSITIONS"] = "0"
+        if strict_cache:
+            # Strict correctness path: dynamic budget changes can evict/reload
+            # Q8 SOA weights at different graph steps.  Retaining parent cl_mem
+            # across those dynamic steps has produced token drift on device, so
+            # keep planned baselines on fresh allocations until the pool path is
+            # separately proven bit-stable.
+            env["GGML_ELASTIC_CACHE_FOREGROUND_LOAD"] = "0"
+            env["GGML_ELASTIC_CL_RETAIN"] = "0"
+            env["GGML_ELASTIC_CL_RETAIN_MB"] = "0"
+            env["GGML_ELASTIC_NO_AUTO_EVICT"] = "0"
+            env["GGML_ELASTIC_RELEASE_STAGE_AFTER_XFORM"] = "1"
     use_interval_schedule = (
         args.use_interval_schedule == "1"
         or (args.use_interval_schedule == "auto" and args.cp_objective == "interval_makespan")
     )
     if use_interval_schedule:
         common["LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE"] = "1"
-        common["LLAMA_ELASTIC_DEFER_STAGE"] = "1"
         if args.overlap_model == "none":
             common["LLAMA_ELASTIC_INTERVAL_STAGE_KINDS"] = "none"
             common["GGML_ELASTIC_ASYNC_STAGE_LOAD"] = "0"
@@ -556,10 +668,7 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
             common["GGML_ELASTIC_RELOAD_ON_XFER"] = "0"
             common["GGML_ELASTIC_XFER_EXTRA"] = "0"
         else:
-            common.setdefault("GGML_ELASTIC_ASYNC_STAGE_LOAD", "1")
-            common.setdefault("GGML_ELASTIC_ASYNC_LOAD_LOOKAHEAD", str(max(4, args.prefetch_distance)))
-            common.setdefault("GGML_ELASTIC_RELOAD_ON_XFER", "1")
-            common.setdefault("GGML_ELASTIC_XFER_EXTRA", "1")
+            enable_plan_pipeline(common)
             common.setdefault("LLAMA_ELASTIC_PREPARE_LEAD_OPS", "16")
             common.setdefault("GGML_ELASTIC_ASYNC_XFORM_MAX_PENDING", "128")
         common.setdefault("GGML_ELASTIC_NO_AUTO_EVICT", "1")
@@ -610,11 +719,18 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE_TIME_LIMIT_MS": str(args.time_limit_ms),
                 "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
                 "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
+                "LLAMA_ELASTIC_DIFF_HORIZON_TOKENS": str(args.diff_horizon_tokens),
+                "LLAMA_ELASTIC_PLAN_UP_STEP_BUCKETS": str(args.plan_up_step_buckets),
+                "LLAMA_ELASTIC_PLAN_SWITCH_MIN_GAP_STEPS": str(args.plan_switch_min_gap_steps),
+                "LLAMA_ELASTIC_ONLINE_INITIAL_BUDGET_MIB": str(initial_budget_mib),
+                "LLAMA_ELASTIC_ONLINE_PREAPPLY_INITIAL": "1",
                 "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
                 "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
                 "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
                 "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
                 "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
+                "LLAMA_ELASTIC_ALLOW_CPU_FALLBACK": "1" if args.allow_cpu_fallback else "0",
+                "GGML_ELASTIC_CALLBACK_ASYNC": "0" if args.overlap_model == "none" else "1",
             }
         )
     elif method in {"candidate-select", "diff-graph-expand", "diff-tree-ideal"}:
@@ -631,11 +747,16 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE_SAFETY_MB": str(effective_safety_mib),
                 "LLAMA_ELASTIC_PREFETCH_DISTANCE": str(args.prefetch_distance),
                 "LLAMA_ELASTIC_TRANSITION_WEIGHT": str(args.transition_weight),
+                "LLAMA_ELASTIC_DIFF_HORIZON_TOKENS": str(args.diff_horizon_tokens),
+                "LLAMA_ELASTIC_PLAN_UP_STEP_BUCKETS": str(args.plan_up_step_buckets),
+                "LLAMA_ELASTIC_PLAN_SWITCH_MIN_GAP_STEPS": str(args.plan_switch_min_gap_steps),
                 "LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER": str(args.disk_reload_multiplier),
                 "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
                 "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
                 "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
                 "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.allowed_placements),
+                "LLAMA_ELASTIC_CANDIDATE_MIN_GAIN_MS": str(args.candidate_min_gain_ms),
+                "LLAMA_ELASTIC_ALLOW_CPU_FALLBACK": "1" if args.allow_cpu_fallback else "0",
             }
         )
     elif method == "mru":
@@ -644,7 +765,9 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_ONLINE": "1",
                 "LLAMA_ELASTIC_ONLINE_MODE": "mru-cache",
                 "LLAMA_ELASTIC_RUNTIME_MRU_CACHE": "1",
+                "LLAMA_ELASTIC_MRU_ON_ANCHOR": "1",
                 "LLAMA_ELASTIC_MRU_EVICT_IMMEDIATE": "1",
+                "GGML_ELASTIC_NO_AUTO_EVICT": "1",
                 "LLAMA_ELASTIC_USE_INTERVAL_SCHEDULE": "0",
                 "LLAMA_ELASTIC_DEFER_STAGE": "0",
                 "GGML_ELASTIC_ASYNC_STAGE_LOAD": "0",
@@ -664,7 +787,8 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
                 "LLAMA_ELASTIC_DISK_GPU_RELOAD_MULTIPLIER": str(args.disk_gpu_reload_multiplier),
                 "LLAMA_ELASTIC_OVERLAP_MODEL": str(args.overlap_model),
                 "LLAMA_ELASTIC_CP_OBJECTIVE": str(args.cp_objective),
-                "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": "cpu,disk_cpu",
+                "LLAMA_ELASTIC_ALLOWED_PLACEMENTS": str(args.mru_allowed_placements),
+                "LLAMA_ELASTIC_ALLOW_CPU_FALLBACK": "1" if args.allow_cpu_fallback else "0",
             }
         )
     else:
@@ -708,6 +832,8 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
         str(args.prefetch_distance),
         "--transition-weight",
         str(args.transition_weight),
+        "--transition-horizon-tokens",
+        str(args.diff_horizon_tokens),
         "--disk-reload-multiplier",
         str(args.disk_reload_multiplier),
         "--disk-gpu-reload-multiplier",
@@ -719,6 +845,10 @@ def start_remote_server(args: argparse.Namespace, log_path: Path) -> subprocess.
         "--allowed-placements",
         str(args.allowed_placements),
     ]
+    if args.allow_cpu_fallback:
+        cmd.append("--allow-cpu-fallback")
+    if args.online_ignore_state:
+        cmd.append("--ignore-state")
     print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
     proc = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=log, stderr=subprocess.STDOUT)
     time.sleep(1.0)
@@ -763,6 +893,8 @@ def main() -> None:
     ap.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
     ap.add_argument("--window-sec", type=float, default=600.0)
     ap.add_argument("--window-stride-sec", type=float, default=10.0)
+    ap.add_argument("--window-start-sec", type=float, default=None,
+                    help="if set, use this source-trace start time instead of selecting the lowest-memory window")
     ap.add_argument("--replay-speedup", type=float, default=1.0)
     ap.add_argument("--bench-seconds", type=float, default=None, help="wall-clock decode duration per run; default = window-sec / replay-speedup")
     ap.add_argument("--bucket-mib", type=int, default=256)
@@ -772,21 +904,41 @@ def main() -> None:
     ap.add_argument("--safety-mib", type=int, default=64)
     ap.add_argument("--pinned-extra-mib", type=int, default=410,
                     help="extra pinned non-planned model bytes counted inside the budget, e.g. output.weight for Llama-3 8B Q4_0")
+    ap.add_argument("--release-stage-after-xform", choices=("0", "1"), default="1",
+                    help="release host staging after prepare/xform consumption; 0 retains staged disk weights across graphs")
     ap.add_argument("--time-limit-ms", type=int, default=250)
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--transition-weight", type=float, default=0.1)
+    ap.add_argument("--diff-horizon-tokens", type=float, default=8.0,
+                    help="token horizon used by diff-tree / diff-graph accept decisions")
+    ap.add_argument("--plan-up-step-buckets", type=int, default=1,
+                    help="limit upward budget movement to this many buckets per accepted switch; 0 disables")
+    ap.add_argument("--plan-switch-min-gap-steps", type=int, default=16,
+                    help="minimum decode steps between dynamic plan switches; 0 disables")
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
     ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
+    ap.add_argument("--static-overlap-model", choices=("pipeline", "none"), default="pipeline",
+                    help="execution overlap for static-min/static-max fixed offline plans")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu",
                     help="comma-separated solver placement choices")
+    ap.add_argument("--allow-cpu-fallback", action="store_true",
+                    help="allow the solver to estimate CPU_Elastic compute when measured CPU compute rows are missing")
+    ap.add_argument("--online-ignore-state", action="store_true",
+                    help="remote online CP ignores runtime residency state and solves budget-only plans")
     ap.add_argument("--top-k", type=int, default=1,
                     help="number of candidate plans per budget for candidate-select / diff-graph-expand / diff-tree-ideal")
     ap.add_argument("--candidate-placement-specs", default="",
                     help="semicolon-separated allowed-placement specs for offline candidate diversity")
     ap.add_argument("--candidate-min-distance", type=int, default=32,
                     help="minimum weight-placement Hamming distance between top-k candidates")
+    ap.add_argument("--candidate-min-gain-ms", type=float, default=5.0,
+                    help="candidate-select only accepts a non-base candidate if predicted score gain is at least this many ms/token")
+    ap.add_argument("--mru-allowed-placements", default="gpu,disk_gpu",
+                    help="placement choices for the runtime MRU baseline; default keeps MRU on GPU/disk rather than CPU")
+    ap.add_argument("--static-weight-mirror", choices=("auto", "0", "1"), default="auto",
+                    help="cache scheduler static weight copies for mixed CPU/GPU plans; auto enables it when CPU placement is allowed")
     ap.add_argument("--use-interval-schedule", choices=("auto", "0", "1"), default="auto",
                     help="whether runtime uses schedule.events anchors; auto enables it for interval_makespan")
     ap.add_argument("--interval-stage-kinds", default="load,prepare",
@@ -799,7 +951,11 @@ def main() -> None:
     ap.add_argument("--ctx-size", type=int, default=4096)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--n-gpu-layers", type=int, default=99,
+                    help="llama-cli -ngl value used for benchmark runs")
     ap.add_argument("--prompt", default="Summarize dynamic elastic memory planning for mobile LLM inference.")
+    ap.add_argument("--show-token-output", action="store_true",
+                    help="keep llama-cli generated tokens in logs; default suppresses stdout and keeps stderr/perf logs")
     ap.add_argument("--timeout-s", type=int, default=480)
     ap.add_argument("--adb-timeout-s", type=int, default=30)
     ap.add_argument("--adb-retries", type=int, default=2)
@@ -834,7 +990,7 @@ def main() -> None:
         args.bench_seconds = args.window_sec / args.replay_speedup
     args.effective_safety_mib = args.safety_mib + args.pinned_extra_mib
 
-    source_name_re = re.compile(r"^trace_\d+_user_\d+\.csv$")
+    source_name_re = re.compile(r"^trace_\d+_user_\d+(?:_[^.]+)?\.csv$")
     sources = sorted((ROOT / p).resolve() for p in Path(ROOT).glob(args.trace_glob))
     sources = [p for p in sources if source_name_re.match(p.name)]
     if args.trace_filter:
@@ -850,6 +1006,7 @@ def main() -> None:
             stride_sec=args.window_stride_sec,
             replay_speedup=args.replay_speedup,
             bucket_mib=args.bucket_mib,
+            window_start_sec=args.window_start_sec,
         )
         for p in sources
     ]
@@ -906,6 +1063,8 @@ def main() -> None:
         if args.candidate_placement_specs:
             cmd.extend(["--candidate-placement-specs", str(args.candidate_placement_specs)])
         cmd.extend(["--candidate-min-distance", str(args.candidate_min_distance)])
+        if args.allow_cpu_fallback:
+            cmd.append("--allow-cpu-fallback")
         if args.offline_chain_state:
             cmd.append("--chain-state")
         if not args.dry_run:
@@ -968,7 +1127,9 @@ def main() -> None:
             for method in methods:
                 timed_mode = args.bench_seconds and args.bench_seconds > 0
                 log_tag = f"s{int(args.bench_seconds)}" if timed_mode and float(args.bench_seconds).is_integer() else (f"s{args.bench_seconds:g}" if timed_mode else f"n{args.n_pred}")
-                work = f"{args.remote_dir}/online_matrix10min_{method}_{t.local.stem}_{log_tag}"
+                work_key = f"{method}:{t.local.stem}:{log_tag}"
+                work_hash = hashlib.sha1(work_key.encode("utf-8")).hexdigest()[:10]
+                work = f"{args.remote_dir}/om_{method}_{work_hash}_{log_tag}"
                 if (t.local.name, method) in completed:
                     print(f"=== skip existing trace={t.local.name} method={method} ===", flush=True)
                     continue
@@ -1003,7 +1164,7 @@ def main() -> None:
                     "0",
                     "--no-warmup",
                     "-ngl",
-                    "99",
+                    str(args.n_gpu_layers),
                     "-fa",
                     "on",
                     "-no-cnv",
@@ -1013,7 +1174,7 @@ def main() -> None:
                     env["LLAMA_ELASTIC_BENCH_SECONDS"] = f"{args.bench_seconds:.3f}".rstrip("0").rstrip(".")
                 if timed_mode:
                     argv[argv.index("-n") + 1] = "-1"
-                script = remote_shell_env(args.remote_dir, env, argv)
+                script = remote_shell_env(args.remote_dir, env, argv, suppress_stdout=False)
                 log_path = log_dir / f"{method}_{t.local.stem}_{log_tag}.log"
                 print(f"=== run trace={t.local.name} method={method} log={log_path} ===", flush=True)
                 if args.dry_run:

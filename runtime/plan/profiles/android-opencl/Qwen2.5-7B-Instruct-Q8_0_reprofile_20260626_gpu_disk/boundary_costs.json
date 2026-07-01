@@ -1,0 +1,11 @@
+{
+  "device": "android-opencl",
+  "input_rows": 26795,
+  "model": "Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk",
+  "records": [],
+  "source_csv": [
+    "runtime/plan/generated/Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk/csv/opencl_compute.csv",
+    "runtime/plan/generated/Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk/csv/opencl_stage.csv",
+    "runtime/plan/generated/Qwen2.5-7B-Instruct-Q8_0_reprofile_20260626_gpu_disk/csv/opencl_reload_legacy.csv"
+  ]
+}

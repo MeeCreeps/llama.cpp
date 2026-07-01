@@ -1,0 +1,15 @@
+{
+  "boundary_records": 0,
+  "device": "android-opencl",
+  "input_rows": 95062,
+  "model": "Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick",
+  "op_records": 6923,
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick/csv/opencl_stage.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick/csv/cpu_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Llama-3.2-1B-Instruct-Q4_0_gguf_all_quick/csv/cpu_stage.csv"
+  ],
+  "stage_records": 547
+}

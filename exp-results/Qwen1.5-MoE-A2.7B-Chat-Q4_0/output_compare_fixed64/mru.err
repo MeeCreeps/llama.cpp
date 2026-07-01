@@ -1,0 +1,267 @@
+ggml_opencl: selected platform: 'QUALCOMM Snapdragon(TM)'
+
+ggml_opencl: device: 'QUALCOMM Adreno(TM) 840 (OpenCL 3.0 Adreno(TM) 840)'
+ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0842.21 Compiler E031.50.19.14
+ggml_opencl: vector subgroup broadcast support: true
+ggml_opencl: device FP16 support: true
+ggml_opencl: mem base addr align: 128
+ggml_opencl: max mem alloc size: 1889 MB
+ggml_opencl: device max workgroup size: 1024
+ggml_opencl: SVM coarse grain buffer support: true
+ggml_opencl: SVM fine grain buffer support: true
+ggml_opencl: SVM fine grain system support: false
+ggml_opencl: SVM atomics support: true
+ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+ggml_opencl: loading OpenCL kernels.........................................................................
+ggml_opencl: default device: 'QUALCOMM Adreno(TM) 840 (OpenCL 3.0 Adreno(TM) 840)'
+build: 7149 (9565bfc50) with Android (13324770, +pgo, +bolt, +lto, +mlgo, based on r530567d) clang version 19.0.0 (https://android.googlesource.com/toolchain/llvm-project 97a699bf4812a18fb657c2779f5296a4ab2694d2) for x86_64-unknown-linux-gnu
+main: llama backend init
+main: load the model and apply lora adapter, if any
+llama_model_load_from_file_impl: using device GPUOpenCL (QUALCOMM Adreno(TM) 840) (unknown id) - 0 MiB free
+llama_model_loader: loaded meta data with 34 key-value pairs and 411 tensors from /data/local/tmp/unifer/llamacpp/qwen1.5-moe-a2.7b-chat-q4_0.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = qwen2moe
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                               general.name str              = Qwen1.5 MoE A2.7B Chat
+llama_model_loader: - kv   3:                           general.finetune str              = Chat
+llama_model_loader: - kv   4:                           general.basename str              = Qwen1.5-MoE
+llama_model_loader: - kv   5:                         general.size_label str              = A2.7B
+llama_model_loader: - kv   6:                            general.license str              = other
+llama_model_loader: - kv   7:                       general.license.name str              = tongyi-qianwen
+llama_model_loader: - kv   8:                       general.license.link str              = https://huggingface.co/Qwen/Qwen1.5-M...
+llama_model_loader: - kv   9:                               general.tags arr[str,2]       = ["chat", "text-generation"]
+llama_model_loader: - kv  10:                          general.languages arr[str,1]       = ["en"]
+llama_model_loader: - kv  11:                       qwen2moe.block_count u32              = 24
+llama_model_loader: - kv  12:                    qwen2moe.context_length u32              = 32768
+llama_model_loader: - kv  13:                  qwen2moe.embedding_length u32              = 2048
+llama_model_loader: - kv  14:               qwen2moe.feed_forward_length u32              = 5632
+llama_model_loader: - kv  15:              qwen2moe.attention.head_count u32              = 16
+llama_model_loader: - kv  16:           qwen2moe.attention.head_count_kv u32              = 16
+llama_model_loader: - kv  17:                    qwen2moe.rope.freq_base f32              = 1000000.000000
+llama_model_loader: - kv  18:  qwen2moe.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  19:                 qwen2moe.expert_used_count u32              = 4
+llama_model_loader: - kv  20:                      qwen2moe.expert_count u32              = 60
+llama_model_loader: - kv  21:        qwen2moe.expert_feed_forward_length u32              = 1408
+llama_model_loader: - kv  22: qwen2moe.expert_shared_feed_forward_length u32              = 5632
+llama_model_loader: - kv  23:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  24:                         tokenizer.ggml.pre str              = qwen2
+llama_model_loader: - kv  25:                      tokenizer.ggml.tokens arr[str,151936]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+llama_model_loader: - kv  26:                  tokenizer.ggml.token_type arr[i32,151936]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+llama_model_loader: - kv  27:                      tokenizer.ggml.merges arr[str,151387]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+llama_model_loader: - kv  28:                tokenizer.ggml.eos_token_id u32              = 151645
+llama_model_loader: - kv  29:            tokenizer.ggml.padding_token_id u32              = 151643
+llama_model_loader: - kv  30:                tokenizer.ggml.bos_token_id u32              = 151643
+llama_model_loader: - kv  31:                    tokenizer.chat_template str              = {% for message in messages %}{% if lo...
+llama_model_loader: - kv  32:               general.quantization_version u32              = 2
+llama_model_loader: - kv  33:                          general.file_type u32              = 2
+llama_model_loader: - type  f32:  145 tensors
+llama_model_loader: - type  f16:   24 tensors
+llama_model_loader: - type q4_0:  241 tensors
+llama_model_loader: - type q6_K:    1 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q4_0
+print_info: file size   = 7.58 GiB (4.55 BPW) 
+load: printing all EOG tokens:
+load:   - 151643 ('<|endoftext|>')
+load:   - 151645 ('<|im_end|>')
+load: special tokens cache size = 3
+load: token to piece cache size = 0.9308 MB
+print_info: arch             = qwen2moe
+print_info: vocab_only       = 0
+print_info: n_ctx_train      = 32768
+print_info: n_embd           = 2048
+print_info: n_embd_inp       = 2048
+print_info: n_layer          = 24
+print_info: n_head           = 16
+print_info: n_head_kv        = 16
+print_info: n_rot            = 128
+print_info: n_swa            = 0
+print_info: is_swa_any       = 0
+print_info: n_embd_head_k    = 128
+print_info: n_embd_head_v    = 128
+print_info: n_gqa            = 1
+print_info: n_embd_k_gqa     = 2048
+print_info: n_embd_v_gqa     = 2048
+print_info: f_norm_eps       = 0.0e+00
+print_info: f_norm_rms_eps   = 1.0e-06
+print_info: f_clamp_kqv      = 0.0e+00
+print_info: f_max_alibi_bias = 0.0e+00
+print_info: f_logit_scale    = 0.0e+00
+print_info: f_attn_scale     = 0.0e+00
+print_info: n_ff             = 5632
+print_info: n_expert         = 60
+print_info: n_expert_used    = 4
+print_info: n_expert_groups  = 0
+print_info: n_group_used     = 0
+print_info: causal attn      = 1
+print_info: pooling type     = 0
+print_info: rope type        = 2
+print_info: rope scaling     = linear
+print_info: freq_base_train  = 1000000.0
+print_info: freq_scale_train = 1
+print_info: n_ctx_orig_yarn  = 32768
+print_info: rope_finetuned   = unknown
+print_info: model type       = A2.7B
+print_info: model params     = 14.32 B
+print_info: general.name     = Qwen1.5 MoE A2.7B Chat
+print_info: n_ff_exp         = 1408
+print_info: n_ff_shexp       = 5632
+print_info: vocab type       = BPE
+print_info: n_vocab          = 151936
+print_info: n_merges         = 151387
+print_info: BOS token        = 151643 '<|endoftext|>'
+print_info: EOS token        = 151645 '<|im_end|>'
+print_info: EOT token        = 151645 '<|im_end|>'
+print_info: PAD token        = 151643 '<|endoftext|>'
+print_info: LF token         = 198 'Ċ'
+print_info: EOG token        = 151643 '<|endoftext|>'
+print_info: EOG token        = 151645 '<|im_end|>'
+print_info: max token length = 256
+load_tensors: loading model tensors, this can take a while... (mmap = true)
+ggml_opencl: GGML_OPENCL_ELASTIC=1，权重 buffer 启用 per-tensor cl_mem 模式
+ggml_opencl elastic: buffer 升 ELASTIC（size=1878.31 MiB，首 tensor='output_norm.weight'）
+ggml_opencl elastic: buffer 升 ELASTIC（size=1839.07 MiB，首 tensor='blk.5.ffn_down_exps.weight'）
+ggml_opencl elastic: buffer 升 ELASTIC（size=1839.07 MiB，首 tensor='blk.11.ffn_down_exps.weight'）
+ggml_opencl elastic: buffer 升 ELASTIC（size=1839.07 MiB，首 tensor='blk.17.ffn_down_exps.weight'）
+ggml_opencl elastic: buffer 升 ELASTIC（size=204.19 MiB，首 tensor='blk.23.ffn_down_exps.weight'）
+load_tensors: offloading 24 repeating layers to GPU
+load_tensors: offloading output layer to GPU
+load_tensors: offloaded 25/25 layers to GPU
+load_tensors:  CPU_Elastic model buffer size =   166.92 MiB
+load_tensors:       OpenCL model buffer size =  7599.72 MiB
+elastic: BudgetWatcher trace=/data/local/tmp/hyzheng/elastic/trace_210_user_116_qwen15moe_q4_0_cov40_90_10min_x1.csv M_floor=3603 MB -> static_target=2835 MB mode=DYNAMIC
+.ggml_opencl elastic: GGML_ELASTIC_STAGE_DETAIL=1 (host substage timing)
+ggml_opencl elastic: direct disk reload enabled by default (set GGML_ELASTIC_DIRECT_IO=0 to use mmap)
+ggml_opencl elastic: host staging pool cap = 256 MB
+ggml_opencl elastic: cl_mem retain pool disabled
+ggml_opencl elastic: BudgetWatcher trace=/data/local/tmp/hyzheng/elastic/trace_210_user_116_qwen15moe_q4_0_cov40_90_10min_x1.csv 初始 B(t)=7970 MB M_floor=3603 MB → static_target=2361 MB mode=DYNAMIC (kv=512 MB misc+safety=730 MB)
+ggml_opencl elastic: GGML_ELASTIC_TIMING=1 (host reload 计时, 无 clFinish 干扰)
+ggml_opencl elastic: 单例就绪 (kv=512 MB misc+safety=730 MB interval=8)
+ggml_opencl elastic: pin unplanned output (243 MB) inside budget -> target=2361 MB
+.....................................................................................
+llama_context: constructing llama_context
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 4096
+llama_context: n_ctx_seq     = 4096
+llama_context: n_batch       = 64
+llama_context: n_ubatch      = 32
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = enabled
+llama_context: kv_unified    = false
+llama_context: freq_base     = 1000000.0
+llama_context: freq_scale    = 1
+llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+llama_context:        CPU  output buffer size =     0.58 MiB
+ggml_opencl elastic: buffer 升 MONOLITHIC（size=768.00 MiB，首 tensor='cache_k_l0'）
+llama_kv_cache:     OpenCL KV buffer size =   768.00 MiB
+llama_kv_cache: size =  768.00 MiB (  4096 cells,  24 layers,  1/1 seqs), K (f16):  384.00 MiB, V (f16):  384.00 MiB
+llama_context:     OpenCL compute buffer size =    20.31 MiB
+llama_context: CPU_Elastic compute buffer size =     0.50 MiB
+llama_context:        CPU compute buffer size =     1.00 MiB
+llama_context: graph nodes  = 1399
+llama_context: graph splits = 2
+common_init_from_params: added <|endoftext|> logit bias = -inf
+common_init_from_params: added <|im_end|> logit bias = -inf
+common_init_from_params: setting dry_penalty_last_n to ctx_size = 4096
+elastic_enable: elastic enabled (provider=callback)
+[elastic-online] enable(callback) rc=0 mode=mru-cache weights=411 solver=runtime/plan/dynamic_budget_solver.py cost_dir=/data/local/tmp/hyzheng/elastic/cost_matrix10min work_dir=/data/local/tmp/hyzheng/elastic/om_mru_cmp64
+main: llama threadpool init, n_threads = 8
+
+system_info: n_threads = 8 (n_threads_batch = 8) / 8 | CPU : NEON = 1 | ARM_FMA = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+
+sampler seed: 123
+sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 4096
+	top_k = 40, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000
+sampler chain: logits -> logit-bias -> penalties -> dry -> top-n-sigma -> top-k -> typical -> top-p -> min-p -> xtc -> temp-ext -> dist 
+generate: n_ctx = 4096, n_batch = 32, n_predict = 64, n_keep = 0
+
+ggml_opencl elastic: BudgetWatcher replay clock reset, B(t)=7970 MB
+llama_plan_load_json: loaded /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_7936_1_plan.json — budget=7936MiB weights=411 ops=411 timeline=0 schedule=0
+[elastic-online] budget=7936 generated /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_7936_1_plan.json mode=mru-cache gen_ms=9.349 weights=411 ops=411 calls=1 failures=0
+elastic_install_runtime_dispatch: installed pre-op anchor trigger for static plan, 0 migrate
+apply_exec_plan: applied plan budget=7936MiB weights=411 ops=411 anchors=411 prefetch=125 evict=0 route=411 migrate=0 events=0 schedule_events=0 schedule_used=0 load=0 transfer=0 xform=0 stage_defer=0
+maybe_apply_plan: budget=7936MiB → switched to plan(budget_mib=7936) provider_get_ms=21.613 apply_ms=44.460
+ggml_opencl elastic: buffer 升 MONOLITHIC（size=20.31 MiB，首 tensor='OpenCL#inp_embd#0'）
+llama elastic true-mru: budget=6694.00 MiB resident=2051.49 MiB weights=82 current=blk.0.attn_q.weight
+maybe_apply_plan: budget=7168MiB pending switch hit=1/2, keep plan(budget_mib=7936)
+llama_plan_load_json: loaded /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_7168_2_plan.json — budget=7168MiB weights=411 ops=411 timeline=0 schedule=0
+[elastic-online] budget=7168 generated /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_7168_2_plan.json mode=mru-cache gen_ms=9.296 weights=411 ops=411 calls=2 failures=0
+elastic_install_runtime_dispatch: installed pre-op anchor trigger for static plan, 0 migrate
+apply_exec_plan: applied plan budget=7168MiB weights=411 ops=411 anchors=411 prefetch=0 evict=0 route=411 migrate=0 events=0 schedule_events=0 schedule_used=0 load=0 transfer=0 xform=0 stage_defer=0
+maybe_apply_plan: budget=7168MiB → switched to plan(budget_mib=7168) provider_get_ms=24.300 apply_ms=113.761
+llama elastic true-mru: budget=5926.00 MiB resident=5792.06 MiB weights=179 current=blk.0.attn_q.weight
+maybe_apply_plan: budget=6912MiB pending switch hit=1/2, keep plan(budget_mib=7168)
+llama_plan_load_json: loaded /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_6912_3_plan.json — budget=6912MiB weights=411 ops=411 timeline=0 schedule=0
+[elastic-online] budget=6912 generated /data/local/tmp/hyzheng/elastic/om_mru_cmp64/online_6912_3_plan.json mode=mru-cache gen_ms=7.829 weights=411 ops=411 calls=3 failures=0
+elastic_install_runtime_dispatch: installed pre-op anchor trigger for static plan, 0 migrate
+apply_exec_plan: applied plan budget=6912MiB weights=411 ops=411 anchors=411 prefetch=7 evict=0 route=411 migrate=0 events=0 schedule_events=0 schedule_used=0 load=0 transfer=0 xform=0 stage_defer=0
+maybe_apply_plan: budget=6912MiB → switched to plan(budget_mib=6912) provider_get_ms=21.151 apply_ms=57.846
+llama elastic true-mru: budget=5670.00 MiB resident=5513.62 MiB weights=176 current=blk.0.attn_q.weight
+llama_perf_sampler_print:    sampling time =      11.74 ms /    77 runs   (    0.15 ms per token,  6559.89 tokens per second)
+llama_perf_context_print:        load time =   87530.02 ms
+llama_perf_context_print: prompt eval time =    6023.92 ms /    13 tokens (  463.38 ms per token,     2.16 tokens per second)
+llama_perf_context_print:        eval time =   74586.19 ms /    63 runs   ( 1183.91 ms per token,     0.84 tokens per second)
+llama_perf_context_print:       total time =  162355.78 ms /    76 tokens
+llama_perf_context_print:    graphs reused =          0
+llama_memory_breakdown_print: | memory breakdown [MiB]                  | total   free    self   model   context   compute       unaccounted |
+llama_memory_breakdown_print: |   - GPUOpenCL (QUALCOMM Adreno(TM) 840) |     0 =    0 + (8388 =  7599 +     768 +      20) + 17592186036027 |
+llama_memory_breakdown_print: |   - Host                                |                  411 =   166 +       0 +     244                   |
+~llama_context: elastic anchor summary: requests=29376 hits=0 duplicate=0 fired=0 load=0 transfer=0 xform=0 failures=0
+~llama_context: elastic true-mru summary: accesses=13888 hits=8363 misses=5525 evictions=7037 load_failures=0 evict_failures=0 resident_bytes=5669.91 MiB budget_bytes=5670.00 MiB
+[elastic-online] calls=3 failures=0 remote_wall_ms=0.000 remote_server_ms=0.000
+
+=== ggml_opencl elastic timing dump (no clFinish overhead) ===
+reload host-issue total: 48113.7 ms
+reload calls: 1351 (avg 35.61 ms/call)
+stage load     calls=0 ok=0 total=0.00 ms avg=0.000 ms MB=0.0 MB/s=0.0
+stage transfer calls=0 ok=0 total=0.00 ms avg=0.000 ms MB=0.0 MB/s=0.0
+stage xform    calls=1603 ok=1603 total=9559.42 ms avg=5.963 ms MB=7792.3 MB/s=815.1
+direct O_DIRECT read calls=2848 ok=2848 fail=0 total=38225.24 ms avg=13.422 ms MB=109701.6 MB/s=2869.9
+direct read split: async_load calls=0 total=0.00 ms MB=0.0; foreground calls=2848 total=38225.52 ms MB=109701.6
+pool stats: soa_hit=0 soa_miss=0 parent_hit=0 parent_miss=2590 parent_create=2590 total=7889.31 ms MB=108438.8
+async xform worker enqueued=0 completed=0 inflight=0 queue=0 max_pending_seen=0 waits=0 wait_total=0.000 ms wait_avg=0.000 ms
+
+=== wbmcl stage detail timing dump (host substage) ===
+detail soa_pool_lookup    calls=2590 total=0.209 ms avg=0.000 ms MB=108438.8
+detail parent_alloc       calls=2590 total=7891.088 ms avg=3.047 ms MB=108438.8
+detail staging_alloc      calls=2590 total=45.218 ms avg=0.017 ms MB=108438.8
+detail host_src           calls=2590 total=37709.812 ms avg=14.560 ms MB=108438.8
+detail write_enqueue      calls=2590 total=9836.796 ms avg=3.798 ms MB=108438.8
+detail subbuffer          calls=2590 total=10.422 ms avg=0.004 ms MB=108438.8
+detail barrier_enqueue    calls=2590 total=8.298 ms avg=0.003 ms MB=108438.8
+detail convert_enqueue    calls=2590 total=257.186 ms avg=0.099 ms MB=108438.8
+detail transpose_enqueue  calls=1492 total=63.627 ms avg=0.043 ms MB=6530.6
+detail final_wait_enqueue calls=0 total=0.000 ms avg=0.000 ms MB=0.0
+detail mark_resident      calls=2590 total=0.454 ms avg=0.000 ms MB=108438.8
+detail cpu_xform          calls=0 total=0.000 ms avg=0.000 ms MB=0.0
+======================================================
+per-suffix breakdown (host issue time):
+  suffix                        n     total ms     MB total     avg ms       MB/s
+  attn_norm                    72        230.9          0.6       3.21        2.4
+  ffn_down_exps               324      13930.4      30071.2      42.99     2158.7
+  ffn_gate_exps               385      16669.3      35732.8      43.30     2143.6
+  ffn_gate_inp                 95        150.4         44.5       1.58      296.1
+  ffn_gate_inp_shexp           11         35.5          0.0       3.23        1.2
+  ffn_norm                     72        101.7          0.6       1.41        5.5
+  ffn_up_exps                 389      16992.4      36104.1      43.68     2124.7
+  output_norm                   3          3.8          0.0       1.26        6.2
+===========================================================
+
+=== CPU_Elastic profile dump (n_graph=64) ===
+  io_pt        : 5.9 ms/graph (direct disk reload / fallback mmap)
+  compute_pt   : 0.1 ms/graph (delegate to ggml-cpu)
+  bytes_pt     : 7.8 MB/graph reloaded
+  effective_bw : 1332 MB/s
+  reload_count : 3 (525090816 bytes total)
+  direct_read  : calls=3 ok=3 fail=0 total=375.63 ms MB=500.8 MB/s=1333.1
+  stage_load   : calls=0 ok=0 total=0.00 ms MB=0.0
+  stage_xform  : calls=3 ok=3 total=375.65 ms MB=500.8
+  async_load   : enqueued=0 completed=0 waits=0 wait_total=0.00 ms
+  async_prepare: enqueued=0 completed=0 waits=0 wait_total=0.00 ms
+  evict_count  : 6 (525090816 bytes total)
+============================================

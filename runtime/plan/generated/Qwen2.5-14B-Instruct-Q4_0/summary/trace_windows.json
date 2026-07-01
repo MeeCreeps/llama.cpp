@@ -1,0 +1,17 @@
+[
+  {
+    "local": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/Qwen2.5-14B-Instruct-Q4_0/traces/trace_01_user_147_10min_x1.csv",
+    "max_bucket_mib": 4608,
+    "max_mib": 4477.2,
+    "mean_mib": 4179.909375,
+    "min_bucket_mib": 3584,
+    "min_mib": 3752.1,
+    "remote_name": "trace_01_user_147_10min_x1.csv",
+    "replay_span": 30.0,
+    "rows": 32,
+    "source": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/trace/traces_9g/trace_01_user_147.csv",
+    "source_end": 320.0,
+    "source_span": 30.0,
+    "source_start": 290.0
+  }
+]

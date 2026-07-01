@@ -72,14 +72,16 @@ uint32_t llama_hparams::n_embd_inp() const {
 
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
+    const uint32_t n_embd_head = is_swa(il) && n_embd_head_k_swa ? n_embd_head_k_swa : n_embd_head_k;
 
-    return n_embd_head_k * n_head_kv;
+    return n_embd_head * n_head_kv;
 }
 
 uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
+    const uint32_t n_embd_head = is_swa(il) && n_embd_head_v_swa ? n_embd_head_v_swa : n_embd_head_v;
 
-    return n_embd_head_v * n_head_kv;
+    return n_embd_head * n_head_kv;
 }
 
 bool llama_hparams::is_n_embd_k_gqa_variable() const {

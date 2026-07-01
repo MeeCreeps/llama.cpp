@@ -1,0 +1,7 @@
+method,artifact,status,raw_ms_per_token,exec_ms_per_token,eval_runs,apply_count,evict_planned,load_planned,transfer_planned,xform_planned,direct_read_mb,direct_read_mb_per_forward,online_calls,online_failures,thermal_gpu_max_c_before,thermal_gpu_max_c_after
+static-min,trace03_cap7300_start0_180s_all_reprofile_20260627,ok,2943.32,2943.3167741935486,62,0,0,69,69,69,296036.7,4774.785483870968,,,33.7,46.5
+static-max,trace03_cap7300_start0_180s_static_max_fair_20260627,ok,596.52,596.515761589404,302,0,0,31,31,31,276825.9,916.6420529801326,,,43.8,53.9
+offline,trace03_cap7300_start0_180s_all_reprofile_20260627,ok,1151.93,1213.6589194630874,149,8,0,369,369,369,267143.9,1792.912080536913,,,52.3,52.3
+diff-tree-ideal,trace03_cap7300_start0_180s_diff_tree_fair_20260627,ok,646.60,664.9895239852398,271,3,0,174,35,174,105960.9,390.9996309963099,3,0,38.0,55.0
+online,trace03_cap7300_start0_180s_all_reprofile_20260627,ok,816.56,733.7760439024389,205,4,0,185,185,185,346507.0,1690.2780487804878,4,0,53.9,71.3
+mru,trace03_cap7300_start0_180s_all_reprofile_20260627,ok,1485.28,1484.5070330578512,121,10,0,0,0,0,207923.9,1718.3793388429751,10,0,70.9,50.8

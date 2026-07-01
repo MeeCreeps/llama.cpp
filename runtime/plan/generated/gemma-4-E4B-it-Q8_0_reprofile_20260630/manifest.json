@@ -1,0 +1,108 @@
+{
+  "commands": [
+    {
+      "phase": "opencl-compute",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/opencl_compute.csv GGML_ELASTIC_PROFILE=1 GGML_OPENCL_DISABLE_ALLOC_HOST_PTR=1 GGML_OPENCL_USE_SVM=1 GGML_OPENCL_ELASTIC=1 ./llama-cli -m /data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 16 -c 4096 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -no-cnv -ngl 99 -fa on"
+    },
+    {
+      "phase": "opencl-stage",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/opencl_stage.csv GGML_OPENCL_DISABLE_ALLOC_HOST_PTR=1 GGML_OPENCL_USE_SVM=1 GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_TIMING=1 GGML_ELASTIC_STAGE_DETAIL=1 LLAMA_ELASTIC_APPLY=/data/local/tmp/hyzheng/elastic/opencl_stage_probe.json LLAMA_ELASTIC_DEFER_STAGE=0 ./llama-cli -m /data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 16 -c 4096 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -no-cnv -ngl 99 -fa on"
+    },
+    {
+      "phase": "opencl-reload",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/opencl_reload_legacy.csv GGML_ELASTIC_PROFILE=1 GGML_OPENCL_DISABLE_ALLOC_HOST_PTR=1 GGML_OPENCL_USE_SVM=1 GGML_OPENCL_ELASTIC=1 GGML_ELASTIC_TIMING=1 GGML_ELASTIC_DYNAMIC=1 GGML_ELASTIC_BUDGET_BUCKET_MB=256 GGML_ELASTIC_BUDGET_CSV=/data/local/tmp/hyzheng/elastic/trace_120_user_116_gemma_e4b_q8_cov40_90.csv ./llama-cli -m /data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 16 -c 4096 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -no-cnv -ngl 99 -fa on"
+    },
+    {
+      "phase": "cpu-compute",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/cpu_compute.csv GGML_ELASTIC_CHUNK_SIZE=1 GGML_ELASTIC_PROFILE=1 ./llama-cli -m /data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 4 -c 4096 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -no-cnv -ngl 0 -dev CPU_Elastic"
+    },
+    {
+      "phase": "cpu-stage",
+      "remote_shell": "cd /data/local/tmp/hyzheng/elastic && LD_LIBRARY_PATH=/data/local/tmp/hyzheng/elastic GGML_ELASTIC_PROFILE_CSV=/data/local/tmp/hyzheng/elastic/cpu_stage.csv LLAMA_ELASTIC_APPLY=/data/local/tmp/hyzheng/elastic/cpu_stage_probe.json LLAMA_ELASTIC_DEFER_STAGE=0 ./llama-cli -m /data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf -p 'The quick brown fox jumps over the lazy dog.' -n 4 -c 4096 -b 32 -ub 32 -t 8 --temp 0 --no-warmup -no-cnv -ngl 0 -dev CPU_Elastic"
+    },
+    {
+      "path": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/gemma-4-E4B-it-Q8_0_reprofile_20260630.weights_ops.json",
+      "phase": "use_existing_model_meta"
+    },
+    {
+      "cmd": [
+        "/home/myid/hz85760/miniconda3/bin/python3",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/build_cost_model.py",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_compute.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_stage.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_reload_legacy.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/cpu_compute.csv",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/cpu_stage.csv",
+        "--out-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/gemma-4-E4B-it-Q8_0_reprofile_20260630",
+        "--device",
+        "android-opencl",
+        "--model",
+        "gemma-4-E4B-it-Q8_0_reprofile_20260630"
+      ],
+      "phase": "build_cost_model"
+    },
+    {
+      "cmd": [
+        "/home/myid/hz85760/miniconda3/bin/python3",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/build_offline_budget_table.py",
+        "--model-meta",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/gemma-4-E4B-it-Q8_0_reprofile_20260630.weights_ops.json",
+        "--cost-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/gemma-4-E4B-it-Q8_0_reprofile_20260630",
+        "--out-dir",
+        "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/offline_table",
+        "--budgets",
+        "4352,4608,4864,5120,5376,5632,5888,6144,6400,6656,6912,7168,7424,7680,7936,8192,8448,8704,8960,9216,9472,9728,9984",
+        "--kv-mib",
+        "512",
+        "--misc-mib",
+        "256",
+        "--safety-mib",
+        "474",
+        "--time-limit-ms",
+        "250",
+        "--cp-objective",
+        "resource_makespan",
+        "--allow-cpu-fallback"
+      ],
+      "phase": "build_offline_table"
+    },
+    {
+      "phase": "push_offline_table",
+      "remote_dir": "/data/local/tmp/hyzheng/elastic/plans_gemma-4-E4B-it-Q8_0_reprofile_20260630"
+    }
+  ],
+  "cost_dir": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/profiles/android-opencl/gemma-4-E4B-it-Q8_0_reprofile_20260630",
+  "cost_summary": {
+    "boundary_records": 0,
+    "device": "android-opencl",
+    "input_rows": 206612,
+    "model": "gemma-4-E4B-it-Q8_0_reprofile_20260630",
+    "op_records": 25835,
+    "source_csv": [
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_compute.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_stage.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/opencl_reload_legacy.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/cpu_compute.csv",
+      "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/csv/cpu_stage.csv"
+    ],
+    "stage_records": 1194
+  },
+  "csv_rows": {
+    "cpu_compute.csv": 45082,
+    "cpu_stage.csv": 24363,
+    "opencl_compute.csv": 51837,
+    "opencl_reload_legacy.csv": 42542,
+    "opencl_stage.csv": 42788
+  },
+  "model": "/data/local/tmp/unifer/llamacpp/gemma-4-E4B-it-Q8_0.gguf",
+  "model_meta": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/model_meta/gemma-4-E4B-it-Q8_0_reprofile_20260630.weights_ops.json",
+  "model_tag": "gemma-4-E4B-it-Q8_0_reprofile_20260630",
+  "offline_table": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/gemma-4-E4B-it-Q8_0_reprofile_20260630/offline_table",
+  "ops": 381,
+  "remote_dir": "/data/local/tmp/hyzheng/elastic",
+  "started": "2026-06-30T01:15:54-0400",
+  "trace": "exp-results/gemma-4-E4B-it-Q8_0/trace_inputs_scaled_cov40_90/trace_120_user_116_gemma_e4b_q8_cov40_90.csv",
+  "weights": 381
+}

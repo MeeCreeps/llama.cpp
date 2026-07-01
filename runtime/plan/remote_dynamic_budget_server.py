@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import tempfile
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +44,7 @@ class SolverHandler(BaseHTTPRequestHandler):
             plan, solve_ms = self.server.solve(req)
             self._send_json({"ok": True, "solve_ms": solve_ms, "plan": plan})
         except Exception as exc:  # keep the phone-side error concrete
+            traceback.print_exc(file=sys.stderr)
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -110,7 +113,7 @@ class SolverHTTPServer(ThreadingHTTPServer):
             self._last_cpu_resident = cpu
 
     def solve(self, req: dict[str, Any]) -> tuple[dict[str, Any], float]:
-        state = self._augment_cpu_residency(req.get("state", {"weights": []}))
+        state = {"weights": []} if self.args.ignore_state else self._augment_cpu_residency(req.get("state", {"weights": []}))
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(state, f)
             state_path = Path(f.name)
@@ -127,6 +130,7 @@ class SolverHTTPServer(ThreadingHTTPServer):
                 time_limit_ms=int(req.get("time_limit_ms", self.args.time_limit_ms)),
                 allow_cpu_fallback=bool(req.get("allow_cpu_fallback", self.args.allow_cpu_fallback)),
                 transition_weight=float(req.get("transition_weight", self.args.transition_weight)),
+                transition_horizon_tokens=float(req.get("transition_horizon_tokens", self.args.transition_horizon_tokens)),
                 disk_reload_multiplier=float(req.get("disk_reload_multiplier", self.args.disk_reload_multiplier)),
                 disk_gpu_reload_multiplier=float(req.get("disk_gpu_reload_multiplier", self.args.disk_gpu_reload_multiplier)),
                 overlap_model=str(req.get("overlap_model", self.args.overlap_model)),
@@ -159,6 +163,7 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
     ap.add_argument("--transition-weight", type=float, default=0.1)
+    ap.add_argument("--transition-horizon-tokens", type=float, default=1.0)
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
     ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
@@ -166,6 +171,8 @@ def main() -> None:
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
     ap.add_argument("--carry-cpu-residency", action="store_true",
                     help="legacy debug fallback: infer CPU residency from the previous returned plan")
+    ap.add_argument("--ignore-state", action="store_true",
+                    help="solve online requests as stateless budget-only CP plans; useful for correctness baselines")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

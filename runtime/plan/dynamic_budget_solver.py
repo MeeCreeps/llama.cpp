@@ -23,6 +23,8 @@ If ops are omitted, one op per weight is inferred.
 from __future__ import annotations
 
 import argparse
+import copy
+import functools
 import json
 import math
 import re
@@ -47,15 +49,24 @@ def parse_allowed_placements(s: str | None) -> set[str]:
     return out or set(PLACEMENTS)
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text())
+@functools.lru_cache(maxsize=64)
+def _load_json_cached(path_str: str, mtime_ns: int, size: int) -> dict[str, Any]:
+    del mtime_ns, size
+    return json.loads(Path(path_str).read_text())
+
+
+def load_json(path: Path, *, cached: bool = False) -> dict[str, Any]:
+    if not cached:
+        return json.loads(path.read_text())
+    st = path.stat()
+    return copy.deepcopy(_load_json_cached(str(path), st.st_mtime_ns, st.st_size))
 
 
 def load_cost_records(cost_dir: Path, filename: str) -> list[dict[str, Any]]:
     path = cost_dir / filename
     if not path.exists():
         return []
-    return load_json(path).get("records", [])
+    return load_json(path, cached=True).get("records", [])
 
 
 class CostModel:
@@ -63,33 +74,91 @@ class CostModel:
         self.stage = load_cost_records(cost_dir, "stage_costs.json")
         self.ops = load_cost_records(cost_dir, "op_costs.json")
         self.used_legacy_reload_ensure = False
+        self.calibration = self.load_calibration(cost_dir)
+        self._stage_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._stage_by_size: dict[tuple[str, str, int], dict[str, Any]] = {}
+        for rec in self.stage:
+            backend = str(rec.get("backend", ""))
+            kind = str(rec.get("kind", ""))
+            name = str(rec.get("name", ""))
+            size = int(rec.get("bytes", 0) or 0)
+            if name:
+                self._stage_by_key.setdefault((backend, kind, name), rec)
+            if size:
+                self._stage_by_size.setdefault((backend, kind, size), rec)
+
+        self._compute_exact_by_name: dict[tuple[str, str], dict[str, Any]] = {}
+        self._compute_mulmat_by_name: dict[tuple[str, str], dict[str, Any]] = {}
+        self._compute_by_name_size: dict[tuple[str, str, int], dict[str, Any]] = {}
+        for rec in self.ops:
+            if rec.get("kind") != "COMPUTE":
+                continue
+            backend = str(rec.get("backend", ""))
+            name = str(rec.get("name", ""))
+            size = int(rec.get("bytes", 0) or 0)
+            key = (backend, name)
+            if rec.get("op") == "MUL_MAT":
+                prev = self._compute_mulmat_by_name.get(key)
+                if prev is None or int(rec.get("samples", 0) or 0) > int(prev.get("samples", 0) or 0):
+                    self._compute_mulmat_by_name[key] = rec
+            else:
+                self._compute_exact_by_name.setdefault(key, rec)
+            if size:
+                self._compute_by_name_size.setdefault((backend, name, size), rec)
+
+    @staticmethod
+    def load_calibration(cost_dir: Path) -> dict[str, Any]:
+        path = cost_dir / "calibration.json"
+        if not path.exists():
+            return {}
+        data = load_json(path, cached=True)
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def calibration_multiplier(self, section: str, key: str, default: float = 1.0) -> float:
+        values = self.calibration.get(section, {})
+        if not isinstance(values, dict):
+            return default
+        try:
+            return float(values.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def stage_multiplier(self, backend: str, kind: str) -> float:
+        return (
+            self.calibration_multiplier("stage_multipliers", f"{backend}:{kind}")
+            * self.calibration_multiplier("backend_multipliers", backend)
+        )
+
+    def compute_multiplier(self, backend: str) -> float:
+        return self.calibration_multiplier("compute_multipliers", backend)
+
+    def placement_multiplier(self, choice: str) -> float:
+        return self.calibration_multiplier("placement_multipliers", choice)
+
+    def placement_fixed_ms(self, choice: str) -> float:
+        return self.calibration_multiplier("placement_fixed_ms", choice, 0.0)
 
     def measured_stage_ms(self, backend: str, kind: str, name: str, byte_size: int) -> float | None:
-        best = None
-        for rec in self.stage:
-            if rec.get("backend") != backend:
-                continue
-            if rec.get("kind") != kind:
-                continue
-            if rec.get("name") == name:
-                return float(rec.get("median_ms", 0.0))
-            if int(rec.get("bytes", 0)) == byte_size and best is None:
-                best = rec
-        if best:
-            return float(best.get("median_ms", 0.0))
+        rec = self._stage_by_key.get((backend, kind, name))
+        if rec is None:
+            rec = self._stage_by_size.get((backend, kind, int(byte_size)))
+        if rec is not None:
+            return float(rec.get("median_ms", 0.0))
         return None
 
     def stage_ms(self, backend: str, kind: str, name: str, byte_size: int) -> float:
         measured = self.measured_stage_ms(backend, kind, name, byte_size)
         if measured is not None:
-            return measured
+            return measured * self.stage_multiplier(backend, kind)
         # Phone-first fallback constants. These are deliberately rough and are
         # replaced by measured CSV data as soon as it exists.
         mb = byte_size / MB
         if kind in ("LOAD", "RELOAD_ENSURE"):
-            return 0.15 + mb / 1800.0 * 1000.0
+            return (0.15 + mb / 1800.0 * 1000.0) * self.stage_multiplier(backend, kind)
         if kind == "TRANSFER":
-            return 0.05 + mb / 6000.0 * 1000.0
+            return (0.05 + mb / 6000.0 * 1000.0) * self.stage_multiplier(backend, kind)
         if kind == "XFORM":
             # Fine-grained profiling may not yet contain standalone transform
             # records. On OP12/OpenCL, GPU transform measured during staged
@@ -97,12 +166,12 @@ class CostModel:
             # optimistic 8 GB/s fallback, while the generic CPU repack path
             # currently falls back to a no-op for llama.cpp weights.
             if backend == "CPU_Elastic":
-                return 0.02
-            return 0.10 + mb / 1200.0 * 1000.0
+                return 0.02 * self.stage_multiplier(backend, kind)
+            return (0.10 + mb / 1200.0 * 1000.0) * self.stage_multiplier(backend, kind)
         if kind == "SYNC":
-            return 0.03
+            return 0.03 * self.stage_multiplier(backend, kind)
         if kind == "EVICT":
-            return 0.01
+            return 0.01 * self.stage_multiplier(backend, kind)
         return 0.0
 
     @staticmethod
@@ -136,28 +205,20 @@ class CostModel:
         return out
 
     def measured_compute_ms(self, backend: str, name: str, byte_size: int) -> float | None:
-        candidates = set(self.compute_profile_names(name))
-        exact = None
         best_mul_mat = None
-        best = None
-        for rec in self.ops:
-            if rec.get("backend") != backend:
-                continue
-            if rec.get("kind") != "COMPUTE":
-                continue
-            if rec.get("name") in candidates:
-                if rec.get("op") == "MUL_MAT":
-                    if best_mul_mat is None or int(rec.get("samples", 0)) > int(best_mul_mat.get("samples", 0)):
-                        best_mul_mat = rec
-                    continue
-                if exact is None:
-                    exact = rec
-            if rec.get("name") == name and int(rec.get("bytes", 0)) == byte_size and best is None:
-                best = rec
+        exact = None
+        for candidate in self.compute_profile_names(name):
+            rec = self._compute_mulmat_by_name.get((backend, candidate))
+            if rec is not None:
+                if best_mul_mat is None or int(rec.get("samples", 0) or 0) > int(best_mul_mat.get("samples", 0) or 0):
+                    best_mul_mat = rec
+            if exact is None:
+                exact = self._compute_exact_by_name.get((backend, candidate))
         if best_mul_mat:
             return float(best_mul_mat.get("median_ms", 0.0))
         if exact:
             return float(exact.get("median_ms", 0.0))
+        best = self._compute_by_name_size.get((backend, name, int(byte_size)))
         if best:
             return float(best.get("median_ms", 0.0))
         return None
@@ -165,11 +226,11 @@ class CostModel:
     def compute_ms(self, backend: str, name: str, byte_size: int) -> float:
         measured = self.measured_compute_ms(backend, name, byte_size)
         if measured is not None:
-            return measured
+            return measured * self.compute_multiplier(backend)
         mb = byte_size / MB
         if backend == "OpenCL":
-            return 0.03 + mb * 0.020
-        return 0.05 + mb * 0.045
+            return (0.03 + mb * 0.020) * self.compute_multiplier(backend)
+        return (0.05 + mb * 0.045) * self.compute_multiplier(backend)
 
     def has_measured_backend_compute(self, backend: str) -> bool:
         return any(rec.get("backend") == backend and rec.get("kind") == "COMPUTE" for rec in self.ops)
@@ -368,6 +429,12 @@ def disk_stage_multiplier(choice: str, disk_reload_multiplier: float, disk_gpu_r
     return disk_reload_multiplier
 
 
+def effective_stage_multiplier(choice: str, cm: CostModel,
+                               disk_reload_multiplier: float,
+                               disk_gpu_reload_multiplier: float) -> float:
+    return disk_stage_multiplier(choice, disk_reload_multiplier, disk_gpu_reload_multiplier) * cm.placement_multiplier(choice)
+
+
 def current_location(row: dict[str, Any] | None) -> str:
     if state_has_backend(row, "GPU"):
         return "gpu"
@@ -406,7 +473,7 @@ def steady_engine_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu
         return {engine: math.inf for engine in ENGINES}
     out = {engine: 0.0 for engine in ENGINES}
     out["compute_gpu" if backend == "GPU" else "compute_cpu"] += compute
-    reload_mult = disk_stage_multiplier(choice, disk_reload_multiplier, disk_gpu_reload_multiplier)
+    reload_mult = effective_stage_multiplier(choice, cm, disk_reload_multiplier, disk_gpu_reload_multiplier)
     if choice == "disk_gpu":
         for kind, _, engine, ms in cm.stage_path("GPU", "disk", "gpu", name, size):
             key = {
@@ -416,10 +483,12 @@ def steady_engine_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu
                 "cpu": "xform_cpu",
             }.get(engine, engine)
             out[key] = out.get(key, 0.0) + reload_mult * ms
+        out["sync"] = out.get("sync", 0.0) + cm.placement_fixed_ms(choice)
     elif choice == "disk_cpu":
         for kind, _, engine, ms in cm.stage_path("CPU", "disk", "cpu", name, size):
             key = "disk" if engine == "disk" else "xform_cpu"
             out[key] = out.get(key, 0.0) + reload_mult * ms
+        out["sync"] = out.get("sync", 0.0) + cm.placement_fixed_ms(choice)
     return out
 
 
@@ -479,10 +548,17 @@ def selected_choice_intervals(choice: str, name: str, size: int, cm: CostModel,
     if math.isinf(compute):
         return []
     out: list[dict[str, Any]] = []
-    reload_mult = disk_stage_multiplier(choice, disk_reload_multiplier, disk_gpu_reload_multiplier)
+    reload_mult = effective_stage_multiplier(choice, cm, disk_reload_multiplier, disk_gpu_reload_multiplier)
     prepare_ms = 0.0
     prepare_engine = "prepare_gpu" if backend == "GPU" else "prepare_cpu"
     if choice == "disk_gpu":
+        fixed_ms = cm.placement_fixed_ms(choice)
+        if fixed_ms > 0.0:
+            out.append({
+                "kind": "load",
+                "engine": "disk",
+                "ms": fixed_ms,
+            })
         for kind, stage_backend, engine, ms in cm.stage_path("GPU", "disk", "gpu", name, size):
             if kind == "LOAD":
                 out.append({
@@ -498,6 +574,13 @@ def selected_choice_intervals(choice: str, name: str, size: int, cm: CostModel,
                 # than a standalone transfer stage.
                 prepare_ms += reload_mult * ms
     elif choice == "disk_cpu":
+        fixed_ms = cm.placement_fixed_ms(choice)
+        if fixed_ms > 0.0:
+            out.append({
+                "kind": "load",
+                "engine": "disk",
+                "ms": fixed_ms,
+            })
         for kind, stage_backend, engine, ms in cm.stage_path("CPU", "disk", "cpu", name, size):
             if kind == "LOAD":
                 out.append({
@@ -882,7 +965,7 @@ def xform_for_backend(backend: str, quant: str) -> str:
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
-    meta = load_json(args.model_meta)
+    meta = load_json(args.model_meta, cached=True)
     weights, ops = normalize_meta(meta)
     state = load_state(args.state)
     cm = CostModel(args.cost_dir)
@@ -895,7 +978,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     ]
 
     budget_bytes = max(0, (args.budget_mib - args.kv_mib - args.misc_mib - args.safety_mib) * MB)
-    objective_transition_weight = float(args.transition_weight) if has_state else 0.0
+    transition_horizon_tokens = max(1.0, float(getattr(args, "transition_horizon_tokens", 1.0)))
+    objective_transition_weight = (float(args.transition_weight) / transition_horizon_tokens) if has_state else 0.0
     by_id = {int(w["weight_id"]): w for w in weights}
     first_consumer: dict[int, int] = {}
     for op in ops:
@@ -1004,8 +1088,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                              str(args.overlap_model))
 
         if location == "disk":
-            if state_any_resident(row):
-                timeline.append({"kind": "evict", "weight_id": wid, "from_loc": src, "to_loc": "disk", "engine": "cpu", "anchor_op_id": 0, "overlap_group": -1})
+            # Disk placements are steady-state per-graph reloads.  Do not put
+            # resident->disk transition evicts into this timeline: anchors fire
+            # every graph, so a one-time transition evict would be repeated
+            # right before the same weight is reloaded/xformed.  On Q8 SOA this
+            # can recycle the current parent buffer into the retain pool and
+            # corrupt the following reload.  apply_exec_plan() already marks the
+            # desired location and performs one-time reconcile separately.
             if be == "GPU":
                 timeline.extend([
                     {"kind": "load", "weight_id": wid, "from_loc": "disk", "to_loc": "cpu", "engine": "disk", "anchor_op_id": anchor, "overlap_group": -1},
@@ -1018,15 +1107,17 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                     {"kind": "xform", "weight_id": wid, "from_loc": "cpu", "to_loc": "cpu", "engine": "cpu", "anchor_op_id": anchor, "overlap_group": -1},
                 ])
         elif has_state and location == "gpu" and src != "gpu":
-            if src == "disk":
-                timeline.append({"kind": "load", "weight_id": wid, "from_loc": "disk", "to_loc": "cpu", "engine": "disk", "anchor_op_id": anchor, "overlap_group": -1})
-            timeline.append({"kind": "transfer", "weight_id": wid, "from_loc": "cpu", "to_loc": "gpu", "engine": "transfer", "anchor_op_id": anchor, "overlap_group": -1})
-            timeline.append({"kind": "xform", "weight_id": wid, "from_loc": "gpu", "to_loc": "gpu", "engine": "gpu", "anchor_op_id": anchor, "overlap_group": -1})
+            # State transition/promotion is a one-time online switch cost.  Do
+            # not emit it into the per-graph anchor timeline; otherwise the
+            # runtime repeats the disk load every token.  The first consumer can
+            # still fault the tensor in through ensure_resident, after which the
+            # chosen GPU placement remains resident until a later plan evicts it.
+            pass
         elif has_state and location == "cpu" and src != "cpu":
-            if src == "gpu":
-                timeline.append({"kind": "evict", "weight_id": wid, "from_loc": "gpu", "to_loc": "disk", "engine": "cpu", "anchor_op_id": 0, "overlap_group": -1})
-            timeline.append({"kind": "load", "weight_id": wid, "from_loc": "disk", "to_loc": "cpu", "engine": "disk", "anchor_op_id": anchor, "overlap_group": -1})
-            timeline.append({"kind": "xform", "weight_id": wid, "from_loc": "cpu", "to_loc": "cpu", "engine": "cpu", "anchor_op_id": anchor, "overlap_group": -1})
+            # Same rule as disk placements: GPU->CPU is a one-time transition
+            # plus disk-backed CPU materialization, not a per-graph timeline
+            # evict.  Repeating it from anchors can invalidate live GPU buffers.
+            pass
 
     plan_ops = []
     for op in ops:
@@ -1081,8 +1172,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "cpu_fallback_enabled": bool(args.allow_cpu_fallback),
             "allowed_placements": sorted(allowed_placements),
             "transition_weight": objective_transition_weight,
+            "base_transition_weight": float(args.transition_weight),
+            "transition_horizon_tokens": transition_horizon_tokens,
             "disk_reload_multiplier": float(args.disk_reload_multiplier),
             "disk_gpu_reload_multiplier": float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
+            "calibration": cm.calibration,
             "exclude_plan_count": len(exclude_placements),
             "min_placement_distance": int(getattr(args, "min_placement_distance", 0)),
         },
@@ -1110,6 +1204,8 @@ def main() -> None:
                     help=f"comma-separated placement choices to allow; valid={','.join(PLACEMENTS)}")
     ap.add_argument("--transition-weight", type=float, default=0.1,
                     help="weight applied to current-state transition/migration cost in the online objective")
+    ap.add_argument("--transition-horizon-tokens", type=float, default=1.0,
+                    help="token horizon used to amortize one-time online transition cost")
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0,
                     help="multiplier applied to steady-state disk/on-demand reload cost")
     ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0,

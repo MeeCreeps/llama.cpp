@@ -163,11 +163,18 @@ struct wbm_opencl_ctx {
     std::condition_variable async_load_cv;
     std::deque<int> async_load_queue;
     std::unordered_map<int, int> async_load_state;
+    std::unordered_map<int, size_t> async_load_bytes_by_idx;
     std::thread async_load_worker;
     uint64_t async_load_enqueued = 0;
     uint64_t async_load_completed = 0;
     uint64_t async_load_waits = 0;
     uint64_t async_load_wait_us = 0;
+    size_t   async_load_pending_bytes = 0;
+    size_t   async_load_max_pending_bytes_seen = 0;
+    size_t   async_load_max_pending_count_seen = 0;
+    uint64_t async_load_throttle_waits = 0;
+    uint64_t async_load_throttle_wait_us = 0;
+    uint64_t async_load_throttle_skipped = 0;
 
     // Async SOA materialization worker. Used by staged pipeline experiments to
     // submit the existing SOA reload callback at a TRANSFER anchor and let the

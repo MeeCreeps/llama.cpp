@@ -1,0 +1,13 @@
+{
+  "boundary_records": 0,
+  "device": "android-opencl",
+  "input_rows": 11452,
+  "model": "OLMoE-1B-7B-0125-Instruct-Q4_K_M_reprofile_20260630",
+  "op_records": 1794,
+  "source_csv": [
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_reprofile_20260630/csv/opencl_compute.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_reprofile_20260630/csv/opencl_reload_legacy.csv",
+    "/home/myid/hz85760/workspace/project/elastic/llama.cpp/runtime/plan/generated/OLMoE-1B-7B-0125-Instruct-Q4_K_M_reprofile_20260630/csv/cpu_compute.csv"
+  ],
+  "stage_records": 48
+}

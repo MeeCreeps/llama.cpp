@@ -1,0 +1,17 @@
+[
+  {
+    "local": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/gemma-4-E4B-it-Q8_0/window_180s_baselines_scaled_cov40_90/run_online_bounded_20260630/traces/trace_120_user_116_gemma_e4b_q8_cov40_90_10min_x1.csv",
+    "max_bucket_mib": 9984,
+    "max_mib": 9889.5,
+    "mean_mib": 8522.702209944751,
+    "min_bucket_mib": 6400,
+    "min_mib": 6420.2,
+    "remote_name": "trace_120_user_116_gemma_e4b_q8_cov40_90_10min_x1.csv",
+    "replay_span": 180.0,
+    "rows": 181,
+    "source": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/gemma-4-E4B-it-Q8_0/trace_inputs_scaled_cov40_90/trace_120_user_116_gemma_e4b_q8_cov40_90.csv",
+    "source_end": 180.0,
+    "source_span": 180.0,
+    "source_start": 0.0
+  }
+]

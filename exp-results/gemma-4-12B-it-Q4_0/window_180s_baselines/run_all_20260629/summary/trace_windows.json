@@ -1,0 +1,17 @@
+[
+  {
+    "local": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/gemma-4-12B-it-Q4_0/window_180s_baselines/run_all_20260629/traces/trace_03_user_116_cap7300_10min_x1.csv",
+    "max_bucket_mib": 7424,
+    "max_mib": 7300.0,
+    "mean_mib": 6769.709944751381,
+    "min_bucket_mib": 5888,
+    "min_mib": 5954.0,
+    "remote_name": "trace_03_user_116_cap7300_10min_x1.csv",
+    "replay_span": 180.0,
+    "rows": 181,
+    "source": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/Qwen2.5-14B-Instruct-Q4_0/trace_inputs/trace_03_user_116_cap7300.csv",
+    "source_end": 180.0,
+    "source_span": 180.0,
+    "source_start": 0.0
+  }
+]

@@ -1,0 +1,630 @@
+{
+  "ops": [
+    {
+      "layer": 0,
+      "name": "blk.0.attn_k_norm.weight",
+      "op_id": 0,
+      "weight_id": 0
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.attn_q_norm.weight",
+      "op_id": 1,
+      "weight_id": 1
+    },
+    {
+      "layer": 0,
+      "name": "blk.0.ffn_gate_inp.weight",
+      "op_id": 2,
+      "weight_id": 2
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_k_norm.weight",
+      "op_id": 3,
+      "weight_id": 3
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.attn_q_norm.weight",
+      "op_id": 4,
+      "weight_id": 4
+    },
+    {
+      "layer": 1,
+      "name": "blk.1.ffn_gate_inp.weight",
+      "op_id": 5,
+      "weight_id": 5
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_k_norm.weight",
+      "op_id": 6,
+      "weight_id": 6
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.attn_q_norm.weight",
+      "op_id": 7,
+      "weight_id": 7
+    },
+    {
+      "layer": 2,
+      "name": "blk.2.ffn_gate_inp.weight",
+      "op_id": 8,
+      "weight_id": 8
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_k_norm.weight",
+      "op_id": 9,
+      "weight_id": 9
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.attn_q_norm.weight",
+      "op_id": 10,
+      "weight_id": 10
+    },
+    {
+      "layer": 3,
+      "name": "blk.3.ffn_gate_inp.weight",
+      "op_id": 11,
+      "weight_id": 11
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_k_norm.weight",
+      "op_id": 12,
+      "weight_id": 12
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.attn_q_norm.weight",
+      "op_id": 13,
+      "weight_id": 13
+    },
+    {
+      "layer": 4,
+      "name": "blk.4.ffn_gate_inp.weight",
+      "op_id": 14,
+      "weight_id": 14
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_k_norm.weight",
+      "op_id": 15,
+      "weight_id": 15
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.attn_q_norm.weight",
+      "op_id": 16,
+      "weight_id": 16
+    },
+    {
+      "layer": 5,
+      "name": "blk.5.ffn_gate_inp.weight",
+      "op_id": 17,
+      "weight_id": 17
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_k_norm.weight",
+      "op_id": 18,
+      "weight_id": 18
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.attn_q_norm.weight",
+      "op_id": 19,
+      "weight_id": 19
+    },
+    {
+      "layer": 6,
+      "name": "blk.6.ffn_gate_inp.weight",
+      "op_id": 20,
+      "weight_id": 20
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_k_norm.weight",
+      "op_id": 21,
+      "weight_id": 21
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.attn_q_norm.weight",
+      "op_id": 22,
+      "weight_id": 22
+    },
+    {
+      "layer": 7,
+      "name": "blk.7.ffn_gate_inp.weight",
+      "op_id": 23,
+      "weight_id": 23
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_k_norm.weight",
+      "op_id": 24,
+      "weight_id": 24
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.attn_q_norm.weight",
+      "op_id": 25,
+      "weight_id": 25
+    },
+    {
+      "layer": 8,
+      "name": "blk.8.ffn_gate_inp.weight",
+      "op_id": 26,
+      "weight_id": 26
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_k_norm.weight",
+      "op_id": 27,
+      "weight_id": 27
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.attn_q_norm.weight",
+      "op_id": 28,
+      "weight_id": 28
+    },
+    {
+      "layer": 9,
+      "name": "blk.9.ffn_gate_inp.weight",
+      "op_id": 29,
+      "weight_id": 29
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_k_norm.weight",
+      "op_id": 30,
+      "weight_id": 30
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.attn_q_norm.weight",
+      "op_id": 31,
+      "weight_id": 31
+    },
+    {
+      "layer": 10,
+      "name": "blk.10.ffn_gate_inp.weight",
+      "op_id": 32,
+      "weight_id": 32
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_k_norm.weight",
+      "op_id": 33,
+      "weight_id": 33
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.attn_q_norm.weight",
+      "op_id": 34,
+      "weight_id": 34
+    },
+    {
+      "layer": 11,
+      "name": "blk.11.ffn_gate_inp.weight",
+      "op_id": 35,
+      "weight_id": 35
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_k_norm.weight",
+      "op_id": 36,
+      "weight_id": 36
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.attn_q_norm.weight",
+      "op_id": 37,
+      "weight_id": 37
+    },
+    {
+      "layer": 12,
+      "name": "blk.12.ffn_gate_inp.weight",
+      "op_id": 38,
+      "weight_id": 38
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_k_norm.weight",
+      "op_id": 39,
+      "weight_id": 39
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.attn_q_norm.weight",
+      "op_id": 40,
+      "weight_id": 40
+    },
+    {
+      "layer": 13,
+      "name": "blk.13.ffn_gate_inp.weight",
+      "op_id": 41,
+      "weight_id": 41
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_k_norm.weight",
+      "op_id": 42,
+      "weight_id": 42
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.attn_q_norm.weight",
+      "op_id": 43,
+      "weight_id": 43
+    },
+    {
+      "layer": 14,
+      "name": "blk.14.ffn_gate_inp.weight",
+      "op_id": 44,
+      "weight_id": 44
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_k_norm.weight",
+      "op_id": 45,
+      "weight_id": 45
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.attn_q_norm.weight",
+      "op_id": 46,
+      "weight_id": 46
+    },
+    {
+      "layer": 15,
+      "name": "blk.15.ffn_gate_inp.weight",
+      "op_id": 47,
+      "weight_id": 47
+    }
+  ],
+  "weights": [
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "name": "blk.0.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 0
+    },
+    {
+      "byte_size": 8192,
+      "layer": 0,
+      "name": "blk.0.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 1
+    },
+    {
+      "byte_size": 524288,
+      "layer": 0,
+      "name": "blk.0.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 2
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "name": "blk.1.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 3
+    },
+    {
+      "byte_size": 8192,
+      "layer": 1,
+      "name": "blk.1.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 4
+    },
+    {
+      "byte_size": 524288,
+      "layer": 1,
+      "name": "blk.1.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 5
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "name": "blk.2.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 6
+    },
+    {
+      "byte_size": 8192,
+      "layer": 2,
+      "name": "blk.2.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 7
+    },
+    {
+      "byte_size": 524288,
+      "layer": 2,
+      "name": "blk.2.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 8
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "name": "blk.3.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 9
+    },
+    {
+      "byte_size": 8192,
+      "layer": 3,
+      "name": "blk.3.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 10
+    },
+    {
+      "byte_size": 524288,
+      "layer": 3,
+      "name": "blk.3.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 11
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "name": "blk.4.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 12
+    },
+    {
+      "byte_size": 8192,
+      "layer": 4,
+      "name": "blk.4.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 13
+    },
+    {
+      "byte_size": 524288,
+      "layer": 4,
+      "name": "blk.4.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 14
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "name": "blk.5.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 15
+    },
+    {
+      "byte_size": 8192,
+      "layer": 5,
+      "name": "blk.5.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 16
+    },
+    {
+      "byte_size": 524288,
+      "layer": 5,
+      "name": "blk.5.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 17
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "name": "blk.6.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 18
+    },
+    {
+      "byte_size": 8192,
+      "layer": 6,
+      "name": "blk.6.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 19
+    },
+    {
+      "byte_size": 524288,
+      "layer": 6,
+      "name": "blk.6.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 20
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "name": "blk.7.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 21
+    },
+    {
+      "byte_size": 8192,
+      "layer": 7,
+      "name": "blk.7.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 22
+    },
+    {
+      "byte_size": 524288,
+      "layer": 7,
+      "name": "blk.7.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 23
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "name": "blk.8.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 24
+    },
+    {
+      "byte_size": 8192,
+      "layer": 8,
+      "name": "blk.8.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 25
+    },
+    {
+      "byte_size": 524288,
+      "layer": 8,
+      "name": "blk.8.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 26
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "name": "blk.9.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 27
+    },
+    {
+      "byte_size": 8192,
+      "layer": 9,
+      "name": "blk.9.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 28
+    },
+    {
+      "byte_size": 524288,
+      "layer": 9,
+      "name": "blk.9.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 29
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "name": "blk.10.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 30
+    },
+    {
+      "byte_size": 8192,
+      "layer": 10,
+      "name": "blk.10.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 31
+    },
+    {
+      "byte_size": 524288,
+      "layer": 10,
+      "name": "blk.10.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 32
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "name": "blk.11.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 33
+    },
+    {
+      "byte_size": 8192,
+      "layer": 11,
+      "name": "blk.11.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 34
+    },
+    {
+      "byte_size": 524288,
+      "layer": 11,
+      "name": "blk.11.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 35
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "name": "blk.12.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 36
+    },
+    {
+      "byte_size": 8192,
+      "layer": 12,
+      "name": "blk.12.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 37
+    },
+    {
+      "byte_size": 524288,
+      "layer": 12,
+      "name": "blk.12.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 38
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "name": "blk.13.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 39
+    },
+    {
+      "byte_size": 8192,
+      "layer": 13,
+      "name": "blk.13.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 40
+    },
+    {
+      "byte_size": 524288,
+      "layer": 13,
+      "name": "blk.13.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 41
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "name": "blk.14.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 42
+    },
+    {
+      "byte_size": 8192,
+      "layer": 14,
+      "name": "blk.14.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 43
+    },
+    {
+      "byte_size": 524288,
+      "layer": 14,
+      "name": "blk.14.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 44
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "name": "blk.15.attn_k_norm.weight",
+      "quant": "",
+      "weight_id": 45
+    },
+    {
+      "byte_size": 8192,
+      "layer": 15,
+      "name": "blk.15.attn_q_norm.weight",
+      "quant": "",
+      "weight_id": 46
+    },
+    {
+      "byte_size": 524288,
+      "layer": 15,
+      "name": "blk.15.ffn_gate_inp.weight",
+      "quant": "",
+      "weight_id": 47
+    }
+  ]
+}

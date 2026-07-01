@@ -133,9 +133,11 @@ struct elastic_online_solver_state {
     bool prewarm_candidate_cache = false;
     std::string last_candidate_file;
     int64_t last_candidate_budget_mib = 0;
+    nlohmann::json last_online_plan_json;
     nlohmann::json last_diff_tree_plan;
     int64_t last_diff_tree_budget_mib = 0;
     double keep_current_margin_ms = 0.0;
+    double candidate_min_gain_ms = 0.0;
     std::string work_dir;
     int kv_mib = 128;
     int misc_mib = 256;
@@ -144,6 +146,7 @@ struct elastic_online_solver_state {
     int prefetch_distance = 1;
     bool allow_cpu_fallback = false;
     double transition_weight = 1.0;
+    double transition_horizon_tokens = 1.0;
     double high_budget_transition_weight = -1.0;
     int64_t high_budget_transition_threshold_mib = 0;
     double disk_reload_multiplier = 1.0;
@@ -411,6 +414,10 @@ static uint32_t elastic_lookup_snapshot_flags(elastic_online_solver_state * s,
     return st.flags;
 }
 
+static double elastic_finite_json_number(double value, double fallback = 0.0) {
+    return std::isfinite(value) ? value : fallback;
+}
+
 static double elastic_candidate_transition_cost(elastic_online_solver_state * s, const nlohmann::json & plan,
                                                 const std::unordered_map<std::string, uint32_t> * state_flags,
                                                 double * load_mb, double * prepare_mb, double * evict_mb,
@@ -474,8 +481,36 @@ static bool elastic_candidate_cache_load(elastic_online_solver_state * s) {
     }
     idxf >> s->candidate_index;
 
-    size_t loaded = 0;
+    s->candidate_cache_loaded = true;
+    const auto rows = s->candidate_index.value("index", nlohmann::json::array());
+    LOG_INF("[elastic-candidate] cached index rows=%zu from %s\n", rows.size(), s->candidate_dir.c_str());
+    return true;
+}
+
+static const nlohmann::json * elastic_candidate_get_plan_json(elastic_online_solver_state * s, const std::string & file) {
+    if (!s || file.empty()) return nullptr;
+    const auto cached = s->candidate_plan_cache.find(file);
+    if (cached != s->candidate_plan_cache.end()) return &cached->second;
+    const std::string path = s->candidate_dir + "/" + file;
+    std::ifstream pf(path);
+    if (!pf) {
+        LOG_ERR("[elastic-candidate] failed to open candidate plan %s\n", path.c_str());
+        return nullptr;
+    }
+    nlohmann::json plan;
+    try {
+        pf >> plan;
+    } catch (const std::exception & e) {
+        LOG_ERR("[elastic-candidate] failed to parse candidate plan %s: %s\n", path.c_str(), e.what());
+        return nullptr;
+    }
+    auto inserted = s->candidate_plan_cache.emplace(file, std::move(plan));
+    return &inserted.first->second;
+}
+
+static std::unordered_set<std::string> elastic_candidate_index_files(elastic_online_solver_state * s) {
     std::unordered_set<std::string> files;
+    if (!s) return files;
     for (const auto & row : s->candidate_index.value("index", nlohmann::json::array())) {
         const std::string base_file = row.value("file", std::string());
         if (!base_file.empty()) files.insert(base_file);
@@ -484,23 +519,7 @@ static bool elastic_candidate_cache_load(elastic_online_solver_state * s) {
             if (!file.empty()) files.insert(file);
         }
     }
-
-    for (const std::string & file : files) {
-        std::ifstream pf(s->candidate_dir + "/" + file);
-        if (!pf) {
-            LOG_ERR("[elastic-candidate] failed to open candidate plan %s/%s\n",
-                    s->candidate_dir.c_str(), file.c_str());
-            return false;
-        }
-        nlohmann::json plan;
-        pf >> plan;
-        s->candidate_plan_cache.emplace(file, std::move(plan));
-        loaded++;
-    }
-
-    s->candidate_cache_loaded = true;
-    LOG_INF("[elastic-candidate] cached %zu plans from %s\n", loaded, s->candidate_dir.c_str());
-    return true;
+    return files;
 }
 
 static llama_plan * elastic_candidate_load_plan_handle(elastic_online_solver_state * s, const std::string & file) {
@@ -521,8 +540,9 @@ static llama_plan * elastic_candidate_load_plan_handle(elastic_online_solver_sta
 static bool elastic_candidate_prewarm(elastic_online_solver_state * s) {
     if (!elastic_candidate_cache_load(s)) return false;
     size_t handles = 0;
-    for (const auto & kv : s->candidate_plan_cache) {
-        if (!elastic_candidate_load_plan_handle(s, kv.first)) return false;
+    for (const auto & file : elastic_candidate_index_files(s)) {
+        if (!elastic_candidate_get_plan_json(s, file)) return false;
+        if (!elastic_candidate_load_plan_handle(s, file)) return false;
         handles++;
     }
     LOG_INF("[elastic-candidate] prewarmed %zu plan handles from %s\n",
@@ -682,6 +702,104 @@ static double elastic_target_transition_cost(elastic_online_solver_state * s, co
     return 0.0;
 }
 
+static void elastic_plan_set_weight_target(nlohmann::json & plan, int weight_id,
+                                           const std::string & loc,
+                                           const std::string & backend,
+                                           const std::string & xform) {
+    nlohmann::json * w = elastic_plan_find_weight(plan, weight_id);
+    if (w) {
+        (*w)["location"] = loc;
+        (*w)["xform"] = xform;
+    }
+    nlohmann::json * op = elastic_plan_find_op(plan, weight_id);
+    if (op) {
+        (*op)["compute_backend"] = backend;
+        (*op)["dispatch"] = "static";
+        (*op)["migrate"] = false;
+        (*op)["migrate_from"] = backend;
+        (*op)["migrate_xform"] = "none";
+    }
+}
+
+static double elastic_plan_total_path_cost(elastic_online_solver_state * s, const nlohmann::json & plan) {
+    double total = 0.0;
+    for (const auto & w : plan.value("weights", nlohmann::json::array())) {
+        if (!w.is_object()) continue;
+        total += elastic_plan_path_cost(s, plan, w.value("weight_id", -1));
+    }
+    return total;
+}
+
+static nlohmann::json elastic_current_state_base_plan(elastic_online_solver_state * s, int64_t budget_mib,
+                                                      const nlohmann::json & target_plan,
+                                                      const std::unordered_map<std::string, uint32_t> * state_flags) {
+    struct keep_item {
+        int id = -1;
+        size_t bytes = 0;
+        double value_per_byte = 0.0;
+    };
+
+    nlohmann::json out = target_plan;
+    out["budget_mib"] = budget_mib;
+
+    const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
+    const int64_t budget_bytes = usable_mib > 0 ? usable_mib * 1024LL * 1024LL : 0;
+    int64_t used = 0;
+    std::vector<keep_item> kept;
+
+    for (const auto & tw : target_plan.value("weights", nlohmann::json::array())) {
+        if (!tw.is_object()) continue;
+        const int id = tw.value("weight_id", -1);
+        if (id < 0 || tw.value("pinned", false)) continue;
+        const std::string name = tw.value("name", std::string());
+        const std::string quant = tw.value("quant", std::string());
+        const size_t bytes = (size_t) tw.value("byte_size", 0);
+        const uint32_t flags = elastic_lookup_snapshot_flags(s, state_flags, name);
+
+        const bool gpu = (flags & (LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
+                                   LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT)) != 0;
+        const bool cpu = (flags & (LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT |
+                                   LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT)) != 0;
+        if (gpu || cpu) {
+            const std::string be = gpu ? "GPU" : "CPU";
+            const std::string loc = gpu ? "gpu" : "cpu";
+            elastic_plan_set_weight_target(out, id, loc, gpu ? "gpu" : "cpu", elastic_xform_for(be, quant));
+            used += (int64_t) bytes;
+
+            const double disk_cost =
+                elastic_stage_cost(s, "CPU_Elastic", "LOAD", name, bytes) +
+                elastic_stage_cost(s, "CPU_Elastic", "XFORM", name, bytes) +
+                elastic_compute_cost(s, "CPU_Elastic", name, bytes);
+            const double resident_cost = gpu ? elastic_compute_cost(s, "OpenCL", name, bytes)
+                                             : elastic_compute_cost(s, "CPU_Elastic", name, bytes);
+            const double value = std::max(0.0, disk_cost - resident_cost);
+            kept.push_back({id, bytes, bytes > 0 ? value / (double) bytes : 0.0});
+        } else {
+            elastic_plan_set_weight_target(out, id, "disk", "cpu", "none");
+        }
+    }
+
+    if (budget_bytes > 0 && used > budget_bytes) {
+        std::sort(kept.begin(), kept.end(), [](const keep_item & a, const keep_item & b) {
+            return a.value_per_byte < b.value_per_byte;
+        });
+        for (const keep_item & it : kept) {
+            if (used <= budget_bytes) break;
+            elastic_plan_set_weight_target(out, it.id, "disk", "cpu", "none");
+            used -= (int64_t) it.bytes;
+        }
+    }
+
+    elastic_recompute_plan_events_from_weights(out, s->prefetch_distance);
+    out["pred_per_token_ms"] = elastic_finite_json_number(elastic_plan_total_path_cost(s, out));
+    out["diff_tree_base"] = {
+        {"mode", "current_state"},
+        {"resident_mb", elastic_plan_resident_bytes(out) / 1024.0 / 1024.0},
+        {"budget_resident_mb", budget_bytes / 1024.0 / 1024.0},
+    };
+    return out;
+}
+
 static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state * s, int64_t budget_mib,
                                                    const nlohmann::json & base_plan,
                                                    const nlohmann::json & target_plan,
@@ -727,6 +845,9 @@ static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state *
     nlohmann::json out = base_plan;
     out["budget_mib"] = budget_mib;
     size_t used = elastic_plan_resident_bytes(out);
+    const bool base_is_current_state =
+        base_plan.contains("diff_tree_base") && base_plan["diff_tree_base"].is_object() &&
+        base_plan["diff_tree_base"].value("mode", std::string()) == "current_state";
 
     std::unordered_map<std::string, group> groups;
     const auto target_weights_it = target_plan.find("weights");
@@ -750,6 +871,9 @@ static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state *
         const size_t bytes = (size_t) tw.value("byte_size", 0);
         const bool base_resident = base_loc == "cpu" || base_loc == "gpu";
         const bool target_resident = target_loc == "cpu" || target_loc == "gpu";
+        if (base_is_current_state && base_resident && (target_loc != base_loc || target_backend != base_backend)) {
+            continue;
+        }
         leaf lf;
         lf.id = id;
         lf.key = elastic_diff_group_key(tw.value("name", std::string()), tw.value("layer", -1));
@@ -797,8 +921,9 @@ static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state *
             used = (size_t) ((int64_t) used + g.delta_bytes);
             accepted_groups++;
             group_log.push_back({{"key", g.key}, {"decision", "accept_group"},
-                                 {"leaves", (int) g.leaves.size()}, {"score_ms", g.score},
-                                 {"transition_ms", g.transition_ms}, {"steady_gain_ms", g.steady_gain_ms},
+                                 {"leaves", (int) g.leaves.size()}, {"score_ms", elastic_finite_json_number(g.score)},
+                                 {"transition_ms", elastic_finite_json_number(g.transition_ms)},
+                                 {"steady_gain_ms", elastic_finite_json_number(g.steady_gain_ms)},
                                  {"delta_mb", g.delta_bytes / 1024.0 / 1024.0}});
             continue;
         }
@@ -818,14 +943,16 @@ static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state *
             expanded_groups++;
             group_log.push_back({{"key", g.key}, {"decision", "expand_accept_leaves"},
                                  {"leaves", (int) g.leaves.size()}, {"accepted_leaves", local_accept},
-                                 {"score_ms", g.score}, {"transition_ms", g.transition_ms},
-                                 {"steady_gain_ms", g.steady_gain_ms},
+                                 {"score_ms", elastic_finite_json_number(g.score)},
+                                 {"transition_ms", elastic_finite_json_number(g.transition_ms)},
+                                 {"steady_gain_ms", elastic_finite_json_number(g.steady_gain_ms)},
                                  {"delta_mb", g.delta_bytes / 1024.0 / 1024.0}});
         } else {
             rejected_groups++;
             group_log.push_back({{"key", g.key}, {"decision", "reject_keep_base"},
-                                 {"leaves", (int) g.leaves.size()}, {"score_ms", g.score},
-                                 {"transition_ms", g.transition_ms}, {"steady_gain_ms", g.steady_gain_ms},
+                                 {"leaves", (int) g.leaves.size()}, {"score_ms", elastic_finite_json_number(g.score)},
+                                 {"transition_ms", elastic_finite_json_number(g.transition_ms)},
+                                 {"steady_gain_ms", elastic_finite_json_number(g.steady_gain_ms)},
                                  {"delta_mb", g.delta_bytes / 1024.0 / 1024.0}});
         }
     }
@@ -965,9 +1092,9 @@ static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, int6
             {"key", g.key},
             {"changed", g.changed},
             {"rejected", g.rejected},
-            {"transition_ms", g.transition_ms},
-            {"steady_gain_ms", g.steady_gain_ms},
-            {"score_ms", score},
+            {"transition_ms", elastic_finite_json_number(g.transition_ms)},
+            {"steady_gain_ms", elastic_finite_json_number(g.steady_gain_ms)},
+            {"score_ms", elastic_finite_json_number(score)},
             {"load_mb", g.load_mb},
             {"prepare_mb", g.prepare_mb},
             {"decision", reject ? "reject" : "accept"},
@@ -1054,14 +1181,23 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     int best_cid = -1;
     std::string best_file;
     nlohmann::json best_plan;
+    double base_score = std::numeric_limits<double>::infinity();
+    double base_transition = 0.0;
+    double base_load_mb = 0.0;
+    double base_prepare_mb = 0.0;
+    double base_evict_mb = 0.0;
+    int base_changed = 0;
+    int base_cid = -1;
+    std::string base_file;
+    nlohmann::json base_plan;
 
     if (s->mode == "candidate-select" && s->keep_current_margin_ms > 0.0 &&
         !s->last_candidate_file.empty() && s->last_candidate_budget_mib > 0 &&
         s->last_candidate_budget_mib <= budget_mib) {
-        const auto keep_it = s->candidate_plan_cache.find(s->last_candidate_file);
-        if (keep_it != s->candidate_plan_cache.end()) {
+        const nlohmann::json * keep_plan = elastic_candidate_get_plan_json(s, s->last_candidate_file);
+        if (keep_plan) {
             const std::string keep_key = s->last_candidate_file + "|" + std::to_string((long long) budget_mib);
-            const double keep_steady = keep_it->second.value("pred_per_token_ms", std::numeric_limits<double>::infinity());
+            const double keep_steady = keep_plan->value("pred_per_token_ms", std::numeric_limits<double>::infinity());
             if (s->keep_current_fast_cache.find(keep_key) != s->keep_current_fast_cache.end()) {
                 if (selected_file) *selected_file = s->last_candidate_file;
                 if (s->log_candidate_events) {
@@ -1079,9 +1215,9 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             for (const auto & cand : candidates) {
                 const std::string file = cand.value("file", std::string());
                 if (file.empty()) continue;
-                const auto it = s->candidate_plan_cache.find(file);
-                if (it == s->candidate_plan_cache.end()) continue;
-                const double steady = it->second.value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
+                const nlohmann::json * plan = elastic_candidate_get_plan_json(s, file);
+                if (!plan) continue;
+                const double steady = plan->value("pred_per_token_ms", cand.value("pred_per_token_ms", 0.0));
                 best_steady = std::min(best_steady, steady);
             }
             if (std::isfinite(keep_steady) && std::isfinite(best_steady) &&
@@ -1107,9 +1243,22 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     for (const auto & cand : candidates) {
         const std::string file = cand.value("file", std::string());
         if (file.empty()) continue;
-        const auto it = s->candidate_plan_cache.find(file);
-        if (it == s->candidate_plan_cache.end()) continue;
-        const nlohmann::json & plan = it->second;
+        const int cid = cand.value("candidate_id", -1);
+        const bool is_base = cid == 0 || file == best_row.value("file", std::string());
+        const double steady_hint = cand.value("pred_per_token_ms", std::numeric_limits<double>::infinity());
+        if (!is_base && s->mode == "candidate-select" && s->candidate_min_gain_ms > 0.0 &&
+            std::isfinite(base_score) && std::isfinite(steady_hint) &&
+            steady_hint >= base_score - s->candidate_min_gain_ms) {
+            if (s->log_candidate_scores) {
+                LOG_INF("[elastic-candidate-prune] budget=%lld candidate=%d file=%s steady_hint=%.3f base_score=%.3f min_gain=%.3f\n",
+                        (long long) budget_mib, cid, file.c_str(),
+                        steady_hint, base_score, s->candidate_min_gain_ms);
+            }
+            continue;
+        }
+        const nlohmann::json * plan_ptr = elastic_candidate_get_plan_json(s, file);
+        if (!plan_ptr) continue;
+        const nlohmann::json & plan = *plan_ptr;
         double load_mb = 0.0, prepare_mb = 0.0, evict_mb = 0.0;
         int changed = 0;
         const double transition = elastic_candidate_transition_cost(s, plan, &state_flags,
@@ -1118,8 +1267,19 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         const double score = steady + transition_weight * transition;
         if (s->log_candidate_scores) {
             LOG_INF("[elastic-candidate-score] budget=%lld candidate=%d file=%s steady=%.3f transition=%.3f score=%.3f changed=%d load=%.1fMB prepare=%.1fMB evict=%.1fMB\n",
-                    (long long) budget_mib, cand.value("candidate_id", -1), file.c_str(),
+                    (long long) budget_mib, cid, file.c_str(),
                     steady, transition, score, changed, load_mb, prepare_mb, evict_mb);
+        }
+        if (is_base && score < base_score) {
+            base_score = score;
+            base_transition = transition;
+            base_load_mb = load_mb;
+            base_prepare_mb = prepare_mb;
+            base_evict_mb = evict_mb;
+            base_changed = changed;
+            base_cid = cid;
+            base_file = file;
+            base_plan = plan;
         }
         if (score < best_score) {
             best_score = score;
@@ -1128,20 +1288,42 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             best_prepare_mb = prepare_mb;
             best_evict_mb = evict_mb;
             best_changed = changed;
-            best_cid = cand.value("candidate_id", -1);
+            best_cid = cid;
             best_file = file;
             best_plan = plan;
         }
     }
     if (best_plan.is_null()) return false;
 
+    if (s->mode == "candidate-select" && best_cid != 0 && s->candidate_min_gain_ms > 0.0 &&
+        !base_plan.is_null() && std::isfinite(base_score)) {
+        const double predicted_gain = base_score - best_score;
+        if (predicted_gain < s->candidate_min_gain_ms) {
+            if (s->log_candidate_events) {
+                LOG_INF("[elastic-candidate-guard] budget=%lld candidate=%d file=%s predicted_gain=%.3f below_min_gain=%.3f; keep_base=%s base_score=%.3f best_score=%.3f\n",
+                        (long long) budget_mib, best_cid, best_file.c_str(),
+                        predicted_gain, s->candidate_min_gain_ms,
+                        base_file.c_str(), base_score, best_score);
+            }
+            best_score = base_score;
+            best_transition = base_transition;
+            best_load_mb = base_load_mb;
+            best_prepare_mb = base_prepare_mb;
+            best_evict_mb = base_evict_mb;
+            best_changed = base_changed;
+            best_cid = base_cid;
+            best_file = base_file;
+            best_plan = base_plan;
+        }
+    }
+
     if (s->mode == "candidate-select" && s->keep_current_margin_ms > 0.0 &&
         !s->last_candidate_file.empty() && s->last_candidate_budget_mib > 0 &&
         s->last_candidate_budget_mib <= budget_mib) {
-        const auto keep_it = s->candidate_plan_cache.find(s->last_candidate_file);
-        if (keep_it != s->candidate_plan_cache.end()) {
+        const nlohmann::json * keep_plan = elastic_candidate_get_plan_json(s, s->last_candidate_file);
+        if (keep_plan) {
             const std::string keep_key = s->last_candidate_file + "|" + std::to_string((long long) budget_mib);
-            const double keep_steady = keep_it->second.value("pred_per_token_ms", std::numeric_limits<double>::infinity());
+            const double keep_steady = keep_plan->value("pred_per_token_ms", std::numeric_limits<double>::infinity());
             const double candidate_score = best_score;
             if (keep_steady <= best_score + s->keep_current_margin_ms) {
                 s->keep_current_fast_cache.insert(keep_key);
@@ -1154,7 +1336,7 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
                 best_cid = -2;
                 best_file = s->last_candidate_file;
                 best_budget = s->last_candidate_budget_mib;
-                best_plan = keep_it->second;
+                best_plan = *keep_plan;
                 if (s->log_candidate_events) {
                     LOG_INF("[elastic-candidate-keep] budget=%lld keep_budget=%lld file=%s keep_steady=%.3f margin=%.3f best_candidate_score=%.3f\n",
                             (long long) budget_mib, (long long) s->last_candidate_budget_mib,
@@ -1173,23 +1355,74 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     } else if (s->mode == "diff-tree-ideal") {
         const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
         const int64_t budget_bytes = usable_mib > 0 ? usable_mib * 1024LL * 1024LL : 0;
-        const nlohmann::json * base = nullptr;
-        if (!s->last_diff_tree_plan.is_null() && s->last_diff_tree_budget_mib <= budget_mib &&
+        const nlohmann::json target_plan = best_plan;
+        const double target_score = best_score;
+        const double target_transition = best_transition;
+        const double target_load_mb = best_load_mb;
+        const double target_prepare_mb = best_prepare_mb;
+        const double target_evict_mb = best_evict_mb;
+        const int target_changed = best_changed;
+        const bool target_score_guard = []() {
+            const char * e = std::getenv("LLAMA_ELASTIC_DIFF_TARGET_SCORE_GUARD");
+            return e && *e && std::atoi(e) != 0;
+        }();
+        const bool bootstrap = s->last_diff_tree_plan.is_null() && s->last_candidate_file.empty();
+        if (bootstrap) {
+            best_plan["diff_tree"] = {
+                {"mode", "ideal_bootstrap_target"},
+                {"reason", "first_plan_uses_offline_target"},
+                {"target_budget_mib", best_plan.value("budget_mib", 0)},
+            };
+            best_transition = elastic_candidate_transition_cost(s, best_plan, &state_flags,
+                                                                &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
+            best_score = best_plan.value("pred_per_token_ms", 0.0) + transition_weight * best_transition;
+        } else {
+        nlohmann::json current_base = elastic_current_state_base_plan(s, budget_mib, best_plan, &state_flags);
+        const nlohmann::json * base = &current_base;
+        const char * base_kind = "current_state";
+        if (elastic_plan_resident_bytes(current_base) == 0 &&
+            !s->last_diff_tree_plan.is_null() && s->last_diff_tree_budget_mib <= budget_mib &&
             (budget_bytes <= 0 || (int64_t) elastic_plan_resident_bytes(s->last_diff_tree_plan) <= budget_bytes)) {
             base = &s->last_diff_tree_plan;
-        } else if (!s->last_candidate_file.empty() && s->last_candidate_budget_mib <= budget_mib) {
-            const auto keep_it = s->candidate_plan_cache.find(s->last_candidate_file);
-            if (keep_it != s->candidate_plan_cache.end() &&
-                (budget_bytes <= 0 || (int64_t) elastic_plan_resident_bytes(keep_it->second) <= budget_bytes)) {
-                base = &keep_it->second;
+            base_kind = "last_diff_tree";
+        } else if (elastic_plan_resident_bytes(current_base) == 0 &&
+                   !s->last_candidate_file.empty() && s->last_candidate_budget_mib <= budget_mib) {
+            const nlohmann::json * keep_plan = elastic_candidate_get_plan_json(s, s->last_candidate_file);
+            if (keep_plan &&
+                (budget_bytes <= 0 || (int64_t) elastic_plan_resident_bytes(*keep_plan) <= budget_bytes)) {
+                base = keep_plan;
+                base_kind = "last_candidate";
             }
         }
         if (base) {
             try {
                 best_plan = elastic_diff_tree_ideal_plan(s, budget_mib, *base, best_plan, &state_flags);
+                best_plan["diff_tree_base_kind"] = base_kind;
                 best_transition = elastic_candidate_transition_cost(s, best_plan, &state_flags,
                                                                     &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
                 best_score = best_plan.value("pred_per_token_ms", 0.0) + transition_weight * best_transition;
+                if (target_score_guard && std::isfinite(target_score) && target_score < best_score) {
+                    if (s->log_candidate_events) {
+                        LOG_INF("[elastic-diff-tree] reject_expanded_plan budget=%lld diff_score=%.3f target_score=%.3f "
+                                "diff_transition=%.3f target_transition=%.3f; use_target=%s\n",
+                                (long long) budget_mib, best_score, target_score,
+                                best_transition, target_transition, best_file.c_str());
+                    }
+                    best_plan = target_plan;
+                    best_plan["diff_tree"] = {
+                        {"mode", "ideal_reject_expand_use_target"},
+                        {"reason", "expanded_score_worse_than_target"},
+                        {"diff_score_ms", elastic_finite_json_number(best_score)},
+                        {"target_score_ms", elastic_finite_json_number(target_score)},
+                        {"target_budget_mib", target_plan.value("budget_mib", 0)},
+                    };
+                    best_score = target_score;
+                    best_transition = target_transition;
+                    best_load_mb = target_load_mb;
+                    best_prepare_mb = target_prepare_mb;
+                    best_evict_mb = target_evict_mb;
+                    best_changed = target_changed;
+                }
             } catch (const std::exception & e) {
                 LOG_ERR("[elastic-diff-tree] expansion failed budget=%lld err=%s; fallback target candidate\n",
                         (long long) budget_mib, e.what());
@@ -1206,6 +1439,7 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
                 {"target_budget_mib", best_plan.value("budget_mib", 0)},
             };
         }
+        }
     }
     if (selected_file) *selected_file = best_file;
 
@@ -1215,16 +1449,16 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             {"source_budget_mib", best_budget},
             {"candidate_id", best_cid},
             {"candidate_file", best_file},
-            {"score_ms", best_score},
-            {"transition_ms", best_transition},
-            {"transition_weight", transition_weight},
-            {"base_transition_weight", s->transition_weight},
-            {"high_budget_transition_weight", s->high_budget_transition_weight},
+            {"score_ms", elastic_finite_json_number(best_score)},
+            {"transition_ms", elastic_finite_json_number(best_transition)},
+            {"transition_weight", elastic_finite_json_number(transition_weight)},
+            {"base_transition_weight", elastic_finite_json_number(s->transition_weight)},
+            {"high_budget_transition_weight", elastic_finite_json_number(s->high_budget_transition_weight)},
             {"high_budget_transition_threshold_mib", s->high_budget_transition_threshold_mib},
             {"diff_changed_weights", best_changed},
-            {"diff_load_mb", best_load_mb},
-            {"diff_prepare_mb", best_prepare_mb},
-            {"diff_evict_mb", best_evict_mb},
+            {"diff_load_mb", elastic_finite_json_number(best_load_mb)},
+            {"diff_prepare_mb", elastic_finite_json_number(best_prepare_mb)},
+            {"diff_evict_mb", elastic_finite_json_number(best_evict_mb)},
         };
 
         std::ofstream out(plan_path);
@@ -1416,11 +1650,30 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
 }
 
 static void elastic_online_state_dump(elastic_online_solver_state * s, const std::string & path) {
+    std::unordered_map<std::string, std::string> last_location_by_name;
+    if (s && s->last_online_plan_json.is_object()) {
+        for (const auto & w : s->last_online_plan_json.value("weights", nlohmann::json::array())) {
+            if (!w.is_object()) continue;
+            const std::string name = w.value("name", std::string());
+            const std::string location = w.value("location", std::string());
+            if (!name.empty() && !location.empty()) {
+                last_location_by_name[name] = location;
+            }
+        }
+    }
+
     nlohmann::json out;
     out["weights"] = nlohmann::json::array();
     for (const auto & name : s->weight_names) {
         llama_elastic_weight_state st{};
         int rc = llama_weight_get_state(s->ctx, name.c_str(), &st);
+        auto lit = last_location_by_name.find(name);
+        if (lit != last_location_by_name.end() && lit->second == "disk") {
+            st.flags &= ~(LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT |
+                          LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT |
+                          LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
+                          LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT);
+        }
         nlohmann::json flags = nlohmann::json::array();
         if (rc == 0) {
             if (st.flags & LLAMA_ELASTIC_WEIGHT_DISK_AVAILABLE)       flags.push_back("disk_available");
@@ -1452,6 +1705,7 @@ static bool elastic_online_generate_remote(elastic_online_solver_state * s, int6
     req["prefetch_distance"] = s->prefetch_distance;
     req["allow_cpu_fallback"] = s->allow_cpu_fallback;
     req["transition_weight"] = s->transition_weight;
+    req["transition_horizon_tokens"] = s->transition_horizon_tokens;
     req["disk_reload_multiplier"] = s->disk_reload_multiplier;
     req["overlap_model"] = s->overlap_model;
     req["cp_objective"] = s->cp_objective;
@@ -1474,8 +1728,9 @@ static bool elastic_online_generate_remote(elastic_online_solver_state * s, int6
             *remote_wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
         if (!res || res->status < 200 || res->status >= 300) {
-            LOG_ERR("[elastic-online] remote solver http failed status=%d url=%s\n",
-                    res ? res->status : -1, common_http_show_masked_url(parts).c_str());
+            const std::string body = res ? res->body.substr(0, 512) : std::string();
+            LOG_ERR("[elastic-online] remote solver http failed status=%d url=%s body=%s\n",
+                    res ? res->status : -1, common_http_show_masked_url(parts).c_str(), body.c_str());
             return false;
         }
         nlohmann::json out = nlohmann::json::parse(res->body);
@@ -1585,6 +1840,16 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
         s->failures++;
         LOG_ERR("[elastic-online] failed to load generated plan %s\n", plan_path.c_str());
         return nullptr;
+    }
+    {
+        std::ifstream pf(plan_path);
+        if (pf) {
+            try {
+                pf >> s->last_online_plan_json;
+            } catch (const std::exception &) {
+                s->last_online_plan_json = nlohmann::json();
+            }
+        }
     }
     s->plans.push_back(plan);
     const double gen_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1761,6 +2026,9 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_PREFETCH_DISTANCE")) online.prefetch_distance = std::atoi(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOW_CPU_FALLBACK")) online.allow_cpu_fallback = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_WEIGHT")) online.transition_weight = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_TRANSITION_HORIZON_TOKENS")) online.transition_horizon_tokens = std::atof(e);
+        else if (const char * e = std::getenv("LLAMA_ELASTIC_DIFF_HORIZON_TOKENS")) online.transition_horizon_tokens = std::atof(e);
+        if (online.transition_horizon_tokens < 1.0) online.transition_horizon_tokens = 1.0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_WEIGHT")) online.high_budget_transition_weight = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_HIGH_BUDGET_TRANSITION_THRESHOLD_MIB")) online.high_budget_transition_threshold_mib = std::atoll(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_DISK_RELOAD_MULTIPLIER")) online.disk_reload_multiplier = std::atof(e);
@@ -1768,6 +2036,7 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_LOG_EVENTS")) online.log_candidate_events = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_PREWARM")) online.prewarm_candidate_cache = std::atoi(e) != 0;
         if (const char * e = std::getenv("LLAMA_ELASTIC_KEEP_CURRENT_MARGIN_MS")) online.keep_current_margin_ms = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_CANDIDATE_MIN_GAIN_MS")) online.candidate_min_gain_ms = std::atof(e);
         if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOWED_PLACEMENTS")) online.allowed_placements = e;
@@ -1780,6 +2049,8 @@ int main(int argc, char ** argv) {
                 LOG_ERR("[elastic-online] failed to open model meta %s\n", online.model_meta_path.c_str());
             } else {
                 mf >> online.model_meta;
+                online.stage_costs = nlohmann::json::object();
+                online.op_costs = nlohmann::json::object();
                 if (std::ifstream sf(online.cost_dir + "/stage_costs.json"); sf) sf >> online.stage_costs;
                 if (std::ifstream of(online.cost_dir + "/op_costs.json"); of) of >> online.op_costs;
                 for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
@@ -1831,6 +2102,32 @@ int main(int argc, char ** argv) {
                 LOG_INF("[elastic-online] enable(callback) rc=%d mode=%s weights=%zu solver=%s cost_dir=%s work_dir=%s\n",
                         rc, online.mode.c_str(), online.item_bases.size(), online.solver.c_str(),
                         online.cost_dir.c_str(), online.work_dir.c_str());
+                const bool preapply_initial = []() {
+                    const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_PREAPPLY_INITIAL");
+                    return !(e && *e && *e == '0');
+                }();
+                if (preapply_initial) {
+                    const char * init_budget_env = std::getenv("LLAMA_ELASTIC_ONLINE_INITIAL_BUDGET_MIB");
+                    int64_t init_budget = init_budget_env && *init_budget_env ? std::atoll(init_budget_env) : 0;
+                    const char * bucket_env = std::getenv("GGML_ELASTIC_BUDGET_BUCKET_MB");
+                    const int64_t bucket = bucket_env && *bucket_env ? std::max<int64_t>(1, std::atoll(bucket_env)) : 1;
+                    if (init_budget > 0 && bucket > 1) {
+                        init_budget = (init_budget / bucket) * bucket;
+                    }
+                    if (init_budget > 0) {
+                        const llama_plan * init_plan = elastic_online_plan_provider(init_budget, &online);
+                        if (init_plan) {
+                            const int arc = llama_elastic_apply_plan(ctx, init_plan);
+                            llama_budget_reset_clock();
+                            LOG_INF("[elastic-online] preapply initial budget=%lld rc=%d plan_budget=%lld\n",
+                                    (long long) init_budget, arc, (long long) llama_plan_budget_mib(init_plan));
+                        } else {
+                            LOG_ERR("[elastic-online] preapply initial failed budget=%lld\n", (long long) init_budget);
+                        }
+                    } else {
+                        LOG_ERR("[elastic-online] preapply initial skipped: no valid budget\n");
+                    }
+                }
                 std::atexit([]() {
                     for (llama_plan * p : online.plans) llama_plan_free(p);
                     LOG_INF("[elastic-online] calls=%llu failures=%llu remote_wall_ms=%.3f remote_server_ms=%.3f\n",
@@ -2974,6 +3271,7 @@ int main(int argc, char ** argv) {
     bool elastic_bench_started = false;
     bool elastic_bench_time_done = false;
     int  elastic_bench_generated = 0;
+    std::string elastic_bench_exit_reason = "loop_condition";
     if (elastic_bench_seconds > 0.0) {
         LOG_INF("[elastic-bench] duration limit enabled: %.3f seconds\n", elastic_bench_seconds);
     }
@@ -3039,11 +3337,13 @@ int main(int argc, char ** argv) {
                 if (n_past + (int) embd.size() >= n_ctx) {
                     if (!params.ctx_shift){
                         LOG_WRN("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+                        elastic_bench_exit_reason = "context_full_ctx_shift_disabled";
                         break;
                     }
 
                     if (params.n_predict == -2) {
                         LOG_WRN("\n\n%s: context full and n_predict == %d => stopping\n", __func__, params.n_predict);
+                        elastic_bench_exit_reason = "context_full_n_predict_minus_2";
                         break;
                     }
 
@@ -3121,6 +3421,10 @@ int main(int argc, char ** argv) {
 
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
+                    elastic_bench_exit_reason = "decode_failed";
+                    LOG_ERR("[elastic-bench] exit reason=%s generated=%d n_past=%d n_remain=%d\n",
+                            elastic_bench_exit_reason.c_str(), elastic_bench_generated, n_past, n_remain);
+                    common_perf_print(ctx, smpl);
                     return 1;
                 }
 
@@ -3233,11 +3537,12 @@ int main(int argc, char ** argv) {
             console::set_display(console::reset);
             display = true;
         }
-        if (elastic_bench_time_done) {
-            LOG_INF("\n[elastic-bench] reached duration %.3f s after %d generated tokens\n",
-                    elastic_bench_seconds, elastic_bench_generated);
-            break;
-        }
+            if (elastic_bench_time_done) {
+                elastic_bench_exit_reason = "duration";
+                LOG_INF("\n[elastic-bench] reached duration %.3f s after %d generated tokens\n",
+                        elastic_bench_seconds, elastic_bench_generated);
+                break;
+            }
 
         // if not currently processing queued inputs;
         if ((int) embd_inp.size() <= n_consumed) {
@@ -3347,6 +3652,7 @@ int main(int argc, char ** argv) {
 
                 if (buffer.empty()) { // Ctrl+D on empty line exits
                     LOG("EOF by user\n");
+                    elastic_bench_exit_reason = "stdin_eof";
                     break;
                 }
 
@@ -3437,8 +3743,11 @@ int main(int argc, char ** argv) {
         }
 
         // end of generation
-        if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
+        if (elastic_bench_seconds > 0.0 && !embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
+            LOG_DBG("[elastic-bench] suppressing EOG stop for token %d\n", embd.back());
+        } else if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
             LOG(" [end of text]\n");
+            elastic_bench_exit_reason = "eog";
             break;
         }
 
@@ -3453,6 +3762,12 @@ int main(int argc, char ** argv) {
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+    }
+
+    if (elastic_bench_seconds > 0.0) {
+        LOG_INF("\n[elastic-bench] final exit reason=%s generated=%d n_past=%d n_remain=%d time_done=%d\n",
+                elastic_bench_exit_reason.c_str(), elastic_bench_generated, n_past, n_remain,
+                elastic_bench_time_done ? 1 : 0);
     }
 
     LOG("\n\n");

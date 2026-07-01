@@ -1,0 +1,7 @@
+method,artifact,status,raw_ms_per_token,exec_ms_per_token,eval_runs,apply_count,evict_planned,load_planned,transfer_planned,xform_planned,direct_read_mb,direct_read_mb_per_forward,online_calls,online_failures,thermal_gpu_max_c_after
+static-min,trace03_cap7300_start0_180s_gpu_disk_all,ok,2026.42,2026.4150561797753,89,0,0,74,74,74,177049.7,1989.3224719101124,,,53.1
+static-max,trace03_cap7300_start0_180s_gpu_disk_all,ok,348.51,348.51418604651167,516,0,0,22,22,22,431.4,0.8360465116279069,,,51.5
+offline,trace03_cap7300_start0_180s_gpu_disk_all,ok,645.15,679.279492481203,266,9,0,602,602,602,10535.2,39.60601503759399,,,50.8
+diff-tree-ideal,trace03_cap7300_start0_180s_gpu_disk_all,ok,439.39,439.23621549636806,413,3,0,85,40,85,2891.3,7.000726392251816,3,0,56.2
+online,trace03_cap7300_start0_180s_online_timeline_kv256_guard80_tl50_b32,ok,479.74,437.66612320916903,349,7,0,154,154,154,182990.4,524.3277936962751,7,0,52.7
+mru,trace03_cap7300_start0_180s_mru_q8direct_kv512_noretain_b32,ok,1085.56,1086.4636249999999,168,10,0,0,0,0,202249.8,1203.867857142857,10,0,44.2
