@@ -1,0 +1,6 @@
+top_p,tokens,active_experts_mean,active_experts_min,active_experts_max,avg_active_experts_per_layer_mean,avg_active_experts_per_layer_min,avg_active_experts_per_layer_max,max_active_experts_one_layer,expert_weight_mib_mean,expert_weight_mib_min,expert_weight_mib_max,expert_fraction_mean,expert_fraction_min,expert_fraction_max,fixed_non_expert_weight_mib,full_expert_pool_mib,full_model_weight_mib
+0.20,999,57.81,36,78,3.61,2.25,4.88,9,195.12,121.50,263.25,0.4018,0.2964,0.4772,288.37,3456.00,3744.37
+0.25,999,74.36,43,103,4.65,2.69,6.44,12,250.95,145.12,347.62,0.4625,0.3348,0.5466,288.37,3456.00,3744.37
+0.30,999,99.15,48,149,6.20,3.00,9.31,13,334.61,162.00,502.88,0.5324,0.3597,0.6355,288.37,3456.00,3744.37
+0.35,999,116.44,53,174,7.28,3.31,10.88,16,393.00,178.88,587.25,0.5725,0.3828,0.6707,288.37,3456.00,3744.37
+0.40,999,144.26,76,200,9.02,4.75,12.50,20,486.88,256.50,675.00,0.6239,0.4708,0.7007,288.37,3456.00,3744.37

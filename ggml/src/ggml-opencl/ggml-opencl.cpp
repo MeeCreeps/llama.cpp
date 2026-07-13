@@ -26,6 +26,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <new>
 #include <charconv>
 #include <mutex>
 #include <unordered_map>
@@ -1902,6 +1903,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable "
+                                       " -DN_SIMDGROUP=4 "
                                        " -DSIMDGROUP_WIDTH=" +
                                        std::to_string(backend_ctx->adreno_wave_size);
         if (backend_ctx->has_vector_subgroup_broadcast) {
@@ -1930,6 +1932,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -cl-mad-enable "
             " -DLINE_STRIDE_A=2048 "
             " -DBLOCK_STRIDE_A=16384 "
+            " -DN_SIMDGROUP=4 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
         if (backend_ctx->has_vector_subgroup_broadcast) {
@@ -1954,6 +1957,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -cl-mad-enable "
             " -DLINE_STRIDE_A=2048 "
             " -DBLOCK_STRIDE_A=16384 "
+            " -DN_SIMDGROUP=4 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
         if (backend_ctx->has_vector_subgroup_broadcast) {
@@ -1970,6 +1974,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -cl-mad-enable "
             " -DLINE_STRIDE_A=5504 "
             " -DBLOCK_STRIDE_A=44032 "
+            " -DN_SIMDGROUP=4 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
         if (backend_ctx->has_vector_subgroup_broadcast) {
@@ -1986,6 +1991,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -cl-mad-enable "
             " -DLINE_STRIDE_A=16000 "
             " -DBLOCK_STRIDE_A=128000 "
+            " -DN_SIMDGROUP=4 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
 
@@ -2918,6 +2924,44 @@ struct elastic_profile_bucket {
     size_t   total_bytes = 0;
 };
 
+struct elastic_moe_q4_cache {
+    cl_mem parent = nullptr;
+    cl_mem route_slots = nullptr;
+    cl_event route_upload_event = nullptr;
+    int capacity = 0;
+    size_t raw_slice_bytes = 0;
+    size_t q_slice_bytes = 0;
+    size_t d_slice_bytes = 0;
+    std::vector<int> expert_for_slot;
+    std::vector<uint64_t> last_used;
+    std::vector<uint32_t> frequency;
+    std::vector<int32_t> route_slots_host;
+    uint64_t accesses = 0;
+};
+
+struct elastic_moe_prefetch_task {
+    int wbm_idx = -1;
+    int expert_id = -1;
+    std::string filename;
+    size_t file_offset = 0;
+    size_t data_size = 0;
+    std::unique_ptr<unsigned char[]> storage;
+    unsigned char * data = nullptr;
+    bool done = false;
+    bool ok = false;
+    uint64_t io_us = 0;
+};
+
+static constexpr size_t ELASTIC_MOE_DIRECT_ALIGNMENT = 4096;
+static constexpr size_t ELASTIC_MOE_DIRECT_PADDING = 2 * ELASTIC_MOE_DIRECT_ALIGNMENT;
+
+static unsigned char * ggml_opencl_moe_direct_ptr(unsigned char * storage, size_t file_offset) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(storage);
+    const uintptr_t aligned = (base + ELASTIC_MOE_DIRECT_ALIGNMENT - 1) &
+                              ~(uintptr_t) (ELASTIC_MOE_DIRECT_ALIGNMENT - 1);
+    return reinterpret_cast<unsigned char *>(aligned + file_offset % ELASTIC_MOE_DIRECT_ALIGNMENT);
+}
+
 struct ggml_opencl_elastic_state {
     elastic::weight_buffer_manager wbm;
     elastic::wbm_opencl_ctx        octx;
@@ -2983,6 +3027,54 @@ struct ggml_opencl_elastic_state {
     std::unordered_map<int, std::string>    wbm_to_name;
     bool                                    sched_registered = false;
 
+    // Optional Q4_0 MoE expert-slice cache. Packed expert tensors remain the
+    // model-file representation, while decode residency is managed per expert.
+    // This is deliberately keyed by WBM tensor id so gate/up/down tensors keep
+    // independent caches and lifetimes.
+    std::mutex                                      moe_cache_mtx;
+    std::unordered_map<int, elastic_moe_q4_cache>   moe_q4_cache;
+    size_t                                           moe_cache_bytes = 0;
+    uint64_t                                         moe_cache_clock = 0;
+    uint64_t                                         moe_cache_hits = 0;
+    uint64_t                                         moe_cache_misses = 0;
+    size_t                                           moe_cache_disk_bytes = 0;
+    uint64_t                                         moe_cache_disk_us = 0;
+    uint64_t                                         moe_cache_router_read_us = 0;
+    uint64_t                                         moe_cache_router_read_calls = 0;
+    uint64_t                                         moe_cache_cpu_xform_us = 0;
+    uint64_t                                         moe_cache_upload_us = 0;
+    uint64_t                                         moe_cache_route_upload_us = 0;
+    uint64_t                                         moe_cache_prepare_us = 0;
+    uint64_t                                         moe_cache_prepare_calls = 0;
+    uint64_t                                         moe_cache_grow_resizes = 0;
+    size_t                                           moe_cache_grow_copy_bytes = 0;
+    int                                              moe_cache_active_capacity = -1;
+    int                                              moe_cache_pending_capacity = -1;
+    int                                              moe_cache_pending_hits = 0;
+    uint64_t                                         moe_cache_capacity_decision_token = 0;
+    uint64_t                                         moe_cache_last_capacity_change_token = 0;
+    int                                              moe_cache_resize_target = -1;
+    uint64_t                                         moe_cache_resize_syncs = 0;
+    FILE *                                           moe_route_trace_file = nullptr;
+    uint64_t                                         moe_route_trace_seq = 0;
+    std::mutex                                       moe_prefetch_mtx;
+    std::condition_variable                          moe_prefetch_cv;
+    std::deque<std::shared_ptr<elastic_moe_prefetch_task>> moe_prefetch_queue;
+    std::unordered_map<uint64_t, std::shared_ptr<elastic_moe_prefetch_task>> moe_prefetch_tasks;
+    std::vector<std::pair<size_t, std::unique_ptr<unsigned char[]>>> moe_prefetch_free_buffers;
+    bool                                             moe_prefetch_workers_started = false;
+    uint64_t                                         moe_prefetch_issued = 0;
+    uint64_t                                         moe_prefetch_completed = 0;
+    uint64_t                                         moe_prefetch_used = 0;
+    uint64_t                                         moe_prefetch_skipped_hit = 0;
+    uint64_t                                         moe_prefetch_skipped_cap = 0;
+    uint64_t                                         moe_prefetch_wait_us = 0;
+    uint64_t                                         moe_prefetch_buffer_allocs = 0;
+    uint64_t                                         moe_prefetch_buffer_reuses = 0;
+    std::unordered_map<const ggml_tensor *, std::pair<uint64_t, std::vector<int32_t>>> moe_router_ids;
+    std::unordered_map<int, std::vector<int32_t>> moe_router_ids_by_layer;
+    std::unordered_map<int, int>                  moe_router_reuse_left_by_layer;
+
     std::mutex                              async_xform_mtx;
     std::condition_variable                 async_xform_cv;
     std::unordered_set<int>                 async_xform_inflight;
@@ -2999,6 +3091,673 @@ struct ggml_opencl_elastic_state {
 static ggml_opencl_elastic_state * ggml_opencl_elastic() {
     static ggml_opencl_elastic_state s;
     return &s;
+}
+
+static int ggml_opencl_moe_prefetch_workers() {
+    static const int workers = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_PREFETCH_WORKERS");
+        return std::max(0, e && *e ? std::atoi(e) : 0);
+    }();
+    return workers;
+}
+
+static size_t ggml_opencl_moe_prefetch_max_pending() {
+    static const size_t max_pending = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_PREFETCH_MAX_PENDING");
+        const long long v = e && *e ? std::atoll(e) : 16;
+        return (size_t) std::max<long long>(1, v);
+    }();
+    return max_pending;
+}
+
+static uint64_t ggml_opencl_moe_prefetch_key(int wbm_idx, int expert_id) {
+    return (uint64_t) (uint32_t) wbm_idx << 32 | (uint32_t) expert_id;
+}
+
+static void ggml_opencl_start_moe_prefetch_workers(ggml_opencl_elastic_state * state) {
+    const int worker_count = ggml_opencl_moe_prefetch_workers();
+    if (!state || worker_count <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(state->moe_prefetch_mtx);
+        if (state->moe_prefetch_workers_started) return;
+        state->moe_prefetch_workers_started = true;
+    }
+    for (int i = 0; i < worker_count; ++i) {
+        std::thread([state]() {
+            for (;;) {
+                std::shared_ptr<elastic_moe_prefetch_task> task;
+                {
+                    std::unique_lock<std::mutex> lock(state->moe_prefetch_mtx);
+                    state->moe_prefetch_cv.wait(lock, [state]() { return !state->moe_prefetch_queue.empty(); });
+                    task = state->moe_prefetch_queue.front();
+                    state->moe_prefetch_queue.pop_front();
+                    for (auto it = state->moe_prefetch_free_buffers.begin();
+                        it != state->moe_prefetch_free_buffers.end(); ++it) {
+                        if (it->first == task->data_size) {
+                            task->storage = std::move(it->second);
+                            state->moe_prefetch_free_buffers.erase(it);
+                            state->moe_prefetch_buffer_reuses++;
+                            break;
+                        }
+                    }
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!task->storage) {
+                    task->storage.reset(new (std::nothrow) unsigned char[
+                        task->data_size + ELASTIC_MOE_DIRECT_PADDING]);
+                    std::lock_guard<std::mutex> lock(state->moe_prefetch_mtx);
+                    state->moe_prefetch_buffer_allocs++;
+                }
+                task->data = task->storage ?
+                    ggml_opencl_moe_direct_ptr(task->storage.get(), task->file_offset) : nullptr;
+                const bool ok = task->data &&
+                    llama_pread_direct(task->filename.c_str(), task->data,
+                                       task->file_offset, task->data_size) == 0;
+                const uint64_t io_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                {
+                    std::lock_guard<std::mutex> lock(state->moe_prefetch_mtx);
+                    task->ok = ok;
+                    task->io_us = io_us;
+                    task->done = true;
+                    state->moe_prefetch_completed++;
+                }
+                state->moe_prefetch_cv.notify_all();
+            }
+        }).detach();
+    }
+}
+
+static void ggml_opencl_enqueue_moe_companion_prefetch(
+        ggml_opencl_elastic_state * state,
+        const ggml_tensor * gate,
+        const std::vector<int32_t> & expert_ids,
+        size_t raw_slice_bytes,
+        int n_experts) {
+    if (!state || !gate || ggml_opencl_moe_prefetch_workers() <= 0 ||
+        std::strstr(gate->name, "ffn_gate_exps.weight") == nullptr) {
+        return;
+    }
+    ggml_opencl_start_moe_prefetch_workers(state);
+    const std::string gate_name = gate->name;
+    const size_t marker = gate_name.find("ffn_gate_exps.weight");
+    if (marker == std::string::npos) return;
+
+    for (const char * replacement : {"ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+        std::string companion = gate_name;
+        companion.replace(marker, std::strlen("ffn_gate_exps.weight"), replacement);
+        int target_idx = -1;
+        {
+            std::lock_guard<std::mutex> lock(state->sched_mtx);
+            auto it = state->name_to_wbm.find(companion);
+            if (it != state->name_to_wbm.end()) target_idx = it->second;
+        }
+        const elastic::block_meta * target = elastic::wbm_get(&state->wbm, target_idx);
+        if (target_idx < 0 || !target || !target->host_ptr ||
+            target->byte_size < raw_slice_bytes * (size_t) n_experts) {
+            continue;
+        }
+        for (int expert_id : expert_ids) {
+            bool resident = false;
+            {
+                std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+                auto cache_it = state->moe_q4_cache.find(target_idx);
+                if (cache_it != state->moe_q4_cache.end()) {
+                    const auto & slots = cache_it->second.expert_for_slot;
+                    resident = std::find(slots.begin(), slots.end(), expert_id) != slots.end();
+                }
+            }
+            if (resident) {
+                std::lock_guard<std::mutex> lock(state->moe_prefetch_mtx);
+                state->moe_prefetch_skipped_hit++;
+                continue;
+            }
+
+            const unsigned char * mmap_src = (const unsigned char *) target->host_ptr +
+                                             (size_t) expert_id * raw_slice_bytes;
+            auto reg = llama_mmap_registry_find(mmap_src);
+            if (reg.filename.empty()) continue;
+            auto task = std::make_shared<elastic_moe_prefetch_task>();
+            task->wbm_idx = target_idx;
+            task->expert_id = expert_id;
+            task->filename = reg.filename;
+            task->file_offset = (const char *) mmap_src - (const char *) reg.base;
+            task->data_size = raw_slice_bytes;
+            const uint64_t key = ggml_opencl_moe_prefetch_key(target_idx, expert_id);
+            {
+                std::lock_guard<std::mutex> lock(state->moe_prefetch_mtx);
+                if (state->moe_prefetch_tasks.find(key) != state->moe_prefetch_tasks.end()) continue;
+                if (state->moe_prefetch_tasks.size() >= ggml_opencl_moe_prefetch_max_pending()) {
+                    state->moe_prefetch_skipped_cap++;
+                    continue;
+                }
+                state->moe_prefetch_tasks.emplace(key, task);
+                state->moe_prefetch_queue.push_back(task);
+                state->moe_prefetch_issued++;
+            }
+            state->moe_prefetch_cv.notify_one();
+        }
+    }
+}
+
+static std::shared_ptr<elastic_moe_prefetch_task> ggml_opencl_consume_moe_prefetch(
+        ggml_opencl_elastic_state * state,
+        int wbm_idx,
+        int expert_id) {
+    if (!state || ggml_opencl_moe_prefetch_workers() <= 0) return {};
+    const uint64_t key = ggml_opencl_moe_prefetch_key(wbm_idx, expert_id);
+    std::shared_ptr<elastic_moe_prefetch_task> task;
+    const auto wait_t0 = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lock(state->moe_prefetch_mtx);
+        auto it = state->moe_prefetch_tasks.find(key);
+        if (it == state->moe_prefetch_tasks.end()) return {};
+        task = it->second;
+        state->moe_prefetch_cv.wait(lock, [&task]() { return task->done; });
+        state->moe_prefetch_tasks.erase(key);
+        state->moe_prefetch_used++;
+    }
+    state->moe_prefetch_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - wait_t0).count();
+    if (!task->ok || !task->storage || !task->data || task->data_size == 0) return {};
+    state->moe_cache_disk_bytes += task->data_size;
+    state->moe_cache_disk_us += task->io_us;
+    return task;
+}
+
+static bool ggml_opencl_moe_expert_cache_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+static bool ggml_opencl_is_moe_expert_weight(const ggml_tensor * tensor) {
+    return tensor && tensor->type == GGML_TYPE_Q4_0 && tensor->ne[2] > 1 &&
+           std::strstr(tensor->name, "_exps.weight") != nullptr;
+}
+
+struct elastic_moe_q4_cache_view {
+    cl_mem parent = nullptr;
+    cl_mem route_slots = nullptr;
+    size_t slot_stride = 0;
+    size_t q_offset = 0;
+};
+
+static bool ggml_opencl_prepare_moe_q4_cache(
+        ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src2,
+        cl_ulong offset2,
+        elastic_moe_q4_cache_view * out) {
+    const auto prepare_t0 = std::chrono::steady_clock::now();
+    if (!backend_ctx || !src0 || !src2 || !out || !ggml_opencl_moe_expert_cache_enabled()) {
+        return false;
+    }
+    if (!ggml_opencl_is_moe_expert_weight(src0) || src2->ne[1] != 1 || src2->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    const int wbm_idx = ggml_opencl_get_wbm_idx(src0);
+    auto * state = ggml_opencl_elastic();
+    const elastic::block_meta * bm = elastic::wbm_get(&state->wbm, wbm_idx);
+    if (wbm_idx < 0 || !bm || !bm->host_ptr || bm->byte_size == 0) {
+        return false;
+    }
+
+    const int n_selected = (int) src2->ne[0];
+    const int n_experts = (int) src0->ne[2];
+    if (n_selected <= 0 || n_selected > n_experts) {
+        return false;
+    }
+
+    static const int requested_capacity = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_SLOTS");
+        const int v = e && *e ? std::atoi(e) : 8;
+        return std::max(1, v);
+    }();
+    const size_t raw_slice_bytes = src0->nb[2];
+    const size_t block_bytes = ggml_type_size(GGML_TYPE_Q4_0);
+    const size_t qk = ggml_blck_size(GGML_TYPE_Q4_0);
+    if (raw_slice_bytes == 0 || block_bytes < 2 || qk == 0 || raw_slice_bytes % block_bytes != 0) {
+        return false;
+    }
+    const size_t n_blocks = raw_slice_bytes / block_bytes;
+    const size_t q_slice_bytes = n_blocks * (qk / 2);
+    const size_t d_slice_bytes = n_blocks * sizeof(ggml_fp16_t);
+    int capacity = std::min(n_experts, std::max(n_selected, requested_capacity));
+    static const bool adaptive_capacity = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_ADAPTIVE");
+        return e && *e && *e != '0';
+    }();
+    if (adaptive_capacity && state->bw_inited) {
+        static const int max_slots = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_MAX_SLOTS");
+            return std::max(1, e && *e ? std::atoi(e) : 60);
+        }();
+        static const int tensor_count = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_TENSOR_COUNT");
+            return std::max(1, e && *e ? std::atoi(e) : 72);
+        }();
+        static const int slot_step = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_SLOT_STEP");
+            return std::max(1, e && *e ? std::atoi(e) : 4);
+        }();
+        static const size_t configured_base_budget_mib = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_BASE_BUDGET_MIB");
+            return e && *e ? (size_t) std::max<long long>(0, std::atoll(e)) : 0;
+        }();
+        const size_t budget_mib = elastic::budget_watcher_get(&state->bw);
+        const size_t floor_mib = configured_base_budget_mib > 0 ?
+            configured_base_budget_mib : state->bw.m_floor_mb;
+        const size_t extra_bytes = budget_mib > floor_mib ?
+            (budget_mib - floor_mib) * size_t(1024 * 1024) : 0;
+        const size_t global_slot_bytes = (q_slice_bytes + d_slice_bytes) * (size_t) tensor_count;
+        int extra_slots = global_slot_bytes > 0 ? (int) (extra_bytes / global_slot_bytes) : 0;
+        extra_slots = (extra_slots / slot_step) * slot_step;
+        capacity = std::min({n_experts, std::max(n_selected, max_slots), requested_capacity + extra_slots});
+    }
+
+    if (adaptive_capacity) {
+        static const int grow_stable_graphs = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_GROW_STABLE_GRAPHS");
+            return std::max(1, e && *e ? std::atoi(e) : 8);
+        }();
+        static const uint64_t resize_min_gap_graphs = []() {
+            const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_RESIZE_MIN_GAP_GRAPHS");
+            return (uint64_t) std::max(0, e && *e ? std::atoi(e) : 16);
+        }();
+        const int desired_capacity = capacity;
+        std::lock_guard<std::mutex> capacity_lock(state->moe_cache_mtx);
+        if (state->moe_cache_active_capacity < 0) {
+            state->moe_cache_active_capacity = desired_capacity;
+            state->moe_cache_capacity_decision_token = state->current_token;
+            state->moe_cache_last_capacity_change_token = state->current_token;
+        } else if (state->moe_cache_capacity_decision_token != state->current_token) {
+            const int old_capacity = state->moe_cache_active_capacity;
+            const char * reason = nullptr;
+            if (desired_capacity < old_capacity) {
+                // Budget compliance takes precedence over cache hit rate.
+                state->moe_cache_active_capacity = desired_capacity;
+                state->moe_cache_pending_capacity = -1;
+                state->moe_cache_pending_hits = 0;
+                reason = "budget_shrink";
+            } else if (desired_capacity > old_capacity) {
+                if (state->moe_cache_pending_capacity == desired_capacity) {
+                    state->moe_cache_pending_hits++;
+                } else {
+                    state->moe_cache_pending_capacity = desired_capacity;
+                    state->moe_cache_pending_hits = 1;
+                }
+                const bool gap_ready = state->current_token >= state->moe_cache_last_capacity_change_token +
+                                       resize_min_gap_graphs;
+                if (state->moe_cache_pending_hits >= grow_stable_graphs && gap_ready) {
+                    state->moe_cache_active_capacity = desired_capacity;
+                    state->moe_cache_pending_capacity = -1;
+                    state->moe_cache_pending_hits = 0;
+                    reason = "stable_grow";
+                }
+            } else {
+                state->moe_cache_pending_capacity = -1;
+                state->moe_cache_pending_hits = 0;
+            }
+            if (reason) {
+                state->moe_cache_last_capacity_change_token = state->current_token;
+                GGML_LOG_INFO("ggml_opencl moe cache: capacity tier %d->%d budget=%zuMiB reason=%s graph=%llu\n",
+                              old_capacity, state->moe_cache_active_capacity,
+                              state->bw_inited ? elastic::budget_watcher_get(&state->bw) : 0,
+                              reason, (unsigned long long) state->current_token);
+            }
+            state->moe_cache_capacity_decision_token = state->current_token;
+        }
+        capacity = state->moe_cache_active_capacity;
+    }
+    const int aggregate_capacity = capacity;
+
+    // Gate misses are on the decode critical path, while gate routing gives
+    // up/down loads a short overlap window. Shift slots toward gate without
+    // increasing the aggregate gate+up+down cache footprint.
+    static const int gate_slot_shift = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_GATE_SLOT_SHIFT");
+        return std::max(0, e && *e ? std::atoi(e) : 0);
+    }();
+    if (gate_slot_shift > 0) {
+        const int actual_shift = std::min(gate_slot_shift, n_experts - capacity);
+        if (std::strstr(src0->name, "ffn_gate_exps.weight") != nullptr) {
+            capacity += actual_shift;
+        } else if (std::strstr(src0->name, "ffn_up_exps.weight") != nullptr ||
+                   std::strstr(src0->name, "ffn_down_exps.weight") != nullptr) {
+            capacity = std::max(n_selected, capacity - (actual_shift + 1) / 2);
+        }
+    }
+
+    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *) src2->extra;
+    if (!extra2 || !extra2->data_device) {
+        return false;
+    }
+    std::vector<int32_t> expert_ids;
+    static const bool reuse_layer_route = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_ROUTE_REUSE");
+        return e && *e && *e != '0';
+    }();
+    int moe_layer = -1;
+    if (reuse_layer_route) {
+        if (std::sscanf(src0->name, "blk.%d.", &moe_layer) != 1) {
+            moe_layer = -1;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+        if (moe_layer >= 0) {
+            auto ids_it = state->moe_router_ids_by_layer.find(moe_layer);
+            auto left_it = state->moe_router_reuse_left_by_layer.find(moe_layer);
+            if (ids_it != state->moe_router_ids_by_layer.end() &&
+                left_it != state->moe_router_reuse_left_by_layer.end() &&
+                left_it->second > 0 && ids_it->second.size() == (size_t) n_selected) {
+                expert_ids = ids_it->second;
+                left_it->second--;
+            }
+        } else {
+            auto it = state->moe_router_ids.find(src2);
+            if (it != state->moe_router_ids.end() && it->second.first == state->current_token) {
+                expert_ids = it->second.second;
+            }
+        }
+    }
+    cl_int err = CL_SUCCESS;
+    if (expert_ids.size() != (size_t) n_selected) {
+        expert_ids.resize((size_t) n_selected);
+        const auto router_t0 = std::chrono::steady_clock::now();
+        err = clEnqueueReadBuffer(backend_ctx->queue, extra2->data_device, CL_TRUE,
+                                  offset2, expert_ids.size() * sizeof(int32_t),
+                                  expert_ids.data(), 0, nullptr, nullptr);
+        state->moe_cache_router_read_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - router_t0).count();
+        state->moe_cache_router_read_calls++;
+        if (err != CL_SUCCESS) {
+            GGML_LOG_ERROR("ggml_opencl moe cache: read router ids failed tensor=%s err=%d\n", src0->name, err);
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+        if (moe_layer >= 0) {
+            // A decode layer consumes the same selected-expert tensor for its
+            // up, gate, and down MUL_MAT_ID operations. These may be split
+            // across separate backend graphs, so current_token is not a valid
+            // lifetime key. The first operation reads the route and the next
+            // two consume it; the following operation refreshes the entry.
+            state->moe_router_ids_by_layer[moe_layer] = expert_ids;
+            state->moe_router_reuse_left_by_layer[moe_layer] = 2;
+        } else {
+            state->moe_router_ids[src2] = {state->current_token, expert_ids};
+        }
+    }
+
+    static const char * route_trace_path = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_ROUTE_TRACE_CSV");
+        return e && *e ? e : nullptr;
+    }();
+    if (route_trace_path && std::strstr(src0->name, "ffn_gate_exps.weight") != nullptr) {
+        std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+        if (!state->moe_route_trace_file) {
+            state->moe_route_trace_file = std::fopen(route_trace_path, "w");
+            if (state->moe_route_trace_file) {
+                std::fprintf(state->moe_route_trace_file,
+                             "seq,graph_id,weight,budget_mib,capacity,expert_ids\n");
+            } else {
+                GGML_LOG_WARN("ggml_opencl moe cache: cannot open route trace %s\n", route_trace_path);
+            }
+        }
+        if (state->moe_route_trace_file) {
+            std::fprintf(state->moe_route_trace_file, "%llu,%llu,%s,%zu,%d,",
+                         (unsigned long long) state->moe_route_trace_seq++,
+                         (unsigned long long) state->current_token, src0->name,
+                         state->bw_inited ? elastic::budget_watcher_get(&state->bw) : 0, capacity);
+            for (size_t i = 0; i < expert_ids.size(); ++i) {
+                std::fprintf(state->moe_route_trace_file, "%s%d", i ? ";" : "", expert_ids[i]);
+            }
+            std::fputc('\n', state->moe_route_trace_file);
+            if ((state->moe_route_trace_seq % 64) == 0) {
+                std::fflush(state->moe_route_trace_file);
+            }
+        }
+    }
+    ggml_opencl_enqueue_moe_companion_prefetch(state, src0, expert_ids, raw_slice_bytes, n_experts);
+
+    std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+    elastic_moe_q4_cache & cache = state->moe_q4_cache[wbm_idx];
+    if (state->moe_cache_resize_target < 0) {
+        state->moe_cache_resize_target = aggregate_capacity;
+    }
+    static const bool preserve_grow = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_PRESERVE_GROW");
+        return e && *e && *e != '0';
+    }();
+    if (cache.parent && cache.capacity != capacity && std::abs(cache.capacity - capacity) >= 4) {
+        // A route-upload event does not cover kernels that subsequently read the
+        // cache parent. Synchronize once when the aggregate slot tier changes so
+        // every old cache buffer is idle before the batch of per-tensor resizes.
+        // Without this barrier the driver can retain an entire old tier while a
+        // new tier is allocated, causing a multi-GiB transient allocation spike.
+        if (state->moe_cache_resize_target != aggregate_capacity) {
+            const cl_int finish_err = clFinish(backend_ctx->queue);
+            if (finish_err != CL_SUCCESS) {
+                GGML_LOG_ERROR("ggml_opencl moe cache: resize barrier failed slots=%d->%d err=%d\n",
+                               state->moe_cache_resize_target, aggregate_capacity, finish_err);
+                return false;
+            }
+            state->moe_cache_resize_target = aggregate_capacity;
+            state->moe_cache_resize_syncs++;
+        }
+        if (cache.route_upload_event) {
+            clWaitForEvents(1, &cache.route_upload_event);
+            clReleaseEvent(cache.route_upload_event);
+            cache.route_upload_event = nullptr;
+        }
+        const size_t old_bytes = (cache.q_slice_bytes + cache.d_slice_bytes) * (size_t) cache.capacity;
+        if (preserve_grow && capacity > cache.capacity) {
+            const size_t new_bytes = (cache.q_slice_bytes + cache.d_slice_bytes) * (size_t) capacity;
+            cl_int grow_err = CL_SUCCESS;
+            cl_mem grown_parent = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
+                                                  new_bytes, nullptr, &grow_err);
+            cl_mem grown_route = nullptr;
+            if (grow_err == CL_SUCCESS) {
+                grown_route = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
+                                             sizeof(int32_t) * (size_t) n_selected, nullptr, &grow_err);
+            }
+            if (grow_err == CL_SUCCESS) {
+                grow_err = clEnqueueCopyBuffer(backend_ctx->queue, cache.parent, grown_parent,
+                                               0, 0, old_bytes, 0, nullptr, nullptr);
+            }
+            if (grow_err == CL_SUCCESS) {
+                clReleaseMemObject(cache.parent);
+                clReleaseMemObject(cache.route_slots);
+                cache.parent = grown_parent;
+                cache.route_slots = grown_route;
+                cache.capacity = capacity;
+                cache.expert_for_slot.resize((size_t) capacity, -1);
+                cache.last_used.resize((size_t) capacity, 0);
+                state->moe_cache_bytes += new_bytes - old_bytes;
+                state->moe_cache_grow_resizes++;
+                state->moe_cache_grow_copy_bytes += old_bytes;
+            } else {
+                if (grown_parent) clReleaseMemObject(grown_parent);
+                if (grown_route) clReleaseMemObject(grown_route);
+                capacity = cache.capacity;
+                GGML_LOG_WARN("ggml_opencl moe cache: preserve-grow failed tensor=%s slots=%d->%d err=%d\n",
+                              src0->name, cache.capacity, capacity, grow_err);
+            }
+        } else {
+            clReleaseMemObject(cache.parent);
+            clReleaseMemObject(cache.route_slots);
+            cache = {};
+            state->moe_cache_bytes -= std::min(state->moe_cache_bytes, old_bytes);
+        }
+    }
+    if (!cache.parent) {
+        cache.capacity = capacity;
+        cache.raw_slice_bytes = raw_slice_bytes;
+        cache.q_slice_bytes = q_slice_bytes;
+        cache.d_slice_bytes = d_slice_bytes;
+        cache.expert_for_slot.assign((size_t) capacity, -1);
+        cache.last_used.assign((size_t) capacity, 0);
+        cache.frequency.assign((size_t) n_experts, 0);
+        cache.route_slots_host.assign((size_t) n_selected, -1);
+        cache.parent = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
+                                      (q_slice_bytes + d_slice_bytes) * (size_t) capacity, nullptr, &err);
+        if (err == CL_SUCCESS) {
+            cache.route_slots = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY,
+                                               sizeof(int32_t) * (size_t) n_selected, nullptr, &err);
+        }
+        if (err != CL_SUCCESS || !cache.parent || !cache.route_slots) {
+            if (cache.parent) clReleaseMemObject(cache.parent);
+            if (cache.route_slots) clReleaseMemObject(cache.route_slots);
+            cache = {};
+            GGML_LOG_ERROR("ggml_opencl moe cache: allocation failed tensor=%s capacity=%d err=%d\n",
+                           src0->name, capacity, err);
+            return false;
+        }
+        state->moe_cache_bytes += (q_slice_bytes + d_slice_bytes) * (size_t) capacity;
+        GGML_LOG_INFO("ggml_opencl moe cache: tensor=%s experts=%d slots=%d slice=%.2f MiB cache=%.2f MiB\n",
+                      src0->name, n_experts, capacity,
+                      raw_slice_bytes / 1024.0 / 1024.0,
+                      (q_slice_bytes + d_slice_bytes) * capacity / 1024.0 / 1024.0);
+    }
+
+    static thread_local std::vector<unsigned char> raw_storage;
+    raw_storage.resize(raw_slice_bytes + ELASTIC_MOE_DIRECT_PADDING);
+    std::vector<int32_t> route_slots((size_t) n_selected, -1);
+    static const bool use_lfu = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_POLICY");
+        return e && std::strcmp(e, "lfu") == 0;
+    }();
+
+    for (int i = 0; i < n_selected; ++i) {
+        const int expert_id = expert_ids[(size_t) i];
+        if (expert_id < 0 || expert_id >= n_experts) {
+            GGML_LOG_ERROR("ggml_opencl moe cache: invalid expert id=%d tensor=%s\n", expert_id, src0->name);
+            return false;
+        }
+        cache.accesses++;
+        cache.frequency[(size_t) expert_id]++;
+        if ((cache.accesses % 1024) == 0) {
+            for (uint32_t & f : cache.frequency) {
+                f = (f + 1) / 2;
+            }
+        }
+        int slot = -1;
+        for (int s = 0; s < cache.capacity; ++s) {
+            if (cache.expert_for_slot[(size_t) s] == expert_id) {
+                slot = s;
+                break;
+            }
+        }
+        if (slot >= 0) {
+            state->moe_cache_hits++;
+        } else {
+            state->moe_cache_misses++;
+            for (int s = 0; s < cache.capacity; ++s) {
+                if (cache.expert_for_slot[(size_t) s] < 0) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                auto protected_this_token = [&](int candidate) {
+                    return std::find(route_slots.begin(), route_slots.begin() + i, candidate) !=
+                           route_slots.begin() + i;
+                };
+                uint32_t best_freq = std::numeric_limits<uint32_t>::max();
+                uint64_t best_age = std::numeric_limits<uint64_t>::max();
+                for (int s = 0; s < cache.capacity; ++s) {
+                    if (protected_this_token(s)) continue;
+                    const int resident_expert = cache.expert_for_slot[(size_t) s];
+                    const uint32_t freq = resident_expert >= 0 ? cache.frequency[(size_t) resident_expert] : 0;
+                    const uint64_t age = cache.last_used[(size_t) s];
+                    if ((!use_lfu && age < best_age) ||
+                        (use_lfu && (freq < best_freq || (freq == best_freq && age < best_age)))) {
+                        slot = s;
+                        best_freq = freq;
+                        best_age = age;
+                    }
+                }
+            }
+
+            const unsigned char * mmap_src = (const unsigned char *) bm->host_ptr +
+                                             (size_t) expert_id * raw_slice_bytes;
+            const std::shared_ptr<elastic_moe_prefetch_task> prefetched_task =
+                ggml_opencl_consume_moe_prefetch(state, wbm_idx, expert_id);
+            const bool prefetched = prefetched_task && prefetched_task->data_size == raw_slice_bytes;
+            bool loaded = prefetched;
+            unsigned char * raw = ggml_opencl_moe_direct_ptr(raw_storage.data(), 0);
+            const auto io_t0 = std::chrono::steady_clock::now();
+            if (!loaded) {
+                auto reg = llama_mmap_registry_find(mmap_src);
+                if (!reg.filename.empty()) {
+                    const size_t file_offset = (const char *) mmap_src - (const char *) reg.base;
+                    raw = ggml_opencl_moe_direct_ptr(raw_storage.data(), file_offset);
+                    loaded = llama_pread_direct(reg.filename.c_str(), raw, file_offset, raw_slice_bytes) == 0;
+                }
+            }
+            const auto io_t1 = std::chrono::steady_clock::now();
+            if (loaded && !prefetched) {
+                state->moe_cache_disk_bytes += raw_slice_bytes;
+                state->moe_cache_disk_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(io_t1 - io_t0).count();
+            }
+            if (!loaded) {
+                std::memcpy(raw, mmap_src, raw_slice_bytes);
+            }
+
+            const auto upload_t0 = std::chrono::steady_clock::now();
+            err = clEnqueueWriteBuffer(backend_ctx->queue, cache.parent, CL_TRUE,
+                                       (size_t) slot * raw_slice_bytes, raw_slice_bytes,
+                                       prefetched ? prefetched_task->data : raw,
+                                       0, nullptr, nullptr);
+            state->moe_cache_upload_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - upload_t0).count();
+            if (prefetched && prefetched_task->storage) {
+                std::lock_guard<std::mutex> prefetch_lock(state->moe_prefetch_mtx);
+                state->moe_prefetch_free_buffers.emplace_back(
+                    prefetched_task->data_size, std::move(prefetched_task->storage));
+                prefetched_task->data = nullptr;
+            }
+            if (err != CL_SUCCESS) {
+                GGML_LOG_ERROR("ggml_opencl moe cache: upload failed tensor=%s expert=%d slot=%d err=%d\n",
+                               src0->name, expert_id, slot, err);
+                return false;
+            }
+            cache.expert_for_slot[(size_t) slot] = expert_id;
+        }
+        cache.last_used[(size_t) slot] = ++state->moe_cache_clock;
+        route_slots[(size_t) i] = slot;
+    }
+
+    if (cache.route_upload_event) {
+        clWaitForEvents(1, &cache.route_upload_event);
+        clReleaseEvent(cache.route_upload_event);
+        cache.route_upload_event = nullptr;
+    }
+    cache.route_slots_host = route_slots;
+    const auto route_t0 = std::chrono::steady_clock::now();
+    err = clEnqueueWriteBuffer(backend_ctx->queue, cache.route_slots, CL_FALSE,
+                               0, cache.route_slots_host.size() * sizeof(int32_t),
+                               cache.route_slots_host.data(), 0, nullptr,
+                               &cache.route_upload_event);
+    state->moe_cache_route_upload_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - route_t0).count();
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml_opencl moe cache: upload route slots failed tensor=%s err=%d\n", src0->name, err);
+        return false;
+    }
+    out->parent = cache.parent;
+    out->route_slots = cache.route_slots;
+    out->slot_stride = q_slice_bytes + d_slice_bytes;
+    out->q_offset = d_slice_bytes;
+    llama_weight_runtime_mark_resident(src0->name, LLAMA_WEIGHT_RUNTIME_GPU);
+    state->moe_cache_prepare_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - prepare_t0).count();
+    state->moe_cache_prepare_calls++;
+    return true;
 }
 
 static void opencl_profile_stage(const char *kind, const char *name, int idx,
@@ -3120,7 +3879,13 @@ static bool opencl_sched_residency_query(const char *name, void * /*ud*/) {
     auto it = s->name_to_wbm.find(name);
     if (it == s->name_to_wbm.end()) return false;
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
-    return bm && bm->resident;
+    if (bm && bm->resident) return true;
+    if (ggml_opencl_moe_expert_cache_enabled()) {
+        std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
+        auto cache = s->moe_q4_cache.find(it->second);
+        return cache != s->moe_q4_cache.end() && cache->second.parent != nullptr;
+    }
+    return false;
 }
 
 static uint32_t opencl_sched_state_query(const char *name, void * /*ud*/) {
@@ -3134,6 +3899,13 @@ static uint32_t opencl_sched_state_query(const char *name, void * /*ud*/) {
     uint32_t flags = 0;
     if (bm && bm->host_ptr) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
     if (bm && bm->resident) flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+    if (ggml_opencl_moe_expert_cache_enabled()) {
+        std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
+        auto cache = s->moe_q4_cache.find(idx);
+        if (cache != s->moe_q4_cache.end() && cache->second.parent) {
+            flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+        }
+    }
     if (bm) {
         std::lock_guard<std::mutex> staging_lock(s->octx.host_staging_mtx);
         auto staged = s->octx.host_staging_by_idx.find(idx);
@@ -3718,6 +4490,47 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                              (unsigned long long) st->octx.parent_create_calls,
                              create_ms, create_mb);
             }
+            if (ggml_opencl_moe_expert_cache_enabled()) {
+                const uint64_t accesses = st->moe_cache_hits + st->moe_cache_misses;
+                const double hit_rate = accesses ? 100.0 * st->moe_cache_hits / accesses : 0.0;
+                const double io_ms = st->moe_cache_disk_us / 1000.0;
+                const double io_mb = st->moe_cache_disk_bytes / 1024.0 / 1024.0;
+                std::fprintf(stderr,
+                             "moe expert cache: tensors=%zu bytes=%.1fMB hits=%llu misses=%llu hit_rate=%.2f%% disk=%.1fMB/%.2fms\n",
+                             st->moe_q4_cache.size(), st->moe_cache_bytes / 1024.0 / 1024.0,
+                             (unsigned long long) st->moe_cache_hits,
+                             (unsigned long long) st->moe_cache_misses,
+                             hit_rate, io_mb, io_ms);
+                std::fprintf(stderr,
+                             "moe cache stages: prepare=%llu/%.2fms router=%llu/%.2fms cpu_xform=%.2fms upload=%.2fms route_upload=%.2fms\n",
+                             (unsigned long long) st->moe_cache_prepare_calls,
+                             st->moe_cache_prepare_us / 1000.0,
+                             (unsigned long long) st->moe_cache_router_read_calls,
+                             st->moe_cache_router_read_us / 1000.0,
+                             st->moe_cache_cpu_xform_us / 1000.0,
+                             st->moe_cache_upload_us / 1000.0,
+                             st->moe_cache_route_upload_us / 1000.0);
+                std::fprintf(stderr, "moe cache resize: syncs=%llu preserved_grow=%llu copied=%.1fMB\n",
+                             (unsigned long long) st->moe_cache_resize_syncs,
+                             (unsigned long long) st->moe_cache_grow_resizes,
+                             st->moe_cache_grow_copy_bytes / 1024.0 / 1024.0);
+                std::fprintf(stderr,
+                             "moe prefetch: issued=%llu completed=%llu used=%llu skipped_hit=%llu skipped_cap=%llu wait=%.2fms pending=%zu buffers=%zu alloc=%llu reuse=%llu\n",
+                             (unsigned long long) st->moe_prefetch_issued,
+                             (unsigned long long) st->moe_prefetch_completed,
+                             (unsigned long long) st->moe_prefetch_used,
+                             (unsigned long long) st->moe_prefetch_skipped_hit,
+                             (unsigned long long) st->moe_prefetch_skipped_cap,
+                             st->moe_prefetch_wait_us / 1000.0,
+                             st->moe_prefetch_tasks.size(),
+                             st->moe_prefetch_free_buffers.size(),
+                             (unsigned long long) st->moe_prefetch_buffer_allocs,
+                             (unsigned long long) st->moe_prefetch_buffer_reuses);
+                if (st->moe_route_trace_file) {
+                    std::fclose(st->moe_route_trace_file);
+                    st->moe_route_trace_file = nullptr;
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(st->async_xform_mtx);
                 const double wait_ms = st->async_xform_wait_us / 1000.0;
@@ -3848,6 +4661,22 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             // attached to that anchor. The regular ensure_resident path below
             // remains the correctness fallback.
             llama_weight_anchor_request(src->name);
+            const bool moe_slice_src =
+                j == 0 && n->op == GGML_OP_MUL_MAT_ID && n->src[2] && n->src[2]->ne[1] == 1 &&
+                ggml_opencl_moe_expert_cache_enabled() && ggml_opencl_is_moe_expert_weight(src);
+            if (moe_slice_src) {
+                // MUL_MAT_ID materializes only the router-selected expert slices.
+                // Drop the packed parent so it cannot consume the same budget.
+                const elastic::block_meta * packed = elastic::wbm_get(&est->wbm, src_wbm_idx);
+                if (packed && packed->resident) {
+                    const int released = elastic::wbmcl_evict_batch(&est->octx, &src_wbm_idx, 1);
+                    if (released > 0) {
+                        llama_weight_runtime_mark_evicted(src->name, LLAMA_WEIGHT_RUNTIME_GPU);
+                        est->n_evicts_total += released;
+                    }
+                }
+                continue;
+            }
             // SOA 量化 tensor (Q4_0 / Q8_0 / MXFP4) 走自定义 evict/reload 回调，
             // 不需要也不能写 src_extra->data_device（它的字段不在同一个偏移）。
             const bool is_soa = (src->type == GGML_TYPE_Q4_0 ||
@@ -3887,8 +4716,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                           const size_t km    = est->kv_bytes + est->misc_overhead;
                           const size_t base  = bt > km ? bt - km : 0;
                           return base + est->extra_target_bytes;
-                      })())
+                    })())
                     : est->static_target_bytes;
+                    if (ggml_opencl_moe_expert_cache_enabled()) {
+                        target = target > est->moe_cache_bytes ? target - est->moe_cache_bytes : 0;
+                    }
                     if (s_pool_counts_budget_pre && est->octx.cache_byte_limit > 0
                         && target > est->octx.cache_byte_limit) {
                         target -= est->octx.cache_byte_limit;
@@ -4076,6 +4908,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                           return base + est->extra_target_bytes;
                       })())
                     : est->static_target_bytes;
+                if (ggml_opencl_moe_expert_cache_enabled()) {
+                    target = target > est->moe_cache_bytes ? target - est->moe_cache_bytes : 0;
+                }
                 if (s_pool_counts_budget && est->octx.cache_byte_limit > 0
                     && target > est->octx.cache_byte_limit) {
                     target -= est->octx.cache_byte_limit;
@@ -4117,6 +4952,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     for (int k = 0; k < GGML_MAX_SRC; ++k) {
                         ggml_tensor *src = nj->src[k];
                         if (!src) continue;
+                        if (ggml_opencl_moe_expert_cache_enabled() && ggml_opencl_is_moe_expert_weight(src)) continue;
                         const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
                         if (se_wbm_idx < 0) continue;
                         const elastic::block_meta *bm =
@@ -4143,6 +4979,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
                     ggml_tensor *src = nj->src[k];
                     if (!src) continue;
+                    if (ggml_opencl_moe_expert_cache_enabled() && ggml_opencl_is_moe_expert_weight(src)) continue;
                     const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
                     if (se_wbm_idx < 0) continue;
                     const elastic::block_meta *bm =
@@ -4184,6 +5021,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
                     ggml_tensor *src = nj->src[k];
                     if (!src) continue;
+                    if (ggml_opencl_moe_expert_cache_enabled() && ggml_opencl_is_moe_expert_weight(src)) continue;
                     const int se_wbm_idx = ggml_opencl_get_wbm_idx(src);
                     if (se_wbm_idx < 0) continue;
                     const elastic::block_meta *bm =
@@ -4416,6 +5254,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_Q8_0 ||
                 op->src[0]->type == GGML_TYPE_MXFP4) {
                 if (op->src[1]->type == GGML_TYPE_F32) {
+                    if (op->src[3] != nullptr && (op->src[3]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[3]))) {
+                        return false;
+                    }
                     return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                 }
             }
@@ -5298,6 +6139,14 @@ static int ggml_opencl_run_q4_0_adreno_transpose(
 }
 
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    static const bool s_disable_adreno_kernels = []() {
+        const char *e = std::getenv("GGML_OPENCL_DISABLE_ADRENO_KERNELS");
+        return e && *e && *e != '0';
+    }();
+    if (s_disable_adreno_kernels) {
+        return false;
+    }
+
     // GGML_ELASTIC_NO_TRANSPOSE=1：elastic 模式下跳过 Adreno transpose 路径。
     // 对 1B 这种小模型 decode 是 mat-vec, transpose 不是优势 (实测 1B-Q4 generic
     // 比 Adreno transpose 还快 ~30%), 但 evict/reload 时 transpose dance 多 6
@@ -5325,6 +6174,14 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     GGML_UNUSED(backend_ctx);
+    static const bool s_disable_adreno_kernels = []() {
+        const char *e = std::getenv("GGML_OPENCL_DISABLE_ADRENO_KERNELS");
+        return e && *e && *e != '0';
+    }();
+    if (s_disable_adreno_kernels) {
+        return false;
+    }
+
     int ne01 = tensor->ne[1];
     return ((strstr(tensor->name, "ffn") != NULL) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 64 == 0);
 }
@@ -10031,13 +10888,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         if (N == 1) {
+            constexpr size_t q4_gemv_n_simgroup = 4;
+
             size_t wavesize = backend_ctx->adreno_wave_size;
             local_work_size[0] = wavesize; // localsize
-            local_work_size[1] = 4; // reduce factor
+            local_work_size[1] = q4_gemv_n_simgroup; // must match N_SIMDGROUP in gemv_noshuffle_q4_0_f32.cl
             local_work_size[2] = 1;
 
             global_work_size[0] = (((M / 2) + wavesize - 1) / wavesize) * wavesize;
-            global_work_size[1] = 4; // reduce factor
+            global_work_size[1] = q4_gemv_n_simgroup;
             global_work_size[2] = 1;
         }
         // <--------------------------------------------> //
@@ -10677,17 +11536,20 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     const ggml_tensor * src2 = dst->src[2];
     GGML_ASSERT(src2);
     GGML_ASSERT(src2->extra);
+    const ggml_tensor * id_mask = dst->src[3];
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl * extra_mask = id_mask ? (ggml_tensor_extra_cl *)id_mask->extra : extra2;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offset2 = extra2->offset + src2->view_offs;
+    cl_ulong offset_mask = id_mask ? extra_mask->offset + id_mask->view_offs : 0;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     GGML_UNUSED(offset0);
@@ -10725,6 +11587,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
     UNUSED(nb20);
 
+    const cl_ulong mask_nb1 = id_mask ? id_mask->nb[1] : 0;
+    const cl_ulong mask_nb2 = id_mask ? id_mask->nb[2] : 0;
+    const int has_id_mask = id_mask != nullptr;
+
     const int ne0 = dst->ne[0];
     const int ne1 = dst->ne[1];
 
@@ -10733,6 +11599,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     const int dst_rows = ne20*ne21; // ne20 = n_used_experts, ne21 = n_rows
 
     GGML_ASSERT(ne00 == ne10);
+
+    elastic_moe_q4_cache_view moe_cache_view;
+    const bool use_moe_q4_cache = src0->type == GGML_TYPE_Q4_0 &&
+        ggml_opencl_prepare_moe_q4_cache(backend_ctx, src0, src2, offset2, &moe_cache_view);
+    cl_mem expert_slots = use_moe_q4_cache ? moe_cache_view.route_slots : extra2->data_device;
+    const int has_expert_slots = use_moe_q4_cache ? 1 : 0;
+    const cl_ulong expert_slot_stride = use_moe_q4_cache ? moe_cache_view.slot_stride : 0;
+    const cl_ulong expert_q_offset = use_moe_q4_cache ? moe_cache_view.q_offset : 0;
 
     int sgs   = 32; // subgroup size
     int nsg   = 1;  // number of subgroups
@@ -10746,6 +11620,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         case GGML_TYPE_Q4_0: {
             kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
 
+            cl_mem q_buffer = use_moe_q4_cache ? moe_cache_view.parent : extra0_q4_0->q;
+            cl_mem d_buffer = use_moe_q4_cache ? moe_cache_view.parent : extra0_q4_0->d;
+
             if (backend_ctx->gpu_family == INTEL) {
                 sgs  = 16;
                 nsg  = 1;
@@ -10758,8 +11635,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
 
-            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
-            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_buffer));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &d_buffer));
             CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
             CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
             CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra2->data_device));
@@ -10783,6 +11660,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &r3));
+            CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_mem),   &extra_mask->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel, 28, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel, 29, sizeof(int),      &has_id_mask));
+            CL_CHECK(clSetKernelArg(kernel, 30, sizeof(cl_mem),   &expert_slots));
+            CL_CHECK(clSetKernelArg(kernel, 31, sizeof(int),      &has_expert_slots));
+            CL_CHECK(clSetKernelArg(kernel, 32, sizeof(cl_ulong), &expert_slot_stride));
+            CL_CHECK(clSetKernelArg(kernel, 33, sizeof(cl_ulong), &expert_q_offset));
 
             break;
         }
@@ -10823,6 +11709,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb21));
             CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne0));
             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_mem),   &extra_mask->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &has_id_mask));
 #else
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32;
 
@@ -10859,12 +11750,17 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb21));
             CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne0));
             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_mem),   &extra_mask->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &has_id_mask));
 #endif // GGML_OPENCL_SOA_Q
             break;
         }
         case GGML_TYPE_MXFP4: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            if (use_adreno_moe_kernels(backend_ctx, src0)) {
+            if (!id_mask && use_adreno_moe_kernels(backend_ctx, src0)) {
                 cl_int status;
 
                 size_t local_size[3] = {64, 2, 1};
@@ -11006,6 +11902,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
+            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_mem),   &extra_mask->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &has_id_mask));
 #else // GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32;
 
@@ -11045,7 +11946,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
-            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float)*sgs,nullptr));
+            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_mem),   &extra_mask->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &has_id_mask));
+            CL_CHECK(clSetKernelArg(kernel, 29, sizeof(float)*sgs,nullptr));
 #endif // GGML_OPENCL_SOA_Q
             break;
         }

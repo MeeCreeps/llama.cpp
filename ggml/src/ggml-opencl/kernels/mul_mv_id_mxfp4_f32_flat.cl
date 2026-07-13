@@ -93,18 +93,43 @@ kernel void kernel_mul_mv_id_mxfp4_f32_flat(
     int           ne0,
     int           ne1,
     int           r2,
-    int           r3
+    int           r3,
+    global char * id_mask,
+    ulong         mask_offset,
+    ulong         mask_nb1,
+    ulong         mask_nb2,
+    int           has_id_mask
 ) {
     dst  = dst  + offsetd;
+    id_mask = (global char *)((global char *)id_mask + mask_offset);
 
     const int iid1 = get_group_id(2) / ne20;
     const int idx  = get_group_id(2) % ne20;
 
-    uint i02 = ((global uint *) (src2 + offset2 + iid1 * nb21))[idx];
+    int i02 = ((global int *) (src2 + offset2 + iid1 * nb21))[idx];
 
     int i11 = idx % ne11;
 
     int nb = ne00 / QK_MXFP4;
+
+    const bool skip_id = i02 < 0 || (has_id_mask && ((global float *) (id_mask + iid1*mask_nb2 + idx*mask_nb1))[0] == 0.0f);
+
+    if (skip_id) {
+        global uchar * dst_cur = dst + (idx * ne0 + iid1 * ne1 * ne0) * sizeof(float);
+        int r0 = get_group_id(0);
+        int r1 = get_group_id(1);
+        int first_row = (r0 * N_SG_MXFP4 + get_sub_group_id()) * N_R0_MXFP4;
+        global float * dst_f32 = (global float *) dst_cur + (ulong)r1*ne0;
+
+        if (get_sub_group_local_id() == 0) {
+            for (int row = 0; row < N_R0_MXFP4; ++row) {
+                if (first_row + row < ne1) {
+                    dst_f32[first_row + row] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
 
     uint src0_off = i02*nb02;
     src0_off /= 17; // 17 = sizeof(block_mxfp4)

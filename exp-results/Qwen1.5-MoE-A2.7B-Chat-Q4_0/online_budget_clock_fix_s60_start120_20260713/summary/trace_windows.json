@@ -1,0 +1,17 @@
+[
+  {
+    "local": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/Qwen1.5-MoE-A2.7B-Chat-Q4_0/online_budget_clock_fix_s60_start120_20260713/traces/trace_220_user_116_qwen15moe_q4_0_cov60_95_10min_x1.csv",
+    "max_bucket_mib": 8704,
+    "max_mib": 8558.0,
+    "mean_mib": 7584.806451612903,
+    "min_bucket_mib": 6400,
+    "min_mib": 6567.0,
+    "remote_name": "trace_220_user_116_qwen15moe_q4_0_cov60_95_10min_x1.csv",
+    "replay_span": 60.0,
+    "rows": 62,
+    "source": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/Qwen1.5-MoE-A2.7B-Chat-Q4_0/trace_inputs_scaled_cov60_95/trace_220_user_116_qwen15moe_q4_0_cov60_95.csv",
+    "source_end": 180.0,
+    "source_span": 60.0,
+    "source_start": 120.0
+  }
+]

@@ -563,6 +563,10 @@ def make_method_env(args: argparse.Namespace, method: str, trace: TraceWindow, r
         "GGML_ELASTIC_KV_MB": str(args.kv_mib),
         "GGML_ELASTIC_MISC_MB": str(args.misc_mib),
         "GGML_ELASTIC_SAFETY_MB": str(effective_safety_mib),
+        # Static traces are flattened to one budget, so their observed floor
+        # is not a valid adaptive-cache baseline. Keep all methods anchored to
+        # the source window's floor for equal slots at equal budgets.
+        "GGML_ELASTIC_MOE_EXPERT_CACHE_BASE_BUDGET_MIB": str(trace.min_bucket_mib),
         "LLAMA_ELASTIC_DEFER_STAGE": "0",
     }
     if args.static_weight_mirror == "1" or (args.static_weight_mirror == "auto" and "cpu" in placement_set):

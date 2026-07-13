@@ -1775,7 +1775,10 @@ void llama_context::maybe_apply_plan() {
     apply_exec_plan(p);
     static const bool reset_budget_after_online_apply = []() {
         const char * e = std::getenv("LLAMA_ELASTIC_RESET_BUDGET_AFTER_ONLINE_APPLY");
-        return !(e && *e && *e == '0');
+        // A runtime plan switch must not restart a replayed budget trace. Doing so
+        // makes the scheduler and adaptive caches jump back to the initial budget.
+        // Keep the old behavior as an explicit debugging/reproduction opt-in.
+        return e && *e && *e != '0';
     }();
     if (reset_budget_after_online_apply) {
         llama_budget_reset_clock();
@@ -2039,6 +2042,92 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    static const bool moe_dynamic_debug = []() {
+        const char * e = std::getenv("LLAMA_MOE_DYNAMIC_TOP_P_DEBUG");
+        return e && *e && *e != '0';
+    }();
+    if (moe_dynamic_debug) {
+        fprintf(stderr,
+                "[moe-dyn-debug] active_tensors=%zu weight_tensors=%zu selected_tensors=%zu\n",
+                res->get_moe_dynamic_active_k().size(),
+                res->get_moe_dynamic_weights().size(),
+                res->get_moe_dynamic_selected_experts().size());
+    }
+    if (moe_dynamic_debug && !res->get_moe_dynamic_active_k().empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        for (const auto & entry : res->get_moe_dynamic_active_k()) {
+            const int il = entry.first;
+            ggml_tensor * active_k = entry.second;
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), active_k);
+            if (!backend) {
+                continue;
+            }
+
+            std::vector<float> values(ggml_nelements(active_k));
+            ggml_backend_tensor_get(active_k, values.data(), 0, ggml_nbytes(active_k));
+
+            fprintf(stderr, "[moe-dyn] layer=%d backend=%s active_k=[", il, ggml_backend_name(backend));
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i > 0) {
+                    fprintf(stderr, ",");
+                }
+                fprintf(stderr, "%.0f", values[i]);
+            }
+            fprintf(stderr, "]\n");
+        }
+        for (const auto & entry : res->get_moe_dynamic_weights()) {
+            const int il = entry.first;
+            ggml_tensor * weights = entry.second;
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), weights);
+            if (!backend || weights->ne[0] < 1) {
+                continue;
+            }
+
+            std::vector<float> values(ggml_nelements(weights));
+            ggml_backend_tensor_get(weights, values.data(), 0, ggml_nbytes(weights));
+
+            fprintf(stderr, "[moe-dyn-prob] layer=%d backend=%s top1=[", il, ggml_backend_name(backend));
+            const int64_t n_tok  = weights->ne[1];
+            for (int64_t tok = 0; tok < n_tok; ++tok) {
+                if (tok > 0) {
+                    fprintf(stderr, ",");
+                }
+                fprintf(stderr, "%.3f", values[tok]);
+            }
+            fprintf(stderr, "]\n");
+        }
+        for (const auto & entry : res->get_moe_dynamic_selected_experts()) {
+            const int il = entry.first;
+            ggml_tensor * selected = entry.second;
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), selected);
+            if (!backend) {
+                fprintf(stderr, "[moe-dyn-ids-skip] layer=%d backend=null\n", il);
+                continue;
+            }
+
+            std::vector<int32_t> values(ggml_nelements(selected));
+            ggml_backend_tensor_get(selected, values.data(), 0, ggml_nbytes(selected));
+
+            const int64_t n_expert_used = selected->ne[0];
+            const int64_t n_tok         = selected->ne[1];
+            fprintf(stderr, "[moe-dyn-ids] layer=%d backend=%s ids=[", il, ggml_backend_name(backend));
+            for (int64_t tok = 0; tok < n_tok; ++tok) {
+                if (tok > 0) {
+                    fprintf(stderr, ";");
+                }
+                fprintf(stderr, "[");
+                for (int64_t ie = 0; ie < n_expert_used; ++ie) {
+                    if (ie > 0) {
+                        fprintf(stderr, ",");
+                    }
+                    fprintf(stderr, "%d", values[tok*n_expert_used + ie]);
+                }
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "]\n");
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2633,7 +2722,21 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes() const {
-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint32_t max_nodes = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    if (const char * e = std::getenv("LLAMA_MOE_DYNAMIC_ALL_EXPERTS"); e && *e && *e != '0') {
+        max_nodes = std::max<uint32_t>(max_nodes, std::max<uint32_t>(4096u, 32u*model.n_tensors()));
+    }
+
+    if (const char * e = std::getenv("LLAMA_GRAPH_MAX_NODES"); e && *e) {
+        char * end = nullptr;
+        const unsigned long v = std::strtoul(e, &end, 10);
+        if (end != e && v > 0) {
+            max_nodes = std::max<uint32_t>(max_nodes, (uint32_t) v);
+        }
+    }
+
+    return max_nodes;
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {

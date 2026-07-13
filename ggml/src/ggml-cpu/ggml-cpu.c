@@ -1488,6 +1488,7 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const struct ggml_tensor * id_mask = dst->src[3];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1570,6 +1571,8 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1577,6 +1580,17 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                if (i02 < 0) {
+                    continue;
+                }
+
+                if (id_mask) {
+                    const float w = *(const float *) ((const char *) id_mask->data + iid1*id_mask->nb[2] + id*id_mask->nb[1]);
+                    if (w == 0.0f) {
+                        continue;
+                    }
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 

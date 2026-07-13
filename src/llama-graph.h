@@ -129,6 +129,26 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+class llm_graph_input_moe_top_p : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_top_p(int64_t n_expert_used, int64_t n_tokens, int64_t min_k);
+    virtual ~llm_graph_input_moe_top_p() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * prefix_before = nullptr; // F32 [n_expert_used, n_expert_used]
+    ggml_tensor * min_k_mask    = nullptr; // F32 [n_expert_used, n_tokens]
+
+private:
+    int64_t n_expert_used = 0;
+    int64_t n_tokens      = 0;
+
+    std::vector<float> prefix_before_data;
+    std::vector<float> min_k_mask_data;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -477,6 +497,9 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_moe_dynamic_active_k() const { return t_moe_dynamic_active_k; }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_moe_dynamic_weights() const { return t_moe_dynamic_weights; }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_moe_dynamic_selected_experts() const { return t_moe_dynamic_selected_experts; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -496,6 +519,10 @@ public:
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
+    void add_moe_dynamic_active_k(int il, ggml_tensor * tensor);
+    void add_moe_dynamic_weights(int il, ggml_tensor * tensor);
+    void add_moe_dynamic_selected_experts(int il, ggml_tensor * tensor);
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -503,6 +530,10 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    std::vector<std::pair<int, ggml_tensor *>> t_moe_dynamic_active_k;
+    std::vector<std::pair<int, ggml_tensor *>> t_moe_dynamic_weights;
+    std::vector<std::pair<int, ggml_tensor *>> t_moe_dynamic_selected_experts;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -608,7 +639,9 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
-              ggml_tensor * ids) const;
+              ggml_tensor * ids,
+              ggml_tensor * id_mask = nullptr,
+                     bool   force_cpu = false) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

@@ -73,6 +73,34 @@ inline float block_q_4_0_dot_y_flat(
     return d * (sumy * -8.f + acc);
 }
 
+inline float block_q_4_0_dot_y_raw(
+        global struct block_q4_0 * block,
+        float sumy,
+        float16 yl,
+        int il
+) {
+    const float d = block->d;
+    global ushort * qs = ((global ushort *) block + 1 + il/2);
+    float acc = 0.f;
+    acc += yl.s0 * (qs[0] & 0x000F);
+    acc += yl.s1 * (qs[0] & 0x0F00);
+    acc += yl.s8 * (qs[0] & 0x00F0);
+    acc += yl.s9 * (qs[0] & 0xF000);
+    acc += yl.s2 * (qs[1] & 0x000F);
+    acc += yl.s3 * (qs[1] & 0x0F00);
+    acc += yl.sa * (qs[1] & 0x00F0);
+    acc += yl.sb * (qs[1] & 0xF000);
+    acc += yl.s4 * (qs[2] & 0x000F);
+    acc += yl.s5 * (qs[2] & 0x0F00);
+    acc += yl.sc * (qs[2] & 0x00F0);
+    acc += yl.sd * (qs[2] & 0xF000);
+    acc += yl.s6 * (qs[3] & 0x000F);
+    acc += yl.s7 * (qs[3] & 0x0F00);
+    acc += yl.se * (qs[3] & 0x00F0);
+    acc += yl.sf * (qs[3] & 0xF000);
+    return d * (sumy * -8.f + acc);
+}
+
 //
 // This variant outputs 8 values.
 //
@@ -103,7 +131,9 @@ inline void mul_vec_q_n_f32_8x_flat(
         int ne0,
         int ne1,
         int r2,
-        int r3
+        int r3,
+        global char * src0_raw,
+        int use_raw
 ) {
     const ulong nb = ne00/QK4_0;
 
@@ -123,6 +153,7 @@ inline void mul_vec_q_n_f32_8x_flat(
 
     global uchar * x = (global uchar *) src0_q + offset0_q;
     global half  * d = (global half  *) src0_d + offset0_d;
+    global struct block_q4_0 * xr = (global struct block_q4_0 *) src0_raw + first_row * nb;
     global float * y = (global float *) src1   + r1*ne10 + im*ne00*ne1;
 
     float16 yl;
@@ -178,15 +209,14 @@ inline void mul_vec_q_n_f32_8x_flat(
         yl.se = yb[22]/16.f;
         yl.sf = yb[23]/4096.f;
 
-        sumf.s0 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 0*nb*QK4_0/2, d + ib + 0*nb, sumy, yl, il);
-        sumf.s1 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 1*nb*QK4_0/2, d + ib + 1*nb, sumy, yl, il);
-        sumf.s2 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 2*nb*QK4_0/2, d + ib + 2*nb, sumy, yl, il);
-        sumf.s3 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 3*nb*QK4_0/2, d + ib + 3*nb, sumy, yl, il);
-
-        sumf.s4 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 4*nb*QK4_0/2, d + ib + 4*nb, sumy, yl, il);
-        sumf.s5 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 5*nb*QK4_0/2, d + ib + 5*nb, sumy, yl, il);
-        sumf.s6 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 6*nb*QK4_0/2, d + ib + 6*nb, sumy, yl, il);
-        sumf.s7 += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 7*nb*QK4_0/2, d + ib + 7*nb, sumy, yl, il);
+        sumf.s0 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 0*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 0*nb*QK4_0/2, d + ib + 0*nb, sumy, yl, il);
+        sumf.s1 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 1*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 1*nb*QK4_0/2, d + ib + 1*nb, sumy, yl, il);
+        sumf.s2 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 2*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 2*nb*QK4_0/2, d + ib + 2*nb, sumy, yl, il);
+        sumf.s3 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 3*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 3*nb*QK4_0/2, d + ib + 3*nb, sumy, yl, il);
+        sumf.s4 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 4*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 4*nb*QK4_0/2, d + ib + 4*nb, sumy, yl, il);
+        sumf.s5 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 5*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 5*nb*QK4_0/2, d + ib + 5*nb, sumy, yl, il);
+        sumf.s6 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 6*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 6*nb*QK4_0/2, d + ib + 6*nb, sumy, yl, il);
+        sumf.s7 += use_raw ? block_q_4_0_dot_y_raw(xr + ib + 7*nb, sumy, yl, il) : block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + 7*nb*QK4_0/2, d + ib + 7*nb, sumy, yl, il);
 
         yb += QK4_0 * (N_SIMDWIDTH/2);
     }
@@ -257,16 +287,27 @@ kernel void kernel_mul_mv_id_q4_0_f32_8x_flat(
         int             ne0,
         int             ne1,
         int             r2,
-        int             r3
+        int             r3,
+        global char  *  id_mask,
+        ulong           mask_offset,
+        ulong           mask_nb1,
+        ulong           mask_nb2,
+        int             has_id_mask,
+        global int   *  expert_slots,
+        int             has_expert_slots,
+        ulong           expert_slot_stride,
+        ulong           expert_q_offset
 ) {
     src1 = (global float *)((global char *)src1 + offset1);
     src2 = (global char  *)((global char *)src2 + offset2);
+    id_mask = (global char *)((global char *)id_mask + mask_offset);
     dst  = (global float *)((global char *)dst  + offsetd);
 
     const int iid1 = get_group_id(2)/ne20;
     const int idx  = get_group_id(2)%ne20;
 
     const int i02 = ((global int *)(src2 + iid1*nb21))[idx];
+    const int cache_slot = has_expert_slots ? expert_slots[idx] : i02;
 
     const int i11 = idx%ne11;
     const int i12 = iid1;
@@ -274,10 +315,54 @@ kernel void kernel_mul_mv_id_q4_0_f32_8x_flat(
     const int i1 = idx;
     const int i2 = i12;
 
-    global char  * src0_q_cur = src0_q + (i02*nb02/nb00)*(QK4_0/2);
-    global half  * src0_d_cur = src0_d + (i02*nb02/nb00);
+    const bool skip_id = i02 < 0 || (has_id_mask && ((global float *) (id_mask + i12*mask_nb2 + idx*mask_nb1))[0] == 0.0f);
+
+    if (skip_id) {
+        global float * dst_cur = dst + i1*ne0 + i2*ne1*ne0;
+        int r0 = get_group_id(0);
+        int r1 = get_group_id(1);
+        int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+
+        if (get_sub_group_local_id() == 0) {
+            if (first_row + 0 < ne01) {
+                dst_cur[r1*ne0 + first_row + 0] = 0.0f;
+            }
+            if (first_row + 1 < ne01) {
+                dst_cur[r1*ne0 + first_row + 1] = 0.0f;
+            }
+            if (first_row + 2 < ne01) {
+                dst_cur[r1*ne0 + first_row + 2] = 0.0f;
+            }
+            if (first_row + 3 < ne01) {
+                dst_cur[r1*ne0 + first_row + 3] = 0.0f;
+            }
+            if (first_row + 4 < ne01) {
+                dst_cur[r1*ne0 + first_row + 4] = 0.0f;
+            }
+            if (first_row + 5 < ne01) {
+                dst_cur[r1*ne0 + first_row + 5] = 0.0f;
+            }
+            if (first_row + 6 < ne01) {
+                dst_cur[r1*ne0 + first_row + 6] = 0.0f;
+            }
+            if (first_row + 7 < ne01) {
+                dst_cur[r1*ne0 + first_row + 7] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    global char  * src0_q_cur = has_expert_slots
+        ? src0_q + cache_slot*expert_slot_stride + expert_q_offset
+        : src0_q + (cache_slot*nb02/nb00)*(QK4_0/2);
+    global half  * src0_d_cur = has_expert_slots
+        ? (global half *)((global char *)src0_d + cache_slot*expert_slot_stride)
+        : src0_d + (cache_slot*nb02/nb00);
+    global char * src0_raw_cur = has_expert_slots
+        ? src0_q + cache_slot*expert_slot_stride
+        : src0_q_cur;
     global float * src1_cur   = (global float *)((global char *) src1  + i11*nb11 + i12*nb12);
     global float * dst_cur    = dst + i1*ne0 + i2*ne1*ne0;
 
-    mul_vec_q_n_f32_8x_flat(src0_q_cur, src0_d_cur, src1_cur, dst_cur, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
+    mul_vec_q_n_f32_8x_flat(src0_q_cur, src0_d_cur, src1_cur, dst_cur, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, src0_raw_cur, has_expert_slots);
 }

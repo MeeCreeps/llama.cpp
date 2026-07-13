@@ -1,0 +1,17 @@
+[
+  {
+    "local": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/OLMoE-1B-7B-0125-Instruct-Q4_0/window_1200s_baselines_dynamic_experts_top_p04_mru_retry_ignore_eos/traces/trace_170_user_116_olmoe_q4_0_cov40_90_10min_x1.csv",
+    "max_bucket_mib": 4608,
+    "max_mib": 4488.0,
+    "mean_mib": 3439.1857618651125,
+    "min_bucket_mib": 1792,
+    "min_mib": 1995.0,
+    "remote_name": "trace_170_user_116_olmoe_q4_0_cov40_90_10min_x1.csv",
+    "replay_span": 1200.0,
+    "rows": 1201,
+    "source": "/home/myid/hz85760/workspace/project/elastic/llama.cpp/exp-results/OLMoE-1B-7B-0125-Instruct-Q4_0/trace_inputs_scaled_cov40_90/trace_170_user_116_olmoe_q4_0_cov40_90.csv",
+    "source_end": 1200.0,
+    "source_span": 1200.0,
+    "source_start": 0.0
+  }
+]

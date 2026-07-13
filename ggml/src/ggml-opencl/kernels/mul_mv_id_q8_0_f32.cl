@@ -62,11 +62,17 @@ kernel void kernel_mul_mv_id_q8_0_f32(
     int           ne21,
     ulong         nb21,
     int           ne0,
-    int           ne1
+    int           ne1,
+    global char * id_mask,
+    ulong         mask_offset,
+    ulong         mask_nb1,
+    ulong         mask_nb2,
+    int           has_id_mask
 ) {
     src0 = (global char *)((global char *)src0 + offset0);
     src1 = (global char *)((global char *)src1 + offset1);
     src2 = (global char *)((global char *)src2 + offset2);
+    id_mask = (global char *)((global char *)id_mask + mask_offset);
     dst  = (global char *)((global char *)dst  + offsetd);
 
     int iid1 = get_group_id(2)/ne20;
@@ -79,6 +85,25 @@ kernel void kernel_mul_mv_id_q8_0_f32(
 
     int i1 = idx;
     int i2 = i12_;
+
+    const bool skip_id = i02 < 0 || (has_id_mask && ((global float *) (id_mask + i12_*mask_nb2 + idx*mask_nb1))[0] == 0.0f);
+
+    if (skip_id) {
+        global char * dst_cur = dst + (i1*ne0 + i2*ne1*ne0)*sizeof(float);
+        int r0 = get_group_id(0);
+        int r1 = get_group_id(1);
+        int first_row = (r0*N_SG_Q8_0 + get_sub_group_id()) * N_R0_Q8_0;
+        global float * dst_f32 = (global float *) dst_cur + (ulong)r1*ne0;
+
+        if (get_sub_group_local_id() == 0) {
+            for (int row = 0; row < N_R0_Q8_0; ++row) {
+                if (first_row + row < ne01) {
+                    dst_f32[first_row + row] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
 
     global char * src0_cur = src0 + i02*nb02;
     global char * src1_cur = src1 + i11_*nb11 + i12_*nb12;
