@@ -28,6 +28,16 @@
 
 #define UNUSED GGML_UNUSED
 
+static inline void ggml_repack_cpu_relax() {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    __asm__ volatile("pause" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+
 static int ggml_cpu_repack_get_n_threads(int64_t n_groups, int64_t nblocks) {
     const char * env = std::getenv("GGML_CPU_REPACK_THREADS");
     if (env == nullptr) {
@@ -1454,6 +1464,73 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
     GGML_UNUSED(data_size);
 }
 
+template <int NROWS, typename PACKED, typename PACK_FN>
+static int repack_q4_0_pair_impl(
+        struct ggml_tensor * first, const void * GGML_RESTRICT first_data, size_t first_size,
+        struct ggml_tensor * second, const void * GGML_RESTRICT second_data, size_t second_size,
+        int interleave_block, const PACK_FN & pack_fn) {
+    if (!first || !second || !first_data || !second_data ||
+        first->type != GGML_TYPE_Q4_0 || second->type != GGML_TYPE_Q4_0 ||
+        first->ne[0] != second->ne[0]) {
+        return -1;
+    }
+
+    const int64_t first_rows  = ggml_nrows(first);
+    const int64_t second_rows = ggml_nrows(second);
+    const int64_t nblocks = first->ne[0] / QK4_0;
+    if (first_rows % NROWS != 0 || second_rows % NROWS != 0 ||
+        first->ne[0] % 8 != 0 ||
+        first_size != static_cast<size_t>(first_rows * nblocks * sizeof(block_q4_0)) ||
+        second_size != static_cast<size_t>(second_rows * nblocks * sizeof(block_q4_0))) {
+        return -1;
+    }
+
+    const int64_t first_groups  = first_rows / NROWS;
+    const int64_t second_groups = second_rows / NROWS;
+    const int64_t total_groups  = first_groups + second_groups;
+    auto * first_dst  = static_cast<PACKED *>(first->data);
+    auto * second_dst = static_cast<PACKED *>(second->data);
+    const auto * first_src  = static_cast<const block_q4_0 *>(first_data);
+    const auto * second_src = static_cast<const block_q4_0 *>(second_data);
+
+    const int n_threads = ggml_cpu_repack_get_n_threads(total_groups, nblocks);
+    if (n_threads <= 1) {
+        // Match the native single-tensor loop shape: two contiguous,
+        // branch-free ranges inside one pair transformation invocation.  The
+        // generic combined loop below is useful for balancing multiple
+        // threads, but its per-group tensor selection is pure overhead for
+        // the single PREPARE worker used by the Elastic pipeline.
+        for (int64_t group = 0; group < first_groups; ++group) {
+            const block_q4_0 * src = first_src + group * NROWS * nblocks;
+            PACKED * dst = first_dst + group * nblocks;
+            for (int64_t x = 0; x < nblocks; ++x) {
+                pack_fn(&dst[x], src, nblocks, x, interleave_block);
+            }
+        }
+        for (int64_t group = 0; group < second_groups; ++group) {
+            const block_q4_0 * src = second_src + group * NROWS * nblocks;
+            PACKED * dst = second_dst + group * nblocks;
+            for (int64_t x = 0; x < nblocks; ++x) {
+                pack_fn(&dst[x], src, nblocks, x, interleave_block);
+            }
+        }
+        return 0;
+    }
+    ggml_cpu_repack_parallel_for(total_groups, n_threads, [&](int64_t g0, int64_t g1) {
+        for (int64_t combined_group = g0; combined_group < g1; ++combined_group) {
+            const bool in_first = combined_group < first_groups;
+            const int64_t group = in_first ? combined_group : combined_group - first_groups;
+            const block_q4_0 * src = (in_first ? first_src : second_src) +
+                group * NROWS * nblocks;
+            PACKED * dst = (in_first ? first_dst : second_dst) + group * nblocks;
+            for (int64_t x = 0; x < nblocks; ++x) {
+                pack_fn(&dst[x], src, nblocks, x, interleave_block);
+            }
+        }
+    });
+    return 0;
+}
+
 static block_iq4_nlx4 make_block_iq4_nlx4(block_iq4_nl * in, unsigned int blck_size_interleave) {
     block_iq4_nlx4 out;
 
@@ -1653,6 +1730,13 @@ namespace ggml::cpu::repack {
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 int repack(struct ggml_tensor *, const void *, size_t);
 
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
+int repack_pair(
+        struct ggml_tensor *, const void *, size_t,
+        struct ggml_tensor *, const void *, size_t) {
+    return -1;
+}
+
 // TODO: generalise.
 template <> int repack<block_q4_0, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_4_bl(t, 4, data, data_size);
@@ -1664,6 +1748,39 @@ template <> int repack<block_q4_0, 8, 4>(struct ggml_tensor * t, const void * da
 
 template <> int repack<block_q4_0, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_8_bl(t, 8, data, data_size);
+}
+
+template <> int repack_pair<block_q4_0, 4, 4>(
+        struct ggml_tensor * first, const void * first_data, size_t first_size,
+        struct ggml_tensor * second, const void * second_data, size_t second_size) {
+    return repack_q4_0_pair_impl<4, block_q4_0x4>(
+        first, first_data, first_size, second, second_data, second_size, 4,
+        [](block_q4_0x4 * dst, const block_q4_0 * src, int64_t nblocks,
+           int64_t x, int interleave) {
+            pack_block_q4_0x4(dst, src, nblocks, x, interleave);
+        });
+}
+
+template <> int repack_pair<block_q4_0, 8, 4>(
+        struct ggml_tensor * first, const void * first_data, size_t first_size,
+        struct ggml_tensor * second, const void * second_data, size_t second_size) {
+    return repack_q4_0_pair_impl<4, block_q4_0x4>(
+        first, first_data, first_size, second, second_data, second_size, 8,
+        [](block_q4_0x4 * dst, const block_q4_0 * src, int64_t nblocks,
+           int64_t x, int interleave) {
+            pack_block_q4_0x4(dst, src, nblocks, x, interleave);
+        });
+}
+
+template <> int repack_pair<block_q4_0, 8, 8>(
+        struct ggml_tensor * first, const void * first_data, size_t first_size,
+        struct ggml_tensor * second, const void * second_data, size_t second_size) {
+    return repack_q4_0_pair_impl<8, block_q4_0x8>(
+        first, first_data, first_size, second, second_data, second_size, 8,
+        [](block_q4_0x8 * dst, const block_q4_0 * src, int64_t nblocks,
+           int64_t x, int interleave) {
+            pack_block_q4_0x8(dst, src, nblocks, x, interleave);
+        });
 }
 
 template <> int repack<block_q4_K, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
@@ -1754,9 +1871,24 @@ template <> void gemm<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+    virtual int repack_pair(
+            struct ggml_tensor * first, const void * first_data, size_t first_size,
+            struct ggml_tensor * second, const void * second_data, size_t second_size) = 0;
+    virtual int row_alignment() const = 0;
+    virtual bool mul_mat_pair_compatible(
+            const struct ggml_tensor * first, const struct ggml_tensor * second) const = 0;
+    virtual size_t mul_mat_pair_work_size(const struct ggml_tensor * first) const = 0;
+    virtual int mul_mat_pair_compute_thread(
+            struct ggml_tensor * first, struct ggml_tensor * second,
+            void * workspace, size_t workspace_size, int ith, int nth,
+            struct ggml_backend_cpu_repack_pair_sync * sync) const = 0;
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+
+    int row_alignment() const override {
+        return NB_COLS;
+    }
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -1802,14 +1934,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         return false;
     }
 
-    void forward_mul_mat_one_chunk(ggml_compute_params * params, ggml_tensor * op, int64_t src0_start, int64_t src0_end) {
+    void forward_mul_mat_one_chunk_with_wdata(
+            ggml_tensor * op, int64_t src0_start, int64_t src0_end,
+            const void * src1_wdata) const {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         ggml_tensor *       dst  = op;
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
-        const void * src1_wdata      = params->wdata;
         const size_t src1_col_stride = ggml_row_size(PARAM_TYPE, ne10);
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
@@ -1826,6 +1959,104 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     (const char *) src1_wdata + (src1_col_stride * iter), 1,
                     src0_end - src0_start);
         }
+    }
+
+    void forward_mul_mat_one_chunk(
+            ggml_compute_params * params, ggml_tensor * op,
+            int64_t src0_start, int64_t src0_end) const {
+        forward_mul_mat_one_chunk_with_wdata(
+            op, src0_start, src0_end, params->wdata);
+    }
+
+    bool mul_mat_pair_compatible(
+            const struct ggml_tensor * first,
+            const struct ggml_tensor * second) const override {
+        if (!first || !second || first == second ||
+            first->op != GGML_OP_MUL_MAT || second->op != GGML_OP_MUL_MAT ||
+            !first->src[0] || !second->src[0] || !first->src[1] ||
+            first->src[1] != second->src[1] ||
+            first->src[0]->extra != this || second->src[0]->extra != this ||
+            first->src[1]->type != GGML_TYPE_F32 ||
+            ggml_n_dims(first->src[0]) != 2 || ggml_n_dims(second->src[0]) != 2 ||
+            first->src[0]->ne[0] != second->src[0]->ne[0] ||
+            first->src[0]->ne[0] != first->src[1]->ne[0] ||
+            first->src[1]->ne[2] != 1 || first->src[1]->ne[3] != 1 ||
+            first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 ||
+            first->nb[0] != sizeof(float) || second->nb[0] != sizeof(float)) {
+            return false;
+        }
+        return first->ne[0] == first->src[0]->ne[1] &&
+               second->ne[0] == second->src[0]->ne[1] &&
+               first->ne[1] == first->src[1]->ne[1] &&
+               second->ne[1] == second->src[1]->ne[1] &&
+               first->ne[2] == first->src[1]->ne[2] &&
+               second->ne[2] == second->src[1]->ne[2] &&
+               first->ne[3] == first->src[1]->ne[3] &&
+               second->ne[3] == second->src[1]->ne[3];
+    }
+
+    size_t mul_mat_pair_work_size(const struct ggml_tensor * first) const override {
+        if (!first || !first->src[1]) return 0;
+        return ggml_row_size(PARAM_TYPE, ggml_nelements(first->src[1]));
+    }
+
+    int mul_mat_pair_compute_thread(
+            struct ggml_tensor * first, struct ggml_tensor * second,
+            void * workspace, size_t workspace_size, int ith, int nth,
+            struct ggml_backend_cpu_repack_pair_sync * sync) const override {
+        if (!mul_mat_pair_compatible(first, second) || !workspace || !sync ||
+            ith < 0 || nth < 1 || ith >= nth ||
+            workspace_size < mul_mat_pair_work_size(first)) {
+            return -1;
+        }
+
+        const ggml_tensor * activation = first->src[1];
+        const int64_t ne10 = activation->ne[0];
+        const int64_t ne11 = activation->ne[1];
+        const size_t nb11 = activation->nb[1];
+        const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+        char * wdata = static_cast<char *>(workspace);
+        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+
+        for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+            ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(
+                reinterpret_cast<float *>(static_cast<char *>(activation->data) + i11 * nb11),
+                wdata + i11 * nbw1, 4, ne10);
+        }
+        for (int64_t i11 = ne11 - ne11 % 4 + ith; i11 < ne11; i11 += nth) {
+            from_float(
+                reinterpret_cast<float *>(static_cast<char *>(activation->data) + i11 * nb11),
+                wdata + i11 * nbw1, ne10);
+        }
+
+        if (sync->quantize_arrivals.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
+            sync->quantize_ready.store(true, std::memory_order_release);
+        } else {
+            while (!sync->quantize_ready.load(std::memory_order_acquire)) {
+                ggml_repack_cpu_relax();
+            }
+        }
+
+        const int64_t first_groups = first->src[0]->ne[1] / NB_COLS;
+        const int64_t second_groups = second->src[0]->ne[1] / NB_COLS;
+        const int64_t total_groups = first_groups + second_groups;
+        // Give every thread one contiguous interval in the combined pair.
+        // Calling GEMV once per interleave group is functionally correct but
+        // destroys the native kernel's amortization and weight locality.
+        const int64_t combined_begin = (total_groups * ith) / nth;
+        const int64_t combined_end = (total_groups * (ith + 1)) / nth;
+        if (combined_begin < first_groups) {
+            const int64_t first_end = std::min(combined_end, first_groups);
+            forward_mul_mat_one_chunk_with_wdata(
+                first, combined_begin * NB_COLS, first_end * NB_COLS, workspace);
+        }
+        if (combined_end > first_groups) {
+            const int64_t second_begin = std::max(combined_begin, first_groups) - first_groups;
+            const int64_t second_end = combined_end - first_groups;
+            forward_mul_mat_one_chunk_with_wdata(
+                second, second_begin * NB_COLS, second_end * NB_COLS, workspace);
+        }
+        return 0;
     }
 
     void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
@@ -2069,6 +2300,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                        (int) NB_COLS, (int) INTER_SIZE);
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
+
+    int repack_pair(
+            struct ggml_tensor * first, const void * first_data, size_t first_size,
+            struct ggml_tensor * second, const void * second_data, size_t second_size) override {
+        GGML_LOG_DEBUG("%s: repack tensor pair %s + %s with %s_%dx%d\n", __func__,
+                       first->name, second->name, ggml_type_name(first->type),
+                       (int) NB_COLS, (int) INTER_SIZE);
+        return ggml::cpu::repack::repack_pair<BLOC_TYPE, INTER_SIZE, NB_COLS>(
+            first, first_data, first_size, second, second_data, second_size);
+    }
 };
 
 }  // namespace ggml::cpu::repack
@@ -2133,7 +2374,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 }
 
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
+    ggml_backend_cpu_repack_tensor_init(tensor);
 
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
@@ -2144,11 +2385,104 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
-    auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    auto OK = ggml_backend_cpu_repack_tensor(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
+}
+
+bool ggml_backend_cpu_repack_tensor_init(struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(
+        ggml_repack_get_optimal_repack_type(tensor));
+    return tensor->extra != nullptr;
+}
+
+bool ggml_backend_cpu_repack_tensor_compatible(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->extra == nullptr) {
+        return false;
+    }
+    return tensor->extra == ggml_repack_get_optimal_repack_type(tensor);
+}
+
+int ggml_backend_cpu_repack_tensor(
+        struct ggml_tensor * tensor, const void * data, size_t size) {
+    if (!ggml_backend_cpu_repack_tensor_compatible(tensor) || data == nullptr ||
+        size != ggml_nbytes(tensor)) {
+        return -1;
+    }
+    auto tensor_traits =
+        (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    return tensor_traits->repack(tensor, data, size);
+}
+
+bool ggml_backend_cpu_repack_tensor_pair_compatible(
+        const struct ggml_tensor * first, const struct ggml_tensor * second) {
+    if (!ggml_backend_cpu_repack_tensor_compatible(first) ||
+        !ggml_backend_cpu_repack_tensor_compatible(second) ||
+        first->extra != second->extra ||
+        first->type != GGML_TYPE_Q4_0 || second->type != GGML_TYPE_Q4_0 ||
+        first->ne[0] != second->ne[0]) {
+        return false;
+    }
+    return true;
+}
+
+int ggml_backend_cpu_repack_tensor_pair(
+        struct ggml_tensor * first, const void * first_data, size_t first_size,
+        struct ggml_tensor * second, const void * second_data, size_t second_size) {
+    if (!ggml_backend_cpu_repack_tensor_pair_compatible(first, second) ||
+        !first_data || !second_data || first_size != ggml_nbytes(first) ||
+        second_size != ggml_nbytes(second)) {
+        return -1;
+    }
+    auto * tensor_traits =
+        static_cast<ggml::cpu::repack::tensor_traits_base *>(first->extra);
+    return tensor_traits->repack_pair(
+        first, first_data, first_size, second, second_data, second_size);
+}
+
+bool ggml_backend_cpu_repack_mul_mat_pair_compatible(
+        const struct ggml_tensor * first, const struct ggml_tensor * second) {
+    if (!first || !second || !first->src[0] || !second->src[0] ||
+        !ggml_backend_cpu_repack_tensor_compatible(first->src[0]) ||
+        !ggml_backend_cpu_repack_tensor_compatible(second->src[0]) ||
+        first->src[0]->extra != second->src[0]->extra) {
+        return false;
+    }
+    const auto * tensor_traits =
+        static_cast<const ggml::cpu::repack::tensor_traits_base *>(first->src[0]->extra);
+    return tensor_traits->mul_mat_pair_compatible(first, second);
+}
+
+size_t ggml_backend_cpu_repack_mul_mat_pair_work_size(
+        const struct ggml_tensor * first, const struct ggml_tensor * second) {
+    if (!ggml_backend_cpu_repack_mul_mat_pair_compatible(first, second)) return 0;
+    const auto * tensor_traits =
+        static_cast<const ggml::cpu::repack::tensor_traits_base *>(first->src[0]->extra);
+    return tensor_traits->mul_mat_pair_work_size(first);
+}
+
+int ggml_backend_cpu_repack_mul_mat_pair_compute_thread(
+        struct ggml_tensor * first, struct ggml_tensor * second,
+        void * workspace, size_t workspace_size, int ith, int nth,
+        struct ggml_backend_cpu_repack_pair_sync * sync) {
+    if (!ggml_backend_cpu_repack_mul_mat_pair_compatible(first, second)) return -1;
+    const auto * tensor_traits =
+        static_cast<const ggml::cpu::repack::tensor_traits_base *>(first->src[0]->extra);
+    return tensor_traits->mul_mat_pair_compute_thread(
+        first, second, workspace, workspace_size, ith, nth, sync);
+}
+
+int ggml_backend_cpu_repack_row_alignment(const struct ggml_tensor * tensor) {
+    if (!ggml_backend_cpu_repack_tensor_compatible(tensor)) {
+        return 1;
+    }
+    const auto * tensor_traits =
+        (const ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    return tensor_traits->row_alignment();
 }
 
 static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -2184,8 +2518,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
-                op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
+                ggml_backend_cpu_repack_tensor_compatible(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
@@ -2200,8 +2533,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
-                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
+                && ggml_backend_cpu_repack_tensor_compatible(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
@@ -2218,7 +2550,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
-            if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+            if (op->src[0]->buffer &&
+                ggml_backend_cpu_repack_tensor_compatible(op->src[0])) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }
         }

@@ -11,34 +11,142 @@
 #include "plan_ir.h"
 #include "plan_executor.h"
 #include "plan_provider.h"
+#include "elastic_granularity.h"
+#if defined(GGML_USE_CPU_ELASTIC)
+#include "ggml-cpu-elastic.h"
+#endif
+#if defined(GGML_USE_OPENCL)
+#include "ggml-opencl.h"
+#endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 // Forward decls for use before file-scope definitions later in this TU.
 static size_t read_mem_available_mb();
+
+static void elastic_token_latency_record(
+        int32_t n_tokens, int64_t latency_us,
+        const std::vector<llama_token> & token_ids) {
+    const char * path = std::getenv("GGML_ELASTIC_TOKEN_CSV");
+    if (!path || !*path || n_tokens <= 0 || latency_us < 0) return;
+    struct token_csv_state {
+        std::mutex mutex;
+        FILE * file = nullptr;
+        std::string path;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        uint64_t sequence = 0;
+        ~token_csv_state() { if (file) std::fclose(file); }
+    };
+    static token_csv_state state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.file || state.path != path) {
+        if (state.file) std::fclose(state.file);
+        state.path = path;
+        state.file = std::fopen(path, "w");
+        state.start = std::chrono::steady_clock::now();
+        state.sequence = 0;
+        if (!state.file) {
+            LLAMA_LOG_ERROR("elastic token profile: failed to open %s\n", path);
+            return;
+        }
+        std::fprintf(state.file,
+                     "sequence,t_sec,budget_mib,n_tokens,latency_ms,"
+                     "resident_mib,resident_blocks,target_mib,reloads_total,evicts_total,token_ids\n");
+    }
+    const double t_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - state.start).count();
+    llama_working_set_runtime_state weights;
+    const bool have_weights = llama_working_set_query("weights", &weights);
+    const double resident_mib = have_weights
+        ? weights.resident_bytes / 1024.0 / 1024.0 : -1.0;
+    std::fprintf(state.file, "%llu,%.6f,%lld,%d,%.3f,%.3f,%d,%d,%llu,%llu,",
+                 (unsigned long long) state.sequence++, t_sec,
+                 (long long) llama_budget_query(), n_tokens, latency_us / 1000.0,
+                 resident_mib,
+                 have_weights ? weights.active_capacity : -1,
+                 have_weights ? weights.target_capacity : -1,
+                 (unsigned long long) (have_weights ? weights.misses : 0),
+                 (unsigned long long) (have_weights ? weights.capacity_changes : 0));
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        if (i > 0) std::fputc(';', state.file);
+        std::fprintf(state.file, "%d", token_ids[i]);
+    }
+    std::fputc('\n', state.file);
+    std::fflush(state.file);
+}
+
+static bool elastic_dynamic_runtime_cache_owns_weight(const std::string & name) {
+    static const std::vector<std::string> patterns = []() {
+        const char * active_env = std::getenv("LLAMA_ELASTIC_DYNAMIC_ACTIVE_EXPERTS");
+        const char * total_env  = std::getenv("LLAMA_ELASTIC_DYNAMIC_TOTAL_EXPERTS");
+        const double active = active_env && *active_env ? std::atof(active_env) : 0.0;
+        const double total  = total_env && *total_env ? std::atof(total_env) : 0.0;
+        if (!(active > 0.0 && total > active)) {
+            return std::vector<std::string>();
+        }
+
+        const char * pattern_env = std::getenv("LLAMA_ELASTIC_DYNAMIC_WEIGHT_PATTERN");
+        const std::string spec = pattern_env && *pattern_env ? pattern_env : "_exps.weight";
+        std::vector<std::string> out;
+        size_t pos = 0;
+        while (pos <= spec.size()) {
+            const size_t comma = spec.find(',', pos);
+            std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            item.erase(std::remove_if(item.begin(), item.end(), [](unsigned char c) { return std::isspace(c); }), item.end());
+            if (!item.empty()) out.push_back(std::move(item));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        return out;
+    }();
+    return std::any_of(patterns.begin(), patterns.end(), [&name](const std::string & pattern) {
+        return name.find(pattern) != std::string::npos;
+    });
+}
 
 static uint64_t elastic_mix_u64(uint64_t h, uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     return h;
 }
 
-static uint64_t elastic_plan_signature(const elastic::ExecPlan & p) {
+static uint64_t elastic_mix_stable_string(
+        uint64_t h, const std::string & value) {
+    h = elastic_mix_u64(h, value.size());
+    for (const unsigned char byte : value) {
+        h = elastic_mix_u64(h, byte);
+    }
+    return h;
+}
+
+// Signature of the graph-affecting core only. Working-set targets are runtime
+// resource patches and must not force graph invalidation when the weight
+// placement, routing and event schedule are unchanged.
+static uint64_t elastic_plan_core_signature(
+        const elastic::ExecPlan & p) {
     uint64_t h = 1469598103934665603ULL;
     h = elastic_mix_u64(h, p.weights.size());
     for (const auto & w : p.weights) {
         h = elastic_mix_u64(h, (uint64_t) w.weight_id);
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(w.name));
         h = elastic_mix_u64(h, (uint64_t) w.location);
         h = elastic_mix_u64(h, w.pinned ? 1ULL : 0ULL);
+        h = elastic_mix_u64(h, (uint64_t) w.xform);
     }
     h = elastic_mix_u64(h, p.ops.size());
     for (const auto & o : p.ops) {
         h = elastic_mix_u64(h, (uint64_t) o.op_id);
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(o.name));
+        h = elastic_mix_u64(h, (uint64_t) o.weight_id);
         h = elastic_mix_u64(h, (uint64_t) o.dispatch);
         h = elastic_mix_u64(h, (uint64_t) o.compute_backend);
         h = elastic_mix_u64(h, o.migrate ? 1ULL : 0ULL);
@@ -52,13 +160,65 @@ static uint64_t elastic_plan_signature(const elastic::ExecPlan & p) {
         h = elastic_mix_u64(h, (uint64_t) e.anchor_op_id);
         h = elastic_mix_u64(h, (uint64_t) e.from_loc);
         h = elastic_mix_u64(h, (uint64_t) e.to_loc);
+        h = elastic_mix_u64(h, (uint64_t) e.engine);
+        h = elastic_mix_u64(h, (uint64_t) e.overlap_group);
     }
+    h = elastic_mix_u64(
+        h, std::hash<std::string>{}(p.schedule_kind));
     h = elastic_mix_u64(h, p.schedule_events.size());
     for (const auto & e : p.schedule_events) {
         h = elastic_mix_u64(h, (uint64_t) e.weight_id);
+        h = elastic_mix_u64(h, (uint64_t) e.anchor_op_id);
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(e.weight_name));
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(e.choice));
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(e.kind));
+        h = elastic_mix_u64(
+            h, std::hash<std::string>{}(e.engine));
         h = elastic_mix_u64(h, (uint64_t) (e.start_ms * 1000.0));
         h = elastic_mix_u64(h, (uint64_t) (e.end_ms * 1000.0));
     }
+    return h;
+}
+
+static uint64_t elastic_working_unit_signature(
+        const elastic::ExecPlan & p) {
+    uint64_t h = 1469598103934665603ULL;
+    h = elastic_mix_u64(h, p.working_unit.enabled ? 1ULL : 0ULL);
+    if (p.working_unit.enabled) {
+        h = elastic_mix_stable_string(h, p.working_unit.mode);
+        h = elastic_mix_u64(
+            h, static_cast<uint64_t>(p.working_unit.cut_parts));
+        h = elastic_mix_u64(
+            h, static_cast<uint64_t>(p.working_unit.multi_tensors));
+        h = elastic_mix_u64(h, p.working_unit.units.size());
+        for (const auto & unit : p.working_unit.units) {
+            h = elastic_mix_u64(h, static_cast<uint64_t>(unit.unit_id));
+            h = elastic_mix_u64(h, unit.fuse_layout ? 1ULL : 0ULL);
+            h = elastic_mix_u64(h, unit.fuse_compute ? 1ULL : 0ULL);
+            h = elastic_mix_u64(h, unit.tiles.size());
+            for (const auto & tile : unit.tiles) {
+                h = elastic_mix_u64(h, static_cast<uint64_t>(tile.weight_id));
+                h = elastic_mix_stable_string(h, tile.weight_name);
+                h = elastic_mix_u64(
+                    h, static_cast<uint64_t>(tile.row_start));
+                h = elastic_mix_u64(
+                    h, static_cast<uint64_t>(tile.row_count));
+                h = elastic_mix_u64(
+                    h, static_cast<uint64_t>(tile.byte_offset));
+                h = elastic_mix_u64(
+                    h, static_cast<uint64_t>(tile.byte_size));
+            }
+        }
+    }
+    return h;
+}
+
+static uint64_t elastic_plan_signature(const elastic::ExecPlan & p) {
+    uint64_t h = elastic_plan_core_signature(p);
+    h = elastic_mix_u64(h, elastic_working_unit_signature(p));
     return h;
 }
 
@@ -489,6 +649,26 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (elastic_decode_wall_runs > 0) {
+        LLAMA_LOG_INFO(
+            "%s: elastic decode wall summary: runs=%" PRIu64
+            " wall_ms=%.3f\n",
+            __func__,
+            elastic_decode_wall_runs,
+            elastic_decode_wall_us_total / 1000.0);
+    }
+    if (elastic_provider_get_calls > 0 ||
+        elastic_runtime_apply_calls > 0) {
+        LLAMA_LOG_INFO(
+            "%s: elastic plan timing summary: provider_calls=%" PRIu64
+            " provider_get_ms=%.3f apply_calls=%" PRIu64
+            " apply_ms=%.3f\n",
+            __func__,
+            elastic_provider_get_calls,
+            elastic_provider_get_ms_total,
+            elastic_runtime_apply_calls,
+            elastic_runtime_apply_ms_total);
+    }
     if (elastic_anchor_requests > 0) {
         LLAMA_LOG_INFO("%s: elastic anchor summary: requests=%" PRIu64
                        " hits=%" PRIu64 " duplicate=%" PRIu64
@@ -531,12 +711,31 @@ llama_context::~llama_context() {
 void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
 
+    const int64_t elastic_decode_wall_us =
+        elastic_decode_wall_start_us > 0
+        ? ggml_time_us() - elastic_decode_wall_start_us : 0;
+    const int64_t elastic_eval_us = t_compute_start_us > 0
+        ? ggml_time_us() - t_compute_start_us : 0;
+    // Single-token CSV rows drive fixed-budget calibration and dynamic-trace
+    // coverage audits. Report the same full critical path used for ranking,
+    // while retaining the standard eval interval for prompt/multi-token rows.
+    const int64_t elastic_profile_latency_us =
+        n_queued_tokens == 1 && elastic_decode_wall_us > 0
+        ? elastic_decode_wall_us : elastic_eval_us;
+    elastic_token_latency_record(
+        n_queued_tokens, elastic_profile_latency_us,
+        elastic_queued_token_ids);
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
 
     // add the evaluation to the stats
     if (n_queued_tokens == 1) {
+        if (elastic_decode_wall_us > 0) {
+            elastic_decode_wall_us_total += elastic_decode_wall_us;
+            elastic_decode_wall_runs++;
+        }
         if (!cparams.no_perf) {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
@@ -555,7 +754,9 @@ void llama_context::synchronize() {
     }
 
     n_queued_tokens = 0;
+    elastic_queued_token_ids.clear();
     t_compute_start_us = 0;
+    elastic_decode_wall_start_us = 0;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1243,9 +1444,75 @@ void llama_context::elastic_install_runtime_dispatch() {
                    __func__, (int) elastic_runtime_route.size(), (int) elastic_migrate.size());
 }
 
+int llama_context::apply_working_set_patch(const elastic::ExecPlan * plan) {
+    if (!plan) return -1;
+    int changed = 0;
+    for (const auto & ws : plan->working_sets) {
+        if (ws.kind.empty()) continue;
+        int target = ws.target_capacity;
+        if (target >= 0) {
+            target = std::max(target, ws.min_capacity);
+            if (ws.max_capacity >= 0) target = std::min(target, ws.max_capacity);
+        }
+        llama_working_set_runtime_state current;
+        if (llama_working_set_query(ws.kind.c_str(), &current) && current.target_capacity == target) {
+            continue;
+        }
+        const int rc = llama_working_set_set_target(ws.kind.c_str(), target);
+        if (rc == 0) {
+            changed++;
+            LLAMA_LOG_INFO("%s: kind=%s target=%d budget_ceiling=%d\n",
+                           __func__, ws.kind.c_str(), target, ws.budget_capacity);
+        }
+        if (rc != 0 && rc != -2) {
+            LLAMA_LOG_WARN("%s: working_set=%s target=%d apply rc=%d\n",
+                           __func__, ws.kind.c_str(), target, rc);
+        }
+    }
+    return changed;
+}
+
+bool llama_context::working_set_replan_needed(const elastic::ExecPlan * plan) {
+    if (!plan) return false;
+    static const double miss_rate_threshold = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_WORKING_SET_GROW_MISS_RATE");
+        return e && *e ? std::max(0.0, std::atof(e)) : 0.15;
+    }();
+    for (const auto & ws : plan->working_sets) {
+        if (ws.kind.empty()) continue;
+        llama_working_set_runtime_state state;
+        if (!llama_working_set_query(ws.kind.c_str(), &state)) continue;
+        const int ceiling = ws.budget_capacity >= 0 ? ws.budget_capacity : ws.target_capacity;
+        auto & previous = elastic_working_set_replan_counters[ws.kind];
+        const uint64_t delta_accesses = state.accesses >= previous.first ? state.accesses - previous.first : 0;
+        const uint64_t delta_misses = state.misses >= previous.second ? state.misses - previous.second : 0;
+        previous = {state.accesses, state.misses};
+        const double miss_rate = delta_accesses ? (double) delta_misses / delta_accesses : 0.0;
+        if (state.active_capacity >= 0 && ceiling >= 0 &&
+            state.active_capacity < ceiling && state.observed_required_capacity > state.active_capacity) {
+            return true;
+        }
+        if (state.active_capacity >= 0 && state.active_capacity < ceiling &&
+            miss_rate >= miss_rate_threshold) {
+            return true;
+        }
+        if (state.active_capacity > ceiling && state.observed_required_capacity > 0 &&
+            state.observed_required_capacity < state.active_capacity) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     if (!plan) return -1;
 
+    const bool frontier_only_plan_change =
+        elastic_last_applied &&
+        elastic_plan_core_signature(*elastic_last_applied) ==
+            elastic_plan_core_signature(*plan) &&
+        elastic_plan_signature(*elastic_last_applied) !=
+            elastic_plan_signature(*plan);
     static const bool sync_before_apply = []() {
         const char * e = std::getenv("LLAMA_ELASTIC_SYNC_BEFORE_APPLY");
         return !(e && *e && *e == '0');
@@ -1254,19 +1521,187 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
         ggml_backend_sched_synchronize(sched.get());
     }
 
-    // Backend id convention for elastic compute routing:
-    // CPU means the real CPU compute backend, while CPU_Elastic is only a
-    // storage/buffer path for elastic weights and must not be used as the
-    // target for planned CPU MUL_MAT ops.
+    const auto t_frontier_publish0 = std::chrono::steady_clock::now();
+    int frontier_delta_weights = 0;
+    double frontier_publish_ms = 0.0;
+    if (plan->working_unit.enabled) {
+        elastic::granularity_config config;
+        if (!elastic::granularity_mode_from_string(
+                plan->working_unit.mode.c_str(), config.mode)) {
+            LLAMA_LOG_ERROR(
+                "%s: invalid working_unit.mode=%s\n",
+                __func__, plan->working_unit.mode.c_str());
+            return -2;
+        }
+        config.cut_parts = std::max(2, plan->working_unit.cut_parts);
+        config.multi_tensors =
+            std::max(2, plan->working_unit.multi_tensors);
+        config.explicitly_enabled = true;
+        std::vector<std::pair<std::string, llama_weight_unit_slice>>
+            published_slices;
+        for (const auto & unit : plan->working_unit.units) {
+            if (unit.unit_id < 0) {
+                LLAMA_LOG_ERROR(
+                    "%s: invalid negative working-unit id\n", __func__);
+                return -3;
+            }
+            uint32_t flags = 0;
+            if (unit.fuse_layout) {
+                flags |= LLAMA_WEIGHT_UNIT_FUSE_LAYOUT;
+            }
+            if (unit.fuse_compute) {
+                flags |= LLAMA_WEIGHT_UNIT_FUSE_COMPUTE;
+            }
+            for (const auto & tile : unit.tiles) {
+                const elastic::WeightPlan * weight =
+                    tile.weight_id >= 0
+                        ? plan->weight_by_id(tile.weight_id)
+                        : nullptr;
+                const std::string & name =
+                    !tile.weight_name.empty()
+                        ? tile.weight_name
+                        : (weight ? weight->name : tile.weight_name);
+                if (name.empty()) {
+                    LLAMA_LOG_ERROR(
+                        "%s: working-unit %d has tile without a valid weight\n",
+                        __func__, unit.unit_id);
+                    return -4;
+                }
+                llama_weight_unit_slice slice;
+                slice.row_start = tile.row_start;
+                slice.row_count = tile.row_count;
+                slice.unit_id = unit.unit_id;
+                slice.flags = flags;
+                published_slices.emplace_back(name, slice);
+            }
+        }
+        elastic::granularity_runtime_apply(config);
+        frontier_delta_weights =
+            llama_weight_unit_plan_replace(published_slices);
+        const auto t_frontier_publish1 =
+            std::chrono::steady_clock::now();
+        frontier_publish_ms =
+            std::chrono::duration<double, std::milli>(
+                t_frontier_publish1 - t_frontier_publish0).count();
+        size_t multi_units = 0;
+        size_t tensor_units = 0;
+        size_t cut_units = 0;
+        for (const auto & unit : plan->working_unit.units) {
+            if (unit.tiles.empty()) {
+                continue;
+            }
+            const auto & first = unit.tiles.front();
+            const bool same_weight = std::all_of(
+                unit.tiles.begin() + 1, unit.tiles.end(),
+                [&first](const elastic::WorkingUnitTilePlan & tile) {
+                    if (first.weight_id >= 0 && tile.weight_id >= 0) {
+                        return tile.weight_id == first.weight_id;
+                    }
+                    return tile.weight_name == first.weight_name;
+                });
+            if (!same_weight) {
+                ++multi_units;
+            } else if (unit.tiles.size() == 1 &&
+                       unit.tiles.front().row_count >= 0) {
+                ++cut_units;
+            } else {
+                ++tensor_units;
+            }
+        }
+        LLAMA_LOG_INFO(
+            "%s: working_unit mode=%s cut_parts=%d multi_tensors=%d "
+            "policy=%s state_aware=%d predicted_ms=%.3f switch_ms=%.3f "
+            "frontier_sig=%016llx "
+            "mixed_units=%zu multi_units=%zu tensor_units=%zu cut_units=%zu "
+            "tiles=%zu publish_ms=%.6f delta_weights=%d generation=%llu\n",
+            __func__, plan->working_unit.mode.c_str(),
+            config.cut_parts, config.multi_tensors,
+            plan->working_unit.policy.c_str(),
+            plan->working_unit.state_aware ? 1 : 0,
+            plan->working_unit.predicted_ms,
+            plan->working_unit.switch_cost_ms,
+            (unsigned long long)
+                elastic_working_unit_signature(*plan),
+            plan->working_unit.units.size(),
+            multi_units, tensor_units, cut_units, published_slices.size(),
+            frontier_publish_ms,
+            frontier_delta_weights,
+            (unsigned long long) llama_weight_unit_plan_generation());
+    } else {
+        elastic::granularity_runtime_clear();
+        const std::vector<std::pair<
+            std::string, llama_weight_unit_slice>> no_slices;
+        frontier_delta_weights =
+            llama_weight_unit_plan_replace(no_slices);
+        const auto t_frontier_publish1 =
+            std::chrono::steady_clock::now();
+        frontier_publish_ms =
+            std::chrono::duration<double, std::milli>(
+                t_frontier_publish1 - t_frontier_publish0).count();
+        LLAMA_LOG_INFO(
+            "%s: cleared working-unit frontier publish_ms=%.6f "
+            "delta_weights=%d generation=%llu\n",
+            __func__, frontier_publish_ms, frontier_delta_weights,
+            (unsigned long long) llama_weight_unit_plan_generation());
+    }
+
+    if (frontier_only_plan_change) {
+        // Placement, dispatch, event schedule, and physical buffers are
+        // unchanged. Backends query the working-unit map at graph entry, so
+        // publishing its changed subtrees does not require executor
+        // reconciliation or graph reconstruction.
+        elastic_plan = plan;
+        apply_working_set_patch(plan);
+        elastic_last_applied = plan;
+        elastic_last_plan_signature = elastic_plan_signature(*plan);
+        elastic_last_provider_budget_mib = plan->budget_mib;
+        elastic_last_provider_plan = plan;
+        LLAMA_LOG_INFO(
+            "%s: applied frontier-only delta_weights=%d budget=%lldMiB "
+            "without graph invalidation\n",
+            __func__, frontier_delta_weights,
+            (long long) plan->budget_mib);
+        return 0;
+    }
+
+    // Backend id convention for elastic compute routing. Production
+    // heterogeneous plans keep CPU on the ordinary CPU backend. A controlled
+    // CPU_Elastic-only granularity experiment must route planned MUL_MAT ops
+    // through CPU_Elastic itself; otherwise the plan carries working units but
+    // every planned operator bypasses their pipeline implementation.
     if (elastic_cpu_id < 0) {
         elastic_cpu_id = (int) backends.size() - 1;
+        int cpu_elastic_id = -1;
         for (size_t i = 0; i < backends.size(); i++) {
             if (backends[i].get() == backend_cpu) {
                 elastic_cpu_id = (int) i;
-            } else if (backends[i].get() != backend_cpu && elastic_gpu_id < 0) {
+            }
+            const char * backend_name = ggml_backend_name(backends[i].get());
+            if (backend_name &&
+                std::strcmp(backend_name, "CPU_Elastic") == 0) {
+                cpu_elastic_id = (int) i;
+            }
+            ggml_backend_dev_t dev =
+                ggml_backend_get_device(backends[i].get());
+            if (dev && ggml_backend_dev_type(dev) ==
+                    GGML_BACKEND_DEVICE_TYPE_GPU &&
+                elastic_gpu_id < 0) {
                 elastic_gpu_id = (int) i;
             }
         }
+        const char * route_cpu_elastic =
+            std::getenv("LLAMA_ELASTIC_ROUTE_CPU_ELASTIC");
+        if (route_cpu_elastic && *route_cpu_elastic &&
+            *route_cpu_elastic != '0' && cpu_elastic_id >= 0) {
+            elastic_cpu_id = cpu_elastic_id;
+        }
+        LLAMA_LOG_INFO(
+            "%s: elastic route ids cpu=%d(%s) gpu=%d\n",
+            __func__, elastic_cpu_id,
+            elastic_cpu_id >= 0
+                ? ggml_backend_name(backends[elastic_cpu_id].get())
+                : "none",
+            elastic_gpu_id);
     }
 
     // 懒建 executor + sinks(桥接到真实 WBM 全局 registry + route 表)。
@@ -1276,6 +1711,7 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
         sinks.set_resident = [this](int wid, bool want) {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
             if (!w) return;
+            if (elastic_dynamic_runtime_cache_owns_weight(w->name)) return;
             llama_weight_runtime_location desired = LLAMA_WEIGHT_RUNTIME_DISK;
             switch (w->location) {
                 case elastic::Location::CPU:  desired = LLAMA_WEIGHT_RUNTIME_CPU;  break;
@@ -1310,6 +1746,7 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
         sinks.is_resident = [this](int wid) -> bool {
             const elastic::WeightPlan * w = elastic_plan ? elastic_plan->weight_by_id(wid) : nullptr;
             if (!w) return false;
+            if (elastic_dynamic_runtime_cache_owns_weight(w->name)) return false;
             return llama_weight_residency_query(w->name.c_str());
         };
         sinks.set_op_backend = [this](int op_id, elastic::Backend be) {
@@ -1535,6 +1972,9 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     }();
     elastic_mru_cache_enabled = mru_cache_env;
     for (const auto & w : plan->weights) {
+        if (elastic_dynamic_runtime_cache_owns_weight(w.name)) {
+            continue;
+        }
         llama_weight_runtime_location desired = LLAMA_WEIGHT_RUNTIME_DISK;
         switch (w.location) {
             case elastic::Location::CPU:  desired = LLAMA_WEIGHT_RUNTIME_CPU;  break;
@@ -1549,7 +1989,8 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     }();
     if (force_reconcile) {
         for (const auto & w : plan->weights) {
-            if (w.name.empty() || w.location == elastic::Location::GPU) {
+            if (w.name.empty() || w.location == elastic::Location::GPU ||
+                elastic_dynamic_runtime_cache_owns_weight(w.name)) {
                 continue;
             }
             const int rc = llama_weight_movement_request(w.name.c_str(), /*evict=*/true);
@@ -1570,6 +2011,11 @@ int llama_context::apply_exec_plan(const elastic::ExecPlan * plan) {
     elastic_anchor_fired.clear();
     elastic::ReconcileStats st = elastic_executor->apply(*plan);
     elastic_mru_cache_reset();
+
+    // A dynamic working-set increase may borrow memory from Movable weights.
+    // Reconcile/evict the core plan first so the backend never observes a
+    // transient over-budget state while growing that working set.
+    apply_working_set_patch(plan);
 
     // RUNTIME-dispatch op:executor 不灌 static route,改由 op_runtime_dispatch hook
     // 在 compute 时查表(D2b-runtime,M5)。这里收集 name → backend_id。
@@ -1684,9 +2130,14 @@ void llama_context::maybe_apply_plan() {
         return v > 0 ? (uint64_t) v : (uint64_t) 0;
     }();
 
-    // 档没变 → 0 开销。callback no-cache 也默认按 budget 档防抖,避免稳定低预算
+    const bool working_set_pressure = working_set_replan_needed(elastic_last_applied);
+    const bool provider_poll_needed = elastic_provider->needs_poll(B);
+
+    // 档没变且动态 working set 没有新压力 → 0 开销。callback no-cache 也默认按 budget 档防抖,避免稳定低预算
     // 下每 token 重复生成/应用同一份 stage plan；需要复现旧行为时可打开上面的 env。
     if (elastic_last_applied && B == elastic_last_applied->budget_mib &&
+        !working_set_pressure &&
+        !provider_poll_needed &&
         (!callback_no_cache || !callback_apply_same_budget)) {
         elastic_pending_budget_mib = -1;
         elastic_pending_budget_hits = 0;
@@ -1694,36 +2145,9 @@ void llama_context::maybe_apply_plan() {
     }
     if (elastic_last_applied && elastic_last_provider_plan == elastic_last_applied &&
         elastic_last_provider_budget_mib == B &&
+        !working_set_pressure &&
+        !provider_poll_needed &&
         (!callback_no_cache || !callback_apply_same_budget)) {
-        return;
-    }
-
-    // Budget traces can oscillate around adjacent buckets. Re-applying a plan
-    // invalidates the graph and may schedule reload/xform work, so require the
-    // new bucket to survive a few decode ticks before switching away from an
-    // already running plan. The first plan is still applied immediately.
-    const bool upward_slew_recovery =
-        elastic_last_applied && budget_up_step_mib > 0 && B > elastic_last_applied->budget_mib;
-    if (elastic_last_applied && switch_stable_steps > 1 && !upward_slew_recovery) {
-        if (elastic_pending_budget_mib != B) {
-            elastic_pending_budget_mib = B;
-            elastic_pending_budget_hits = 1;
-        } else {
-            elastic_pending_budget_hits++;
-        }
-        if (elastic_pending_budget_hits < switch_stable_steps) {
-            LLAMA_LOG_INFO("%s: budget=%lldMiB pending switch hit=%d/%d, keep plan(budget_mib=%lld)\n",
-                           __func__, (long long) B, elastic_pending_budget_hits, switch_stable_steps,
-                           (long long) elastic_last_applied->budget_mib);
-            return;
-        }
-    }
-    if (elastic_last_applied && switch_min_gap_steps > 0 &&
-        decode_step > elastic_last_switch_decode_step &&
-        decode_step - elastic_last_switch_decode_step < switch_min_gap_steps) {
-        LLAMA_LOG_INFO("%s: budget=%lldMiB switch suppressed by min_gap=%llu steps, keep plan(budget_mib=%lld)\n",
-                       __func__, (long long) B, (unsigned long long) switch_min_gap_steps,
-                       (long long) elastic_last_applied->budget_mib);
         return;
     }
 
@@ -1731,6 +2155,8 @@ void llama_context::maybe_apply_plan() {
     const elastic::ExecPlan * p = elastic_provider->get(B, 0, 0);
     const auto t_get1 = std::chrono::steady_clock::now();
     const double provider_get_ms = std::chrono::duration<double, std::milli>(t_get1 - t_get0).count();
+    elastic_provider_get_calls++;
+    elastic_provider_get_ms_total += provider_get_ms;
     static const bool trace_plan_apply = []() {
         const char * e = std::getenv("LLAMA_ELASTIC_PLAN_TRACE");
         return e && *e && *e != 0;
@@ -1747,6 +2173,52 @@ void llama_context::maybe_apply_plan() {
                        __func__, (long long) B, (long long) p->budget_mib,
                        (int) p->weights.size(), (int) p->ops.size(),
                        (int) p->timeline.size(), (int) p->schedule_events.size(), provider_get_ms);
+    }
+
+    const bool working_set_coupled_to_core = std::any_of(
+        p->working_sets.begin(), p->working_sets.end(),
+        [](const elastic::WorkingSetPlan & ws) { return ws.coupled_to_core; });
+
+    // Standalone dynamic-resource patches are cheap and do not change graph
+    // routing. Coupled patches must be applied atomically by apply_exec_plan:
+    // first reconcile Movable weights, then resize the Dynamic working set.
+    const int working_set_changes = working_set_coupled_to_core ? 0 : apply_working_set_patch(p);
+
+    const bool downward_memory_pressure =
+        elastic_last_applied && B < elastic_last_applied->budget_mib;
+
+    // Budget traces can oscillate around adjacent buckets. Re-applying a full
+    // plan invalidates the graph, so debounce that expensive part only when
+    // holding the current plan is memory-safe. A downward budget transition
+    // is a hard constraint and must evict/apply immediately.
+    const bool upward_slew_recovery =
+        elastic_last_applied && budget_up_step_mib > 0 && B > elastic_last_applied->budget_mib;
+    if (elastic_last_applied && switch_stable_steps > 1 &&
+        !downward_memory_pressure && !upward_slew_recovery &&
+        !working_set_coupled_to_core) {
+        if (elastic_pending_budget_mib != B) {
+            elastic_pending_budget_mib = B;
+            elastic_pending_budget_hits = 1;
+        } else {
+            elastic_pending_budget_hits++;
+        }
+        if (elastic_pending_budget_hits < switch_stable_steps) {
+            LLAMA_LOG_INFO("%s: budget=%lldMiB working_set_changes=%d pending full switch hit=%d/%d, keep plan(budget_mib=%lld)\n",
+                           __func__, (long long) B, working_set_changes,
+                           elastic_pending_budget_hits, switch_stable_steps,
+                           (long long) elastic_last_applied->budget_mib);
+            return;
+        }
+    }
+    if (elastic_last_applied && !downward_memory_pressure && !working_set_coupled_to_core &&
+        switch_min_gap_steps > 0 &&
+        decode_step > elastic_last_switch_decode_step &&
+        decode_step - elastic_last_switch_decode_step < switch_min_gap_steps) {
+        LLAMA_LOG_INFO("%s: budget=%lldMiB working_set_changes=%d full switch suppressed by min_gap=%llu steps, keep plan(budget_mib=%lld)\n",
+                       __func__, (long long) B, working_set_changes,
+                       (unsigned long long) switch_min_gap_steps,
+                       (long long) elastic_last_applied->budget_mib);
+        return;
     }
     // 指针相同(table 同档同指针) 或 provider 量化到同 budget 档时,只更新指针。
     if (p == elastic_last_applied) {
@@ -1772,7 +2244,14 @@ void llama_context::maybe_apply_plan() {
         return;
     }
     const auto t_apply0 = std::chrono::steady_clock::now();
-    apply_exec_plan(p);
+    const int apply_rc = apply_exec_plan(p);
+    if (apply_rc != 0) {
+        LLAMA_LOG_ERROR(
+            "%s: apply_exec_plan failed budget=%lldMiB "
+            "plan_budget=%lldMiB rc=%d; retaining previous plan\n",
+            __func__, (long long) B, (long long) p->budget_mib, apply_rc);
+        return;
+    }
     static const bool reset_budget_after_online_apply = []() {
         const char * e = std::getenv("LLAMA_ELASTIC_RESET_BUDGET_AFTER_ONLINE_APPLY");
         // A runtime plan switch must not restart a replayed budget trace. Doing so
@@ -1785,6 +2264,8 @@ void llama_context::maybe_apply_plan() {
     }
     const auto t_apply1 = std::chrono::steady_clock::now();
     const double apply_ms = std::chrono::duration<double, std::milli>(t_apply1 - t_apply0).count();
+    elastic_runtime_apply_calls++;
+    elastic_runtime_apply_ms_total += apply_ms;
     elastic_last_applied = p;
     elastic_last_plan_signature = sig;
     elastic_last_provider_budget_mib = B;
@@ -2171,6 +2652,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     embd_seq.clear();
 
     n_queued_tokens += n_tokens;
+    if (batch_inp.token) {
+        elastic_queued_token_ids.insert(
+            elastic_queued_token_ids.end(), batch_inp.token,
+            batch_inp.token + batch_inp.n_tokens);
+    }
 
     // reserve output buffer
     if (output_reserve(n_tokens) < n_tokens) {
@@ -2300,6 +2786,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
+    // Include scheduler and online plan-selection/apply work in an independent
+    // end-to-end wall-clock measurement.  synchronize() closes this interval
+    // at the same point at which logits become consumable.
+    if (elastic_decode_wall_start_us == 0) {
+        elastic_decode_wall_start_us = ggml_time_us();
+    }
+
     // Runtime scheduler hook — observes MemAvailable + fires user callback when
     // delta ≥ threshold. Scheduler can mutate op_schedule_fn / call
     // llama_weight_request_prefetch/_evict to influence this decode + next.
@@ -2362,6 +2855,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
+    if (batch_inp.token) {
+        elastic_queued_token_ids.insert(
+            elastic_queued_token_ids.end(), batch_inp.token,
+            batch_inp.token + batch_inp.n_tokens);
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
@@ -2830,6 +3328,10 @@ ggml_status llama_context::graph_compute(
         const char * e = std::getenv("LLAMA_ELASTIC_PRELOAD_DISK_WEIGHTS_PER_GRAPH");
         return e && *e && *e != '0';
     }();
+    static const bool force_plan_evict = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_FORCE_PLAN_EVICT");
+        return e && *e && *e != '0';
+    }();
     if (repeat_elastic_anchors_per_graph && elastic_executor) {
         if (elastic_executor->defer_stage_events()) {
             elastic_anchor_fired.clear();
@@ -2837,7 +3339,9 @@ ggml_status llama_context::graph_compute(
         if ((evict_disk_weights_per_graph || preload_disk_weights_per_graph) && elastic_plan) {
             for (const auto & w : elastic_plan->weights) {
                 if (w.location != elastic::Location::DISK || w.pinned || w.name.empty()) continue;
-                if (evict_disk_weights_per_graph && llama_weight_residency_query(w.name.c_str())) {
+                if (evict_disk_weights_per_graph &&
+                    (force_plan_evict ||
+                     llama_weight_residency_query(w.name.c_str()))) {
                     int rc = llama_weight_movement_request(w.name.c_str(), /*evict=*/true);
                     if (rc == 0) {
                         llama_weight_runtime_mark_resident(w.name.c_str(), LLAMA_WEIGHT_RUNTIME_DISK);
@@ -2854,11 +3358,15 @@ ggml_status llama_context::graph_compute(
         }
     }
 
-    if (backend_cpu != nullptr) {
-        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+    // Attach llama's persistent threadpool to every CPU-like backend that
+    // explicitly exposes the setter.  CPU_Elastic wraps a real CPU delegate;
+    // attaching only backend_cpu left that delegate on a disposable default
+    // threadpool for every fine-grained sub-graph.
+    for (const auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
-            set_threadpool_fn(backend_cpu, tp);
+            set_threadpool_fn(backend.get(), tp);
         }
     }
 
@@ -3549,6 +4057,9 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    elastic_decode_wall_start_us = 0;
+    elastic_decode_wall_runs = 0;
+    elastic_decode_wall_us_total = 0;
 }
 
 std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context::memory_breakdown() const {
@@ -4075,6 +4586,10 @@ int llama_context::elastic_enable(const char * provider_kind, const char * plans
     elastic_last_applied = nullptr;
     elastic_last_provider_plan = nullptr;
     elastic_last_provider_budget_mib = -1;
+    elastic_provider_get_calls = 0;
+    elastic_provider_get_ms_total = 0.0;
+    elastic_runtime_apply_calls = 0;
+    elastic_runtime_apply_ms_total = 0.0;
     LLAMA_LOG_INFO("%s: elastic enabled (provider=%s)\n", __func__, kind.c_str());
     return 0;
 }
@@ -4142,6 +4657,143 @@ int llama_weight_get_state(llama_context * /*ctx*/, const char * tensor_name,
         out_state->flags |= LLAMA_ELASTIC_WEIGHT_DISK_AVAILABLE;
     }
     return 0;
+}
+
+int llama_working_set_get_state(llama_context * /*ctx*/, const char * kind,
+                                struct llama_working_set_state * out_state) {
+    if (!kind || !out_state) return -1;
+    llama_working_set_runtime_state state;
+    if (!llama_working_set_query(kind, &state)) return -2;
+    out_state->active_capacity = state.active_capacity;
+    out_state->pending_capacity = state.pending_capacity;
+    out_state->target_capacity = state.target_capacity;
+    out_state->observed_required_capacity = state.observed_required_capacity;
+    out_state->accesses = state.accesses;
+    out_state->hits = state.hits;
+    out_state->misses = state.misses;
+    out_state->capacity_changes = state.capacity_changes;
+    out_state->resident_bytes = state.resident_bytes;
+    return 0;
+}
+
+int llama_context::granularity_get_state(
+        struct llama_granularity_runtime_state * out_state) const {
+    if (!out_state) return -1;
+    *out_state = {};
+    out_state->backend = -1;
+#if defined(GGML_USE_OPENCL)
+    for (const auto & owned : backends) {
+        ggml_backend_t backend = owned.get();
+        if (!ggml_backend_is_opencl(backend)) continue;
+        ggml_backend_opencl_granularity_state state{};
+        if (!ggml_backend_opencl_get_granularity_state(
+                backend, &state)) continue;
+        out_state->backend = 1;
+        out_state->mode = state.mode;
+        out_state->units = state.units;
+        out_state->nonresident_units = state.nonresident_units;
+        out_state->pipeline_issued = state.pipeline_issued;
+        out_state->pipeline_ready = state.pipeline_ready;
+        out_state->pipeline_waits = state.pipeline_waits;
+        out_state->pipeline_wait_us = state.pipeline_wait_us;
+        out_state->reloads = state.reloads;
+        out_state->reload_bytes = state.reload_bytes;
+        out_state->prepare_us = state.prepare_us;
+        out_state->direct_read_calls = state.direct_read_calls;
+        out_state->direct_read_us = state.direct_read_us;
+        out_state->direct_read_bytes = state.direct_read_bytes;
+        out_state->load_calls = state.load_calls;
+        out_state->load_us = state.load_us;
+        out_state->load_bytes = state.load_bytes;
+        out_state->prepare_calls = state.prepare_calls;
+        out_state->prepare_bytes = state.prepare_bytes;
+        out_state->compute_calls = state.compute_calls;
+        out_state->compute_us = state.compute_us;
+        out_state->compute_timing_available =
+            state.compute_timing_available;
+        out_state->pipeline_residency_us =
+            state.pipeline_residency_us;
+        out_state->pipeline_unissued_us = state.pipeline_unissued_us;
+        out_state->pipeline_stage_us = state.pipeline_stage_us;
+        out_state->pipeline_retire_us = state.pipeline_retire_us;
+        out_state->evict_us = state.evict_us;
+        out_state->resident_bytes = state.resident_bytes;
+        return 0;
+    }
+#endif
+#if defined(GGML_USE_CPU_ELASTIC)
+    for (const auto & owned : backends) {
+        ggml_backend_t backend = owned.get();
+        if (!ggml_backend_is_cpu_elastic(backend)) continue;
+        ggml_backend_elastic_granularity_state state{};
+        if (!ggml_backend_cpu_elastic_get_granularity_state(
+                backend, &state)) continue;
+        out_state->backend = 0;
+        out_state->mode = state.mode;
+        out_state->units = state.units;
+        out_state->nonresident_units = state.nonresident_units;
+        out_state->pipeline_issued = state.pipeline_issued;
+        out_state->pipeline_ready = state.pipeline_ready;
+        out_state->pipeline_waits = state.pipeline_waits;
+        out_state->pipeline_wait_us = state.pipeline_wait_us;
+        out_state->reloads = state.reloads;
+        out_state->reload_bytes = state.reload_bytes;
+        out_state->prepare_us = state.prepare_us;
+        out_state->direct_read_calls = state.direct_read_calls;
+        out_state->direct_read_us = state.direct_read_us;
+        out_state->direct_read_bytes = state.direct_read_bytes;
+        out_state->load_calls = state.load_calls;
+        out_state->load_us = state.load_us;
+        out_state->load_bytes = state.load_bytes;
+        out_state->prepare_calls = state.prepare_calls;
+        out_state->prepare_bytes = state.prepare_bytes;
+        out_state->compute_calls = state.compute_calls;
+        out_state->compute_us = state.compute_us;
+        out_state->compute_timing_available =
+            state.compute_timing_available;
+        out_state->pipeline_residency_us =
+            state.pipeline_residency_us;
+        out_state->pipeline_unissued_us = state.pipeline_unissued_us;
+        out_state->pipeline_stage_us = state.pipeline_stage_us;
+        out_state->pipeline_retire_us = state.pipeline_retire_us;
+        out_state->evict_us = state.evict_us;
+        out_state->resident_bytes = state.resident_bytes;
+        return 0;
+    }
+#endif
+    return -2;
+}
+
+int llama_context::granularity_synchronize_pipeline() {
+#if defined(GGML_USE_OPENCL)
+    for (const auto & owned : backends) {
+        ggml_backend_t backend = owned.get();
+        if (ggml_backend_is_opencl(backend) &&
+            ggml_backend_opencl_synchronize_elastic_pipeline(backend)) {
+            return 0;
+        }
+    }
+#endif
+#if defined(GGML_USE_CPU_ELASTIC)
+    for (const auto & owned : backends) {
+        ggml_backend_t backend = owned.get();
+        if (ggml_backend_is_cpu_elastic(backend) &&
+            ggml_backend_cpu_elastic_synchronize_pipeline(backend)) {
+            return 0;
+        }
+    }
+#endif
+    return -2;
+}
+
+int llama_granularity_get_state(
+        llama_context * ctx,
+        struct llama_granularity_runtime_state * out_state) {
+    return ctx ? ctx->granularity_get_state(out_state) : -1;
+}
+
+int llama_granularity_synchronize_pipeline(llama_context * ctx) {
+    return ctx ? ctx->granularity_synchronize_pipeline() : -1;
 }
 
 int llama_weight_request_prefetch(llama_context * /*ctx*/, const char * tensor_name) {

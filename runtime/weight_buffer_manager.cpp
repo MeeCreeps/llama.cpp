@@ -23,10 +23,12 @@ int wbm_init(weight_buffer_manager *wbm, int n_blocks) {
         wbm->blocks[i].backend_handle  = nullptr;
         wbm->blocks[i].last_use_event  = nullptr;
         wbm->blocks[i].prefetch_event  = nullptr;
+        wbm->blocks[i].eviction_group  = -1;
     }
     wbm->current_token  = 0;
     wbm->n_resident     = 0;
     wbm->resident_bytes = 0;
+    wbm->eviction_groups.clear();
     return 0;
 }
 
@@ -44,6 +46,7 @@ int wbm_add_block(weight_buffer_manager *wbm, void *host_ptr, size_t byte_size) 
     b.backend_handle  = nullptr;
     b.last_use_event  = nullptr;
     b.prefetch_event  = nullptr;
+    b.eviction_group  = -1;
     return idx;
 }
 
@@ -60,6 +63,7 @@ int wbm_register_block(weight_buffer_manager *wbm,
     b.last_use_event = nullptr;
     b.prefetch_event = nullptr;
     b.last_used_token = 0;
+    b.eviction_group = -1;
     return 0;
 }
 
@@ -116,14 +120,78 @@ void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned) {
     wbm->blocks[idx].is_pinned = pinned;
 }
 
+void wbm_clear_eviction_groups(weight_buffer_manager *wbm) {
+    if (!wbm) return;
+    for (block_meta & block : wbm->blocks) {
+        block.eviction_group = -1;
+    }
+    wbm->eviction_groups.clear();
+}
+
+void wbm_set_eviction_group(weight_buffer_manager *wbm,
+                            int idx,
+                            int64_t group_id) {
+    if (!wbm) return;
+    if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) return;
+    block_meta & block = wbm->blocks[idx];
+    if (block.eviction_group == group_id) return;
+    if (block.eviction_group >= 0) {
+        auto found = wbm->eviction_groups.find(block.eviction_group);
+        if (found != wbm->eviction_groups.end()) {
+            auto & members = found->second;
+            members.erase(
+                std::remove(members.begin(), members.end(), idx),
+                members.end());
+            if (members.empty()) {
+                wbm->eviction_groups.erase(found);
+            }
+        }
+    }
+    block.eviction_group = group_id;
+    if (group_id >= 0) {
+        wbm->eviction_groups[group_id].push_back(idx);
+    }
+}
+
+static bool wbm_group_can_evict(const weight_buffer_manager * wbm,
+                                int candidate,
+                                int exclude_idx) {
+    if (!wbm || candidate < 0 ||
+        static_cast<size_t>(candidate) >= wbm->blocks.size()) {
+        return false;
+    }
+    const block_meta & selected = wbm->blocks[candidate];
+    if (!selected.resident || selected.is_pinned ||
+        candidate == exclude_idx) {
+        return false;
+    }
+    if (selected.eviction_group < 0) return true;
+    const auto found =
+        wbm->eviction_groups.find(selected.eviction_group);
+    if (found == wbm->eviction_groups.end()) return true;
+    for (int idx : found->second) {
+        if (idx < 0 || static_cast<size_t>(idx) >= wbm->blocks.size()) {
+            continue;
+        }
+        const block_meta & block = wbm->blocks[idx];
+        if (!block.resident ||
+            block.eviction_group != selected.eviction_group) {
+            continue;
+        }
+        if (block.is_pinned || block.block_idx == exclude_idx) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
     if (!wbm) return -1;
     int victim = -1;
     if (wbm->victim_fn) {
         victim = wbm->victim_fn(wbm, exclude_idx, wbm->victim_ud);
         if (victim >= 0) {
-            const block_meta &bv = wbm->blocks[victim];
-            if (!bv.resident || bv.is_pinned || victim == exclude_idx) victim = -1;
+            if (!wbm_group_can_evict(wbm, victim, exclude_idx)) victim = -1;
         }
         return victim;
     }
@@ -132,9 +200,7 @@ int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
         uint64_t newest = 0;
         bool found = false;
         for (const auto &b : wbm->blocks) {
-            if (!b.resident)            continue;
-            if (b.is_pinned)            continue;
-            if (b.block_idx == exclude_idx) continue;
+            if (!wbm_group_can_evict(wbm, b.block_idx, exclude_idx)) continue;
             if (!found || b.last_used_token > newest) {
                 newest = b.last_used_token;
                 victim = b.block_idx;
@@ -145,9 +211,7 @@ int wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx) {
         // LRU：选 last_used_token 最小
         uint64_t oldest = static_cast<uint64_t>(-1);  // UINT64_MAX
         for (const auto &b : wbm->blocks) {
-            if (!b.resident)            continue;
-            if (b.is_pinned)            continue;
-            if (b.block_idx == exclude_idx) continue;
+            if (!wbm_group_can_evict(wbm, b.block_idx, exclude_idx)) continue;
             if (b.last_used_token < oldest) {
                 oldest = b.last_used_token;
                 victim = b.block_idx;
@@ -175,24 +239,58 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
     // 本轮选中的 victim 临时置 resident=false, 防 victim_fn / 内置策略重复选中
     // (它们都以 !resident 为过滤条件); 函数末尾恢复, 真正的 mark_evicted 由调用方做。
     std::vector<int> hidden;
+    // A custom victim hook can nominate one member of an atomic group whose
+    // sibling is pinned/excluded. That makes this group invalid, but must not
+    // stop eviction while another independent group is available. Temporarily
+    // hide rejected groups from the hook and keep searching; these blocks are
+    // restored without being returned as victims.
+    std::vector<int> rejected_hidden;
     while (simulated_bytes > target_bytes) {
         int victim = -1;
         if (wbm->victim_fn) {
             // 注入的 pick_victim hook (桥接到用户 scheduler)。 看 wbm 当前 resident
             // 候选 (已 picked 的本轮被置 resident=false, 不会被选)。
             victim = wbm->victim_fn(wbm, exclude_idx, wbm->victim_ud);
-            // 防御: hook 返回非候选 (pinned/exclude/非 resident) 时丢弃, 退出
+            // 防御: hook 返回非候选时隐藏该候选所属的原子组，再让 hook
+            // 从剩余 resident 集合选择；不能因为一个被保护的组提前结束。
             if (victim >= 0) {
-                const block_meta &bv = wbm->blocks[victim];
-                if (!bv.resident || bv.is_pinned || victim == exclude_idx) victim = -1;
+                if (!wbm_group_can_evict(wbm, victim, exclude_idx)) {
+                    if (static_cast<size_t>(victim) >=
+                        wbm->blocks.size()) {
+                        break;
+                    }
+                    const block_meta & rejected = wbm->blocks[victim];
+                    std::vector<int> rejected_members{victim};
+                    if (rejected.eviction_group >= 0) {
+                        const auto found = wbm->eviction_groups.find(
+                            rejected.eviction_group);
+                        if (found != wbm->eviction_groups.end()) {
+                            rejected_members = found->second;
+                        }
+                    }
+                    bool hid_any = false;
+                    for (int member : rejected_members) {
+                        if (member < 0 ||
+                            static_cast<size_t>(member) >=
+                                wbm->blocks.size()) {
+                            continue;
+                        }
+                        block_meta & block = wbm->blocks[member];
+                        if (!block.resident) continue;
+                        block.resident = false;
+                        rejected_hidden.push_back(member);
+                        hid_any = true;
+                    }
+                    if (!hid_any) break;
+                    continue;
+                }
             }
         } else if (wbm->evict_mru) {
             uint64_t newest = 0;
             bool found = false;
             for (const auto &b : wbm->blocks) {
-                if (!b.resident)               continue;
-                if (b.is_pinned)               continue;
-                if (b.block_idx == exclude_idx) continue;
+                if (!wbm_group_can_evict(
+                        wbm, b.block_idx, exclude_idx)) continue;
                 if (!found || b.last_used_token > newest) {
                     newest = b.last_used_token;
                     victim = b.block_idx;
@@ -202,9 +300,8 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
         } else {
             uint64_t oldest = static_cast<uint64_t>(-1);
             for (const auto &b : wbm->blocks) {
-                if (!b.resident)               continue;
-                if (b.is_pinned)               continue;
-                if (b.block_idx == exclude_idx) continue;
+                if (!wbm_group_can_evict(
+                        wbm, b.block_idx, exclude_idx)) continue;
                 if (b.last_used_token < oldest) {
                     oldest = b.last_used_token;
                     victim = b.block_idx;
@@ -212,14 +309,31 @@ int wbm_evict_to_byte_budget(weight_buffer_manager *wbm,
             }
         }
         if (victim < 0) break;
-        picked[victim] = true;
-        wbm->blocks[victim].resident = false;   // 临时隐藏 (末尾恢复)
-        hidden.push_back(victim);
-        simulated_bytes -= wbm->blocks[victim].byte_size;
-        out_victims->push_back(victim);
-        ++n_picked;
+        const int64_t group = wbm->blocks[victim].eviction_group;
+        std::vector<int> members{victim};
+        if (group >= 0) {
+            const auto found = wbm->eviction_groups.find(group);
+            if (found != wbm->eviction_groups.end()) {
+                members = found->second;
+            }
+        }
+        for (int member : members) {
+            if (member < 0 ||
+                static_cast<size_t>(member) >= wbm->blocks.size()) {
+                continue;
+            }
+            block_meta & block = wbm->blocks[member];
+            if (!block.resident || picked[block.block_idx]) continue;
+            picked[block.block_idx] = true;
+            block.resident = false;   // 临时隐藏 (末尾恢复)
+            hidden.push_back(block.block_idx);
+            simulated_bytes -= block.byte_size;
+            out_victims->push_back(block.block_idx);
+            ++n_picked;
+        }
     }
     for (int v : hidden) wbm->blocks[v].resident = true;  // 恢复; mark_evicted 由调用方做
+    for (int v : rejected_hidden) wbm->blocks[v].resident = true;
     return n_picked;
 }
 
@@ -272,6 +386,7 @@ void wbm_shutdown(weight_buffer_manager *wbm) {
     wbm->current_token = 0;
     wbm->n_resident = 0;
     wbm->resident_bytes = 0;
+    wbm->eviction_groups.clear();
 }
 
 }  // namespace elastic

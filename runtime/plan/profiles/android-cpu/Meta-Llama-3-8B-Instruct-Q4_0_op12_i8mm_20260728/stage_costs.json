@@ -1,0 +1,8 @@
+{
+  "device": "android-cpu-elastic",
+  "input_rows": 0,
+  "model": "OP12-Llama3-8B-Q4-CPU-pipeline-budgetfair-I8MM-workerpin-20260728",
+  "note": "CPU LOAD/XFORM are supplied by calibration.json linear models fitted from fixed-budget Tensor-mode runtime counters.",
+  "records": [],
+  "source_csv": []
+}

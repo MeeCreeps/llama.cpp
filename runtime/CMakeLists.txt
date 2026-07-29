@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 
 set(_ELASTIC_SOURCES
     budget_watcher.cpp
+    elastic_granularity.cpp
     elastic_profile_writer.cpp
     metrics_logger.cpp
     weight_buffer_manager.cpp

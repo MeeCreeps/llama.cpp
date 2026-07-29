@@ -1725,7 +1725,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     switch_trace.static_input_copy_us += sched_trace_now_us() - copy_t0;
                 }
             } else {
-                if (apply_static_weight_mirror(input, input_cpy, split_backend_id)) {
+                ggml_tensor * split_node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+                const bool selected_expert_input =
+                    split_node != nullptr && split_node->op == GGML_OP_MUL_MAT_ID &&
+                    split_node->src[0] == input_cpy;
+                // Keep MUL_MAT_ID inputs on the selected-expert copy path below.
+                // A persistent full-tensor mirror defeats that path and retains
+                // every packed expert tensor even though this token uses only a
+                // small subset of experts.
+                if (!selected_expert_input &&
+                    apply_static_weight_mirror(input, input_cpy, split_backend_id)) {
                     continue;
                 }
                 // wait for the split backend to finish using the input before overwriting it

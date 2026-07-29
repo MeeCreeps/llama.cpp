@@ -287,3 +287,106 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32(
     }
 
 }
+
+// Compute two independently resident row cuts in one dispatch.  The third
+// work dimension selects the cut, while every work-group otherwise executes
+// the same GEMV as kernel_gemv_noshuffle_q4_0_f32.  This preserves separate
+// LOAD/PREPARE/residency units without paying a second kernel submission or a
+// cross-queue synchronization for decode.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q4_0_f32_dual(
+        __read_only image1d_buffer_t src0_q0,
+        global half2 * src0_d0,
+        __read_only image1d_buffer_t src0_q1,
+        global half2 * src0_d1,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd0,
+        ulong offsetd1,
+        int ne00,
+        int ne01)
+{
+    const uint cut = get_global_id(2);
+    const uint groupId = get_local_id(1);
+    const uint gid = get_global_id(0);
+    const ushort slid = get_sub_group_local_id();
+    const uint K = ne00;
+    const uint M = ne01;
+    const uint line_stride_a = M / 2;
+    const uint block_stride_a = N_SIMDGROUP * M;
+    const uint k_blocks = K / QK4_0;
+    global half2 * src0_d = cut == 0 ? src0_d0 : src0_d1;
+
+    __private uint4 regA;
+    __private half2 regS;
+    __private float8 regB;
+    __private float2 totalSum = (float2)(0.0f);
+    global const float * src1_f =
+        (global const float *)((global const char *)src1 + offset1);
+
+    for (uint k = groupId; k < k_blocks; k += N_SIMDGROUP) {
+        regS = src0_d[gid + k * line_stride_a];
+        if (slid < 4) {
+            regB.s0123 = vload4(slid * 2 + k * 8, src1_f);
+            regB.s4567 = vload4(1 + slid * 2 + k * 8, src1_f);
+        }
+
+        const uint q_base = gid + k * block_stride_a;
+        regA.s0 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 0).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 0).x;
+        regA.s1 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 1).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 1).x;
+        regA.s2 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 2).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 2).x;
+        regA.s3 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 3).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 3).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_hi(
+            totalSum, as_ushort8(regA), regS, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_hi(
+            totalSum, as_ushort8(regA), regS, regB);
+#endif
+
+        regA.s0 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 4).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 4).x;
+        regA.s1 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 5).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 5).x;
+        regA.s2 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 6).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 6).x;
+        regA.s3 = cut == 0
+            ? read_imageui(src0_q0, q_base + line_stride_a * 7).x
+            : read_imageui(src0_q1, q_base + line_stride_a * 7).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_lo(
+            totalSum, as_ushort8(regA), regS, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_lo(
+            totalSum, as_ushort8(regA), regS, regB);
+#endif
+    }
+
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (groupId > 0) {
+        reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = totalSum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < N_SIMDGROUP - 1; ++i) {
+            totalSum += reduceLM[SIMDGROUP_WIDTH * i + slid];
+        }
+        global float * cut_dst = (global float *)(
+            (global char *)dst + (cut == 0 ? offsetd0 : offsetd1));
+        vstore2(totalSum, 0, &(cut_dst[gid * 2]));
+    }
+}

@@ -30,6 +30,8 @@ using elastic::wbm_touch;
 using elastic::wbm_set_last_use_event;
 using elastic::wbm_set_pinned;
 using elastic::wbm_evict_to_byte_budget;
+using elastic::wbm_clear_eviction_groups;
+using elastic::wbm_set_eviction_group;
 
 namespace {
 
@@ -50,6 +52,9 @@ void check_eq_sz(size_t got, size_t want, const char *msg) {
 }
 
 void register_uniform(weight_buffer_manager *wbm, int n, size_t each_bytes) {
+    // Most cases in this legacy unit-test file assert LRU order explicitly;
+    // production keeps MRU as its default decode policy.
+    wbm->evict_mru = false;
     for (int i = 0; i < n; ++i) {
         int rc = wbm_register_block(wbm, i, &fake_host_pool[i], each_bytes);
         if (rc != 0) {
@@ -58,6 +63,16 @@ void register_uniform(weight_buffer_manager *wbm, int n, size_t each_bytes) {
             std::abort();
         }
     }
+}
+
+int pick_lowest_resident(
+    const weight_buffer_manager * wbm, int exclude_idx, void *) {
+    for (const block_meta & block : wbm->blocks) {
+        if (block.resident && block.block_idx != exclude_idx) {
+            return block.block_idx;
+        }
+    }
+    return -1;
 }
 
 // —— 用例 1：init + register 元数据正确 ——
@@ -319,6 +334,7 @@ void test_pinned_skipped_by_lru() {
 void test_evict_to_byte_budget_picks() {
     weight_buffer_manager wbm{};
     wbm_init(&wbm, 5);
+    wbm.evict_mru = false;
     // 异构 size：10, 20, 30, 40, 50（共 150）
     wbm_register_block(&wbm, 0, &fake_host_pool[0], 10);
     wbm_register_block(&wbm, 1, &fake_host_pool[1], 20);
@@ -400,6 +416,98 @@ void test_evict_to_byte_budget_already_satisfied() {
     std::printf("[OK] test_evict_to_byte_budget_already_satisfied\n");
 }
 
+// —— 用例 13：同一 Super-Tensor unit 原子驱逐 ——
+void test_grouped_eviction_is_atomic() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 4);
+    register_uniform(&wbm, 4, 25);
+    for (int i = 0; i < 4; ++i) {
+        wbm_mark_resident(
+            &wbm, i, reinterpret_cast<void *>(0x500 + i));
+        wbm_touch(&wbm, i, static_cast<uint64_t>(i + 1));
+    }
+
+    // 0/1 are the two physical tiles of one Tensor unit.  Selecting the
+    // oldest member must return both, even though evicting one would already
+    // satisfy a 75-byte target.
+    wbm_set_eviction_group(&wbm, 0, 7);
+    wbm_set_eviction_group(&wbm, 1, 7);
+    std::vector<int> victims;
+    const int n = wbm_evict_to_byte_budget(
+        &wbm, 75, -1, &victims);
+    check_eq_int(n, 2, "group eviction selects both tiles");
+    check_eq_int(static_cast<int>(victims.size()), 2,
+                 "group victim vector size");
+    check_eq_int(victims[0], 0, "group first tile");
+    check_eq_int(victims[1], 1, "group second tile");
+
+    wbm_clear_eviction_groups(&wbm);
+    victims.clear();
+    check_eq_int(
+        wbm_evict_to_byte_budget(&wbm, 75, -1, &victims),
+        1, "clear restores per-tile eviction");
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_grouped_eviction_is_atomic\n");
+}
+
+// —— 用例 14：组内 pin/exclude 保护整个逻辑 unit ——
+void test_grouped_eviction_respects_pin_and_exclude() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 4);
+    register_uniform(&wbm, 4, 25);
+    for (int i = 0; i < 4; ++i) {
+        wbm_mark_resident(
+            &wbm, i, reinterpret_cast<void *>(0x600 + i));
+        wbm_touch(&wbm, i, static_cast<uint64_t>(i + 1));
+    }
+    wbm_set_eviction_group(&wbm, 0, 9);
+    wbm_set_eviction_group(&wbm, 1, 9);
+
+    wbm_set_pinned(&wbm, 1, true);
+    check_eq_int(
+        wbm_pick_lru_victim(&wbm, -1), 2,
+        "pinned sibling protects group");
+    wbm_set_pinned(&wbm, 1, false);
+    check_eq_int(
+        wbm_pick_lru_victim(&wbm, 1), 2,
+        "excluded sibling protects group");
+
+    std::vector<int> victims;
+    const int n = wbm_evict_to_byte_budget(
+        &wbm, 75, 1, &victims);
+    check_eq_int(n, 1, "budget picker skips protected group");
+    check_eq_int(victims[0], 2, "next independent unit selected");
+    wbm_shutdown(&wbm);
+    std::printf("[OK] test_grouped_eviction_respects_pin_and_exclude\n");
+}
+
+// —— 用例 15：custom victim hook 遇到被保护组后继续搜索 ——
+void test_grouped_eviction_custom_hook_skips_protected_group() {
+    weight_buffer_manager wbm{};
+    wbm_init(&wbm, 4);
+    register_uniform(&wbm, 4, 25);
+    for (int i = 0; i < 4; ++i) {
+        wbm_mark_resident(
+            &wbm, i, reinterpret_cast<void *>(0x700 + i));
+    }
+    wbm_set_eviction_group(&wbm, 0, 11);
+    wbm_set_eviction_group(&wbm, 1, 11);
+    wbm_set_pinned(&wbm, 1, true);
+    wbm.victim_fn = pick_lowest_resident;
+
+    std::vector<int> victims;
+    const int n = wbm_evict_to_byte_budget(
+        &wbm, 75, -1, &victims);
+    check_eq_int(n, 1, "custom hook skips protected group");
+    check_eq_int(victims[0], 2, "custom hook selects next unit");
+    check_eq_int(
+        wbm_resident_count(&wbm), 4,
+        "picker restores selected and rejected visibility");
+    wbm_shutdown(&wbm);
+    std::printf(
+        "[OK] test_grouped_eviction_custom_hook_skips_protected_group\n");
+}
+
 }  // namespace
 
 int main() {
@@ -415,6 +523,9 @@ int main() {
     test_evict_to_byte_budget_picks();
     test_evict_to_byte_budget_pin_exclude();
     test_evict_to_byte_budget_already_satisfied();
+    test_grouped_eviction_is_atomic();
+    test_grouped_eviction_respects_pin_and_exclude();
+    test_grouped_eviction_custom_hook_skips_protected_group();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

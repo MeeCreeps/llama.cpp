@@ -1,0 +1,5 @@
+phase,weight_budget_pct,total_budget_mib,multi_median_ms,multi_fused_median_ms,tensor_median_ms,cut_median_ms,winner
+initial_90,90,1835,154.074,156.640,143.379,150.857,tensor
+low_30,30,740,991.081,1037.273,912.766,884.009,cut
+mid_60,60,1288,494.024,495.878,413.675,550.525,tensor
+recovered_90,90,1835,164.159,166.899,150.476,156.781,tensor

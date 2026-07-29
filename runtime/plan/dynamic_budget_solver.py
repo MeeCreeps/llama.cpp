@@ -29,7 +29,18 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+try:
+    from .super_tensor_planner import (
+        GranularityCostModel,
+        attach_working_unit,
+    )
+except ImportError:
+    from super_tensor_planner import (  # type: ignore
+        GranularityCostModel,
+        attach_working_unit,
+    )
 
 
 MB = 1024 * 1024
@@ -47,6 +58,31 @@ def parse_allowed_placements(s: str | None) -> set[str]:
     if bad:
         raise ValueError(f"unknown placement(s): {sorted(bad)}")
     return out or set(PLACEMENTS)
+
+
+def parse_forced_weight_placements(
+    values: Iterable[str] | None,
+) -> dict[str, str]:
+    """Parse repeatable hard ``WEIGHT=PLACEMENT`` constraints."""
+    result: dict[str, str] = {}
+    for raw in values or ():
+        name, separator, placement = str(raw).partition("=")
+        name = name.strip()
+        placement = placement.strip()
+        if not separator or not name or not placement:
+            raise ValueError(
+                "--force-weight-placement expects WEIGHT=PLACEMENT, "
+                f"got {raw!r}")
+        if placement not in PLACEMENTS:
+            raise ValueError(
+                f"unknown forced placement {placement!r} for {name!r}")
+        previous = result.get(name)
+        if previous is not None and previous != placement:
+            raise ValueError(
+                f"conflicting forced placements for {name!r}: "
+                f"{previous!r} and {placement!r}")
+        result[name] = placement
+    return result
 
 
 @functools.lru_cache(maxsize=64)
@@ -131,6 +167,31 @@ class CostModel:
             * self.calibration_multiplier("backend_multipliers", backend)
         )
 
+    def calibrated_stage_fallback_ms(
+        self, backend: str, kind: str, byte_size: int
+    ) -> float | None:
+        """Return a measured linear model for an otherwise-unprofiled stage."""
+        models = self.calibration.get("stage_fallback_models", {})
+        if not isinstance(models, dict):
+            return None
+        model = models.get(f"{backend}:{kind}")
+        if not isinstance(model, dict):
+            return None
+        try:
+            fixed_ms = max(0.0, float(model.get("fixed_ms", 0.0)))
+            if "ms_per_mib" in model:
+                ms_per_mib = max(0.0, float(model["ms_per_mib"]))
+            else:
+                bandwidth = float(model.get("bandwidth_mib_s", 0.0))
+                if bandwidth <= 0.0:
+                    return None
+                ms_per_mib = 1000.0 / bandwidth
+        except (TypeError, ValueError):
+            return None
+        return (
+            fixed_ms + byte_size / MB * ms_per_mib
+        ) * self.stage_multiplier(backend, kind)
+
     def compute_multiplier(self, backend: str) -> float:
         return self.calibration_multiplier("compute_multipliers", backend)
 
@@ -152,6 +213,10 @@ class CostModel:
         measured = self.measured_stage_ms(backend, kind, name, byte_size)
         if measured is not None:
             return measured * self.stage_multiplier(backend, kind)
+        calibrated = self.calibrated_stage_fallback_ms(
+            backend, kind, byte_size)
+        if calibrated is not None:
+            return calibrated
         # Phone-first fallback constants. These are deliberately rough and are
         # replaced by measured CSV data as soon as it exists.
         mb = byte_size / MB
@@ -236,10 +301,25 @@ class CostModel:
         return any(rec.get("backend") == backend and rec.get("kind") == "COMPUTE" for rec in self.ops)
 
     def has_measured_stage_backend(self, backend: str) -> bool:
-        return any(rec.get("backend") == backend for rec in self.stage)
+        if any(rec.get("backend") == backend for rec in self.stage):
+            return True
+        models = self.calibration.get("stage_fallback_models", {})
+        return (
+            isinstance(models, dict)
+            and any(str(key).startswith(f"{backend}:") for key in models)
+        )
 
     def has_measured_stage_kind(self, backend: str, kind: str) -> bool:
-        return any(rec.get("backend") == backend and rec.get("kind") == kind for rec in self.stage)
+        if any(
+            rec.get("backend") == backend and rec.get("kind") == kind
+            for rec in self.stage
+        ):
+            return True
+        models = self.calibration.get("stage_fallback_models", {})
+        return (
+            isinstance(models, dict)
+            and f"{backend}:{kind}" in models
+        )
 
     def gpu_reload_ms(self, name: str, byte_size: int) -> float:
         return self.path_sum_ms("GPU", "disk", "gpu", name, byte_size)
@@ -352,6 +432,16 @@ def load_state(path: Path | None) -> dict[str, dict[str, Any]]:
     return out
 
 
+def load_working_set_state(path: Path | None, kind: str) -> dict[str, Any] | None:
+    if not path:
+        return None
+    data = load_json(path)
+    for row in data.get("working_sets", []):
+        if isinstance(row, dict) and str(row.get("kind", "")) == kind:
+            return row
+    return None
+
+
 def state_has_backend(row: dict[str, Any] | None, backend: str) -> bool:
     if not row:
         return False
@@ -423,6 +513,84 @@ def placement_resident_bytes(choice: str, byte_size: int) -> int:
     return 0 if choice.startswith("disk_") else byte_size
 
 
+def planner_resident_budget_bytes(args: argparse.Namespace) -> int:
+    """Return capacity for the persistent plan-resident set.
+
+    The physical backend budget also contains the current and prefetched
+    streaming working units. Reserving their window only in the planner keeps
+    the backend's hard byte target unchanged while enforcing
+    ``R_keep + R_stream <= B`` by construction.
+    """
+    stream_reserve_mib = max(
+        0, int(getattr(args, "planner_stream_reserve_mib", 0)))
+    reserved_mib = (
+        int(args.kv_mib)
+        + int(args.misc_mib)
+        + int(args.safety_mib)
+        + stream_reserve_mib
+    )
+    return max(0, (int(args.budget_mib) - reserved_mib) * MB)
+
+
+def is_dynamic_weight(args: argparse.Namespace, name: str) -> bool:
+    active = float(getattr(args, "dynamic_active_experts", 0.0))
+    total = float(getattr(args, "dynamic_total_experts", 0.0))
+    if active <= 0.0 or total <= 0.0 or active >= total:
+        return False
+    patterns = [
+        item.strip()
+        for item in str(getattr(args, "dynamic_weight_pattern", "_exps.weight")).split(",")
+        if item.strip()
+    ]
+    return any(pattern in name for pattern in patterns)
+
+
+def dynamic_weight_budget_bytes(args: argparse.Namespace, name: str, byte_size: int) -> int:
+    if not is_dynamic_weight(args, name):
+        return byte_size
+    active = float(getattr(args, "dynamic_active_experts", 0.0))
+    total = float(getattr(args, "dynamic_total_experts", 0.0))
+    return max(1, int(round(byte_size * active / total)))
+
+
+def build_dynamic_working_set_plan(
+    args: argparse.Namespace,
+    weights: list[dict[str, Any]],
+    plan_weights: list[dict[str, Any]],
+    budget_bytes: int,
+) -> list[dict[str, Any]]:
+    total_experts = int(math.ceil(float(getattr(args, "dynamic_total_experts", 0.0))))
+    dynamic = [w for w in weights if is_dynamic_weight(args, str(w.get("name", "")))]
+    if total_experts <= 0 or not dynamic:
+        return []
+
+    # One logical slot retains one expert slice from every dynamic parent
+    # tensor. Full packed parents stay disk-backed and do not consume this
+    # runtime-cache budget.
+    bytes_per_slot = sum(int(w.get("byte_size", 0)) for w in dynamic) / total_experts
+    static_resident = sum(
+        int(w.get("byte_size", 0))
+        for w in plan_weights
+        if str(w.get("location", "disk")) in {"cpu", "gpu"}
+        and not is_dynamic_weight(args, str(w.get("name", "")))
+    )
+    remaining = max(0, budget_bytes - static_resident)
+    target = total_experts if bytes_per_slot <= 0 else int(remaining // bytes_per_slot)
+    target = max(1, min(total_experts, target))
+    return [{
+        "name": "dynamic_weights",
+        "kind": "expert_slices",
+        "target_capacity": target,
+        "budget_capacity": target,
+        "min_capacity": 1,
+        "max_capacity": total_experts,
+        "policy": "budget_static",
+        "state_aware": False,
+        "bytes_per_capacity": int(math.ceil(bytes_per_slot)),
+        "budget_headroom_bytes": remaining,
+    }]
+
+
 def disk_stage_multiplier(choice: str, disk_reload_multiplier: float, disk_gpu_reload_multiplier: float) -> float:
     if choice == "disk_gpu":
         return disk_reload_multiplier * disk_gpu_reload_multiplier
@@ -443,8 +611,19 @@ def current_location(row: dict[str, Any] | None) -> str:
     return "disk"
 
 
+def transition_cost_location(row: dict[str, Any] | None) -> str:
+    """Use the last logical target only to discourage equivalent-plan churn."""
+    if state_any_resident(row):
+        return current_location(row)
+    if row:
+        previous = str(row.get("previous_location", "")).lower()
+        if previous in {"cpu", "gpu", "disk"}:
+            return previous
+    return "disk"
+
+
 def transition_ms(choice: str, name: str, size: int, row: dict[str, Any] | None, cm: CostModel) -> float:
-    src = current_location(row)
+    src = transition_cost_location(row)
     dst = placement_location(choice)
     backend = placement_backend(choice)
     if src == dst:
@@ -510,7 +689,7 @@ def steady_ms(choice: str, name: str, size: int, cm: CostModel, allow_cpu_fallba
 
 def transition_engine_ms(choice: str, name: str, size: int, row: dict[str, Any] | None,
                          cm: CostModel) -> dict[str, float]:
-    src = current_location(row)
+    src = transition_cost_location(row)
     dst = placement_location(choice)
     backend = placement_backend(choice)
     out = {engine: 0.0 for engine in ENGINES}
@@ -977,7 +1156,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         if Path(path).exists()
     ]
 
-    budget_bytes = max(0, (args.budget_mib - args.kv_mib - args.misc_mib - args.safety_mib) * MB)
+    budget_bytes = planner_resident_budget_bytes(args)
+    forced_weight_placements = parse_forced_weight_placements(
+        getattr(args, "force_weight_placement", ()))
     transition_horizon_tokens = max(1.0, float(getattr(args, "transition_horizon_tokens", 1.0)))
     objective_transition_weight = (float(args.transition_weight) / transition_horizon_tokens) if has_state else 0.0
     by_id = {int(w["weight_id"]): w for w in weights}
@@ -990,44 +1171,74 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         wid = int(w["weight_id"])
         size = int(w.get("byte_size", 0))
         name = str(w["name"])
-        costs = placement_costs(
-            w, cm, state,
-            allow_cpu_fallback=bool(args.allow_cpu_fallback),
-            transition_weight=objective_transition_weight,
-            disk_reload_multiplier=float(args.disk_reload_multiplier),
-            disk_gpu_reload_multiplier=float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
-            overlap_model=str(args.overlap_model),
-        )
-        for choice in PLACEMENTS:
-            if choice not in allowed_placements:
-                costs[choice] = math.inf
-            if name == "output.weight" and choice in ("cpu", "disk_cpu") and not bool(getattr(args, "allow_output_cpu", False)):
-                costs[choice] = math.inf
-            if name == "output.weight" and choice in ("disk_cpu", "disk_gpu") and not bool(getattr(args, "allow_output_disk", False)):
-                costs[choice] = math.inf
-        engine_costs = placement_engine_costs(
-            w, cm, state,
-            allow_cpu_fallback=bool(args.allow_cpu_fallback),
-            transition_weight=objective_transition_weight,
-            disk_reload_multiplier=float(args.disk_reload_multiplier),
-            disk_gpu_reload_multiplier=float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
-        )
-        for choice in PLACEMENTS:
-            if choice not in allowed_placements:
-                engine_costs[choice] = {engine: math.inf for engine in ENGINES}
-            if name == "output.weight" and choice in ("cpu", "disk_cpu") and not bool(getattr(args, "allow_output_cpu", False)):
-                engine_costs[choice] = {engine: math.inf for engine in ENGINES}
-            if name == "output.weight" and choice in ("disk_cpu", "disk_gpu") and not bool(getattr(args, "allow_output_disk", False)):
-                engine_costs[choice] = {engine: math.inf for engine in ENGINES}
-        choice_ops = {
-            choice: selected_choice_intervals(
-                choice, name, size, cm, bool(args.allow_cpu_fallback),
-                float(args.disk_reload_multiplier), float(getattr(args, "disk_gpu_reload_multiplier", 4.0))
+        dynamic_managed = is_dynamic_weight(args, name)
+        if dynamic_managed:
+            # The packed runtime cache owns these slices and accounts its bytes
+            # separately. Keep the full parent out of CP residency decisions.
+            budget_size = 0
+            costs = {choice: (0.0 if choice == "disk_gpu" else math.inf) for choice in PLACEMENTS}
+            engine_costs = {
+                choice: ({engine: 0.0 for engine in ENGINES} if choice == "disk_gpu"
+                         else {engine: math.inf for engine in ENGINES})
+                for choice in PLACEMENTS
+            }
+            choice_ops = {"disk_gpu": []}
+        else:
+            budget_size = dynamic_weight_budget_bytes(args, name, size)
+            costs = placement_costs(
+                w, cm, state,
+                allow_cpu_fallback=bool(args.allow_cpu_fallback),
+                transition_weight=objective_transition_weight,
+                disk_reload_multiplier=float(args.disk_reload_multiplier),
+                disk_gpu_reload_multiplier=float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
+                overlap_model=str(args.overlap_model),
             )
-            for choice in PLACEMENTS
-            if choice in allowed_placements and not math.isinf(costs.get(choice, math.inf))
-        }
-        items.append((wid, size, first_consumer.get(wid, wid), name, costs, engine_costs, choice_ops))
+            for choice in PLACEMENTS:
+                if choice not in allowed_placements:
+                    costs[choice] = math.inf
+                if name == "output.weight" and choice in ("cpu", "disk_cpu") and not bool(getattr(args, "allow_output_cpu", False)):
+                    costs[choice] = math.inf
+                if name == "output.weight" and choice in ("disk_cpu", "disk_gpu") and not bool(getattr(args, "allow_output_disk", False)):
+                    costs[choice] = math.inf
+            engine_costs = placement_engine_costs(
+                w, cm, state,
+                allow_cpu_fallback=bool(args.allow_cpu_fallback),
+                transition_weight=objective_transition_weight,
+                disk_reload_multiplier=float(args.disk_reload_multiplier),
+                disk_gpu_reload_multiplier=float(getattr(args, "disk_gpu_reload_multiplier", 4.0)),
+            )
+            for choice in PLACEMENTS:
+                if choice not in allowed_placements:
+                    engine_costs[choice] = {engine: math.inf for engine in ENGINES}
+                if name == "output.weight" and choice in ("cpu", "disk_cpu") and not bool(getattr(args, "allow_output_cpu", False)):
+                    engine_costs[choice] = {engine: math.inf for engine in ENGINES}
+                if name == "output.weight" and choice in ("disk_cpu", "disk_gpu") and not bool(getattr(args, "allow_output_disk", False)):
+                    engine_costs[choice] = {engine: math.inf for engine in ENGINES}
+            choice_ops = {
+                choice: selected_choice_intervals(
+                    choice, name, size, cm, bool(args.allow_cpu_fallback),
+                    float(args.disk_reload_multiplier), float(getattr(args, "disk_gpu_reload_multiplier", 4.0))
+                )
+                for choice in PLACEMENTS
+                if choice in allowed_placements and not math.isinf(costs.get(choice, math.inf))
+            }
+        forced_choice = forced_weight_placements.get(name)
+        if forced_choice is not None:
+            if (
+                forced_choice not in allowed_placements or
+                math.isinf(costs.get(forced_choice, math.inf))
+            ):
+                raise ValueError(
+                    f"forced placement {name}={forced_choice} is unavailable "
+                    f"under allowed placements {sorted(allowed_placements)}")
+            for choice in PLACEMENTS:
+                if choice == forced_choice:
+                    continue
+                costs[choice] = math.inf
+                engine_costs[choice] = {
+                    engine: math.inf for engine in ENGINES}
+                choice_ops.pop(choice, None)
+        items.append((wid, budget_size, first_consumer.get(wid, wid), name, costs, engine_costs, choice_ops))
 
     cp_result = select_placements_cp(
         items, budget_bytes, args.time_limit_ms, str(args.cp_objective), int(args.prefetch_distance),
@@ -1046,6 +1257,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if not placements:
         placements = select_placements_greedy(items, budget_bytes)
         solver_kind = "greedy"
+        if not cp_status:
+            cp_status = "GREEDY"
     if str(args.cp_objective) == "interval_makespan" and not cp_schedule:
         cp_schedule, cp_objective_ms = build_index_pipeline_schedule(
             items, placements, int(args.prefetch_distance)
@@ -1061,6 +1274,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     for w in weights:
         wid = int(w["weight_id"])
         choice = placements.get(wid, "disk_gpu")
+        dynamic_managed = is_dynamic_weight(args, str(w["name"]))
+        if dynamic_managed:
+            choice = "disk_gpu"
         be = placement_backend(choice)
         quant = str(w.get("quant", ""))
         location = placement_location(choice)
@@ -1082,11 +1298,16 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         src = current_location(row)
         consumer = first_consumer.get(wid, 0)
         anchor = consumer if consumer <= args.prefetch_distance else max(0, consumer - args.prefetch_distance)
-        pred_ms += steady_ms(choice, name, size, cm, bool(args.allow_cpu_fallback),
-                             float(args.disk_reload_multiplier),
-                             float(args.disk_gpu_reload_multiplier),
-                             str(args.overlap_model))
+        if not dynamic_managed:
+            pred_ms += steady_ms(choice, name, size, cm, bool(args.allow_cpu_fallback),
+                                 float(args.disk_reload_multiplier),
+                                 float(args.disk_gpu_reload_multiplier),
+                                 str(args.overlap_model))
 
+        if dynamic_managed:
+            # The OpenCL packed-expert cache loads selected slices directly;
+            # a full-tensor load/xform timeline would duplicate that memory.
+            continue
         if location == "disk":
             # Disk placements are steady-state per-graph reloads.  Do not put
             # resident->disk transition evicts into this timeline: anchors fire
@@ -1123,6 +1344,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     for op in ops:
         wid = int(op.get("weight_id", -1))
         choice = placements.get(wid, "disk_gpu")
+        if is_dynamic_weight(args, str(by_id.get(wid, {}).get("name", ""))):
+            choice = "disk_gpu"
         be = placement_backend(choice)
         loc = placement_location(choice)
         w = by_id.get(wid, {})
@@ -1141,7 +1364,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    return {
+    working_sets = build_dynamic_working_set_plan(args, weights, plan_weights, budget_bytes)
+    plan = {
         "schema_version": 1,
         "budget_mib": args.budget_mib,
         "kv_bytes": args.kv_mib * MB,
@@ -1149,6 +1373,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "weights": plan_weights,
         "ops": plan_ops,
         "timeline": timeline,
+        "working_sets": working_sets,
         "schedule": {
             "kind": ("index_pipeline" if cp_status and "INDEX_PIPELINE_FALLBACK" in str(cp_status)
                      else "interval_cp_sat") if str(args.cp_objective) == "interval_makespan" and cp_schedule else "none",
@@ -1179,8 +1404,58 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "calibration": cm.calibration,
             "exclude_plan_count": len(exclude_placements),
             "min_placement_distance": int(getattr(args, "min_placement_distance", 0)),
+            "dynamic_active_experts": float(getattr(args, "dynamic_active_experts", 0.0)),
+            "dynamic_total_experts": float(getattr(args, "dynamic_total_experts", 0.0)),
+            "dynamic_weight_pattern": str(getattr(args, "dynamic_weight_pattern", "_exps.weight")),
+            "forced_weight_placements": forced_weight_placements,
+            "planner_stream_reserve_mib": max(
+                0, int(getattr(
+                    args, "planner_stream_reserve_mib", 0))),
+            "planner_resident_budget_bytes": budget_bytes,
         },
     }
+    granularity_policy = str(
+        getattr(args, "granularity_policy", "none"))
+    if granularity_policy != "none":
+        raw_state = (
+            load_json(args.state)
+            if args.state is not None else {})
+        current_plan_path = getattr(
+            args, "granularity_current_plan", None)
+        current_plan = (
+            load_json(current_plan_path)
+            if current_plan_path is not None and
+            Path(current_plan_path).exists() else {})
+        current_working_unit = (
+            current_plan.get("working_unit") or
+            raw_state.get("working_unit"))
+        offline_working_unit = None
+        offline_target_path = getattr(
+            args, "granularity_offline_target_plan", None)
+        if offline_target_path is not None:
+            offline_target_plan = load_json(
+                Path(offline_target_path))
+            candidate = offline_target_plan.get("working_unit")
+            if isinstance(candidate, dict):
+                offline_working_unit = candidate
+        granularity_model = GranularityCostModel.load(
+            getattr(args, "granularity_profile", None),
+            str(getattr(args, "granularity_backend", "cpu")))
+        attach_working_unit(
+            meta, plan, granularity_model,
+            policy=granularity_policy,
+            current_working_unit=current_working_unit,
+            offline_working_unit=offline_working_unit,
+            telemetry=raw_state.get("granularity"),
+            horizon_tokens=float(getattr(
+                args, "granularity_horizon_tokens", 8.0)),
+            min_gain_ms=float(getattr(
+                args, "granularity_min_gain_ms", 0.0)),
+            max_edits=int(getattr(
+                args, "granularity_max_edits", 4)),
+            beam_width=int(getattr(
+                args, "granularity_beam_width", 128)))
+    return plan
 
 
 def main() -> None:
@@ -1192,6 +1467,11 @@ def main() -> None:
     ap.add_argument("--kv-mib", type=int, default=128)
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
+    ap.add_argument(
+        "--planner-stream-reserve-mib", type=int, default=0,
+        help=(
+            "reserve weight capacity for the current/prefetched streaming "
+            "units; reduces only persistent plan residency"))
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--allow-cpu-fallback", action="store_true",
@@ -1202,6 +1482,10 @@ def main() -> None:
                     help="allow output.weight to be evicted to disk; disabled by default because logits output reload dominates decode")
     ap.add_argument("--allowed-placements", default=",".join(PLACEMENTS),
                     help=f"comma-separated placement choices to allow; valid={','.join(PLACEMENTS)}")
+    ap.add_argument(
+        "--force-weight-placement", action="append", default=[],
+        metavar="WEIGHT=PLACEMENT",
+        help="repeatable hard placement constraint for controlled comparisons")
     ap.add_argument("--transition-weight", type=float, default=0.1,
                     help="weight applied to current-state transition/migration cost in the online objective")
     ap.add_argument("--transition-horizon-tokens", type=float, default=1.0,
@@ -1218,6 +1502,43 @@ def main() -> None:
                     help="existing plan whose placement should be excluded by --min-placement-distance; may be repeated")
     ap.add_argument("--min-placement-distance", type=int, default=0,
                     help="minimum weight-placement Hamming distance from each --exclude-plan")
+    ap.add_argument("--dynamic-active-experts", type=float, default=0.0,
+                    help="profiled active experts per layer used only by the memory constraint")
+    ap.add_argument("--dynamic-total-experts", type=float, default=0.0,
+                    help="total experts per layer paired with --dynamic-active-experts")
+    ap.add_argument("--dynamic-weight-pattern", default="_exps.weight",
+                    help="comma-separated weight-name patterns whose memory footprint is dynamic")
+    ap.add_argument(
+        "--granularity-policy",
+        choices=(
+            "none", "fixed-multi", "fixed-tensor", "fixed-cut",
+            "offline", "online", "diff-tree"),
+        default="none",
+        help="attach a mixed Super-Tensor partition after placement solving")
+    ap.add_argument(
+        "--granularity-backend", choices=("cpu", "gpu"), default="cpu",
+        help="fixed backend whose calibrated working-unit costs are used")
+    ap.add_argument(
+        "--granularity-profile", type=Path,
+        help="device/backend granularity calibration JSON")
+    ap.add_argument(
+        "--granularity-current-plan", type=Path,
+        help="previous ExecPlan used as the root of online local split/merge")
+    ap.add_argument(
+        "--granularity-offline-target-plan", type=Path,
+        help="precomputed Offline-Mixed plan used as Diff-tree guidance")
+    ap.add_argument(
+        "--granularity-horizon-tokens", type=float, default=8.0,
+        help="tokens over which an online split/merge must repay switch cost")
+    ap.add_argument(
+        "--granularity-min-gain-ms", type=float, default=0.0,
+        help="additional horizon gain required before accepting a local edit")
+    ap.add_argument(
+        "--granularity-max-edits", type=int, default=4,
+        help="maximum local split/merge patches emitted by one callback")
+    ap.add_argument(
+        "--granularity-beam-width", type=int, default=128,
+        help="beam width of the offline mixed-partition search")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 

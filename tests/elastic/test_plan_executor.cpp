@@ -7,6 +7,7 @@
 #include "plan_ir.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>
 #include <set>
 #include <string>
@@ -194,12 +195,46 @@ static void test_deferred_stage_events() {
     CHECK(ex.events_for_anchor(4).size() == 1);
 }
 
+// The mixed-granularity runner delegates recurring LOAD/PREPARE to the
+// backend's physical-unit pipeline.  "none" must therefore remove the legacy
+// complete-weight stage anchors even though their diagnostic counts remain in
+// the placement plan.
+static void test_unit_pipeline_stage_authority() {
+    const char * previous =
+        std::getenv("LLAMA_ELASTIC_INTERVAL_STAGE_KINDS");
+    const bool had_previous = previous != nullptr;
+    const std::string previous_value =
+        previous ? previous : "";
+    setenv("LLAMA_ELASTIC_INTERVAL_STAGE_KINDS", "none", 1);
+
+    MockBackend mb;
+    ExecSinks sinks = mb.make_sinks();
+    sinks.defer_stage_events = true;
+    PlanExecutor ex(std::move(sinks));
+    ExecPlan p = make_plan(10, 4);
+
+    ReconcileStats st = ex.apply(p);
+    CHECK(st.n_load_events == 6);
+    CHECK(mb.load_count == 0);
+    CHECK(ex.events_for_anchor(4).empty());
+    CHECK(ex.events_for_anchor(8).empty());
+
+    if (had_previous) {
+        setenv(
+            "LLAMA_ELASTIC_INTERVAL_STAGE_KINDS",
+            previous_value.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_ELASTIC_INTERVAL_STAGE_KINDS");
+    }
+}
+
 int main() {
     test_fresh_apply();
     test_replan_diff();
     test_runtime_dispatch();
     test_anchor_index();
     test_deferred_stage_events();
+    test_unit_pipeline_stage_authority();
 
     if (g_fail == 0) {
         std::printf("test_plan_executor: ALL PASS\n");

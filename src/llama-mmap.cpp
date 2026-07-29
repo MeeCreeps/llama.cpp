@@ -1,4 +1,5 @@
 #include "llama-mmap.h"
+#include "llama-uring.h"
 
 #include "llama-impl.h"
 
@@ -20,6 +21,10 @@
     #include <sys/stat.h>
     #include <sys/ioctl.h>
     #include <stdlib.h>      // posix_memalign
+#if defined(__linux__) || defined(__ANDROID__)
+    #include <linux/aio_abi.h>
+    #include <sys/syscall.h>
+#endif
 #endif
 
 #ifdef __has_include
@@ -572,19 +577,115 @@ struct direct_io_handle {
 };
 static std::mutex g_direct_mtx;
 static std::unordered_map<std::string, direct_io_handle> g_direct_handles;
+// Synchronous pipeline workers use independent per-thread fds/bounce buffers.
+// Holding g_direct_mtx across pread serialized a persistent auxiliary LOAD lane
+// with the primary lane and made a Multi unit no better than two Tensor reads.
+static thread_local std::unordered_map<std::string, direct_io_handle>
+    g_direct_thread_handles;
+static bool g_direct_batch_uring_unavailable = false;
+#if defined(__linux__) || defined(__ANDROID__)
+static aio_context_t g_direct_aio_context = 0;
+static bool g_direct_batch_aio_unavailable = false;
 
-static int llama_pread_full_direct(int fd, void * dst, size_t len, size_t file_offset, const char * tag) {
+struct direct_aio_request {
+    int fd = -1;
+    void * dst = nullptr;
+    size_t file_offset = 0;
+    size_t len = 0;
+};
+
+static bool llama_direct_aio_init_locked() {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (g_direct_aio_context != 0) return true;
+    if (g_direct_batch_aio_unavailable) return false;
+    aio_context_t context = 0;
+    if (syscall(__NR_io_setup, 256U, &context) != 0) {
+        fprintf(stderr, "[linux-aio] io_setup failed: %s\n", strerror(errno));
+        g_direct_batch_aio_unavailable = true;
+        return false;
+    }
+    g_direct_aio_context = context;
+    fprintf(stderr, "[linux-aio] init OK: entries=256\n");
+    return true;
+#else
+    return false;
+#endif
+}
+
+// Legacy Linux native AIO remains available on many Android kernels whose
+// app seccomp policy denies io_uring_setup. O_DIRECT requests are the intended
+// use case for this interface and preserve one independent-offset submission
+// for a real Multi working unit.
+static int llama_direct_aio_batch_locked(
+        const direct_aio_request * requests, size_t count) {
+    if (!requests || count < 2 || !llama_direct_aio_init_locked()) return -1;
+    std::vector<struct iocb> controls(count);
+    std::vector<struct iocb *> control_ptrs(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (requests[i].fd < 0 || !requests[i].dst || requests[i].len == 0) return -2;
+        struct iocb & cb = controls[i];
+        memset(&cb, 0, sizeof(cb));
+        cb.aio_data = static_cast<__u64>(i + 1);
+        cb.aio_lio_opcode = IOCB_CMD_PREAD;
+        cb.aio_fildes = static_cast<__u32>(requests[i].fd);
+        cb.aio_buf = static_cast<__u64>(reinterpret_cast<uintptr_t>(requests[i].dst));
+        cb.aio_nbytes = static_cast<__u64>(requests[i].len);
+        cb.aio_offset = static_cast<__s64>(requests[i].file_offset);
+        control_ptrs[i] = &cb;
+    }
+    const long submitted = syscall(
+        __NR_io_submit, g_direct_aio_context, static_cast<long>(count), control_ptrs.data());
+    if (submitted <= 0) {
+        fprintf(stderr, "[linux-aio] io_submit failed: %s\n", strerror(errno));
+        g_direct_batch_aio_unavailable = true;
+        return -3;
+    }
+    size_t completed = 0;
+    bool ok = submitted == static_cast<long>(count);
+    std::vector<struct io_event> events(static_cast<size_t>(submitted));
+    while (completed < static_cast<size_t>(submitted)) {
+        const long received = syscall(
+            __NR_io_getevents, g_direct_aio_context, 1L,
+            static_cast<long>(events.size()), events.data(), nullptr);
+        if (received <= 0) {
+            fprintf(stderr, "[linux-aio] io_getevents failed: %s\n", strerror(errno));
+            ok = false;
+            break;
+        }
+        for (long i = 0; i < received; ++i) {
+            const size_t request_index = events[static_cast<size_t>(i)].data > 0
+                ? static_cast<size_t>(events[static_cast<size_t>(i)].data - 1) : count;
+            if (request_index >= count ||
+                events[static_cast<size_t>(i)].res !=
+                    static_cast<__s64>(requests[request_index].len) ||
+                events[static_cast<size_t>(i)].res2 != 0) {
+                ok = false;
+            }
+        }
+        completed += static_cast<size_t>(received);
+    }
+    return ok && completed == count ? 0 : -4;
+}
+#endif
+
+// O_DIRECT requests must be block-aligned, but the final aligned block can
+// legally return fewer than io_len bytes when the file itself is not aligned.
+// required_len is the portion of that aligned request that the caller consumes.
+static int llama_pread_at_least_direct(
+        int fd, void * dst, size_t io_len, size_t required_len,
+        size_t file_offset, const char * tag) {
+    if (required_len > io_len) return -5;
     char * out = static_cast<char *>(dst);
     size_t done = 0;
-    while (done < len) {
-        ssize_t rd = pread(fd, out + done, len - done, file_offset + done);
+    while (done < required_len) {
+        ssize_t rd = pread(fd, out + done, io_len - done, file_offset + done);
         if (rd < 0) {
             fprintf(stderr, "[llama_pread_direct %s] pread fail: %s\n", tag, strerror(errno));
             return -3;
         }
         if (rd == 0) {
             fprintf(stderr, "[llama_pread_direct %s] short read: got %zu / %zu at offset=%zu\n",
-                    tag, done, len, file_offset);
+                    tag, done, required_len, file_offset);
             return -4;
         }
         done += (size_t) rd;
@@ -592,10 +693,15 @@ static int llama_pread_full_direct(int fd, void * dst, size_t len, size_t file_o
     return 0;
 }
 
+static int llama_pread_full_direct(
+        int fd, void * dst, size_t len, size_t file_offset, const char * tag) {
+    return llama_pread_at_least_direct(fd, dst, len, len, file_offset, tag);
+}
+
 int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size_t len) {
 #if defined(__linux__) || defined(__ANDROID__)
-    std::lock_guard<std::mutex> lk(g_direct_mtx);
-    auto &h = g_direct_handles[filename];
+    if (!filename || !dst || len == 0) return -1;
+    auto &h = g_direct_thread_handles[filename];
     if (h.fd < 0) {
         int fd = open(filename, O_RDONLY | O_DIRECT);
         if (fd < 0) {
@@ -635,7 +741,9 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
             if (posix_memalign(&h.bounce, blk, need) != 0) { h.bcap = 0; return -2; }
             h.bcap = need;
         }
-        int rc = llama_pread_full_direct(h.fd, h.bounce, need, head_off_aligned, "head-only");
+        int rc = llama_pread_at_least_direct(
+            h.fd, h.bounce, need, head_skip + len,
+            head_off_aligned, "head-only");
         if (rc != 0) return rc;
         memcpy(dst, (char*)h.bounce + head_skip, len);
         return 0;
@@ -693,7 +801,8 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
             if (posix_memalign(&h.bounce, blk, blk) != 0) { h.bcap = 0; return -2; }
             h.bcap = blk;
         }
-        int rc = llama_pread_full_direct(h.fd, h.bounce, blk, tail_file_off, "tail");
+        int rc = llama_pread_at_least_direct(
+            h.fd, h.bounce, blk, tail_size, tail_file_off, "tail");
         if (rc != 0) return rc;
         memcpy(mid_dst + mid_size, h.bounce, tail_size);
     }
@@ -703,6 +812,159 @@ int llama_pread_direct(const char *filename, void *dst, size_t file_offset, size
 #else
     (void)filename; (void)dst; (void)file_offset; (void)len;
     return -1;
+#endif
+}
+
+int llama_pread_direct_batch(const llama_pread_request * requests, size_t count) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (!requests || count == 0) return -1;
+    if (count == 1) {
+        return llama_pread_direct(requests[0].filename, requests[0].dst,
+                                 requests[0].file_offset, requests[0].len) == 0 ? 1 : -2;
+    }
+
+    struct batch_middle {
+        llama_uring::pread_request request;
+        direct_io_handle * handle = nullptr;
+    };
+    std::vector<batch_middle> middles;
+    middles.reserve(count);
+
+    std::lock_guard<std::mutex> lk(g_direct_mtx);
+    for (size_t i = 0; i < count; ++i) {
+        const llama_pread_request & request = requests[i];
+        if (!request.filename || !request.dst || request.len == 0) return -3;
+        auto & handle = g_direct_handles[request.filename];
+        if (handle.fd < 0) {
+            const int fd = open(request.filename, O_RDONLY | O_DIRECT);
+            if (fd < 0) {
+                fprintf(stderr, "[llama_pread_direct_batch] open failed %s: %s\n",
+                        request.filename, strerror(errno));
+                return -4;
+            }
+            struct stat st;
+            if (fstat(fd, &st) == 0 && st.st_blksize >= 4096 &&
+                (st.st_blksize & (st.st_blksize - 1)) == 0) {
+                handle.blk = static_cast<size_t>(st.st_blksize);
+            }
+            handle.fd = fd;
+        }
+
+        const size_t blk = handle.blk;
+        char * dst = static_cast<char *>(request.dst);
+        const size_t head_aligned = request.file_offset & ~(blk - 1);
+        const size_t head_skip = request.file_offset - head_aligned;
+        const size_t first = std::min(request.len, blk - head_skip);
+
+        auto ensure_bounce = [&handle, blk](size_t bytes) -> bool {
+            if (handle.bcap >= bytes) return true;
+            if (handle.bounce) free(handle.bounce);
+            handle.bounce = nullptr;
+            if (posix_memalign(&handle.bounce, blk, bytes) != 0) {
+                handle.bcap = 0;
+                return false;
+            }
+            handle.bcap = bytes;
+            return true;
+        };
+
+        if (head_skip != 0 || request.len < blk) {
+            if (!ensure_bounce(blk)) return -5;
+            const int rc = llama_pread_at_least_direct(
+                handle.fd, handle.bounce, blk, head_skip + first,
+                head_aligned, "batch-head");
+            if (rc != 0) return rc;
+            memcpy(dst, static_cast<char *>(handle.bounce) + head_skip, first);
+        }
+
+        const size_t consumed = (head_skip != 0 || request.len < blk) ? first : 0;
+        const size_t remaining = request.len - consumed;
+        const size_t middle_size = (remaining / blk) * blk;
+        char * middle_dst = dst + consumed;
+        const size_t middle_offset = request.file_offset + consumed;
+        const bool middle_aligned = middle_size > 0 &&
+            (reinterpret_cast<uintptr_t>(middle_dst) % blk) == 0 &&
+            (middle_offset % blk) == 0 && blk == 4096;
+        if (middle_aligned) {
+            middles.push_back({
+                {request.filename, middle_dst, middle_offset, middle_size}, &handle});
+        } else if (middle_size > 0) {
+            const int rc = llama_pread_full_direct(
+                handle.fd, middle_dst, middle_size, middle_offset, "batch-mid-sync");
+            if (rc != 0) return rc;
+        }
+
+        const size_t tail_size = remaining - middle_size;
+        if (tail_size > 0) {
+            if (!ensure_bounce(blk)) return -5;
+            const size_t tail_offset = middle_offset + middle_size;
+            const int rc = llama_pread_at_least_direct(
+                handle.fd, handle.bounce, blk, tail_size,
+                tail_offset, "batch-tail");
+            if (rc != 0) return rc;
+            memcpy(middle_dst + middle_size, handle.bounce, tail_size);
+        }
+    }
+
+    bool submitted_as_batch = false;
+    if (middles.size() > 1 && !g_direct_batch_uring_unavailable) {
+        std::vector<llama_uring::pread_request> aligned;
+        aligned.reserve(middles.size());
+        for (const batch_middle & middle : middles) aligned.push_back(middle.request);
+        submitted_as_batch = llama_uring::pread_aligned_batch(
+            aligned.data(), aligned.size()) == 0;
+        if (!submitted_as_batch) g_direct_batch_uring_unavailable = true;
+    }
+    if (middles.size() > 1 && !submitted_as_batch &&
+        !g_direct_batch_aio_unavailable) {
+        std::vector<direct_aio_request> aligned;
+        aligned.reserve(middles.size());
+        for (const batch_middle & middle : middles) {
+            aligned.push_back({middle.handle->fd, middle.request.dst,
+                               middle.request.file_offset, middle.request.len});
+        }
+        submitted_as_batch = llama_direct_aio_batch_locked(
+            aligned.data(), aligned.size()) == 0;
+    }
+    if (!submitted_as_batch) {
+        // io_uring may be blocked by Android policy. Complete the exact same
+        // buffers synchronously and report the fallback to the caller.
+        for (const batch_middle & middle : middles) {
+            const int rc = llama_pread_full_direct(
+                middle.handle->fd, middle.request.dst, middle.request.len,
+                middle.request.file_offset, "batch-fallback");
+            if (rc != 0) return rc;
+        }
+        return 1;
+    }
+    return 0;
+#else
+    (void) requests;
+    (void) count;
+    return -1;
+#endif
+}
+
+bool llama_pread_direct_batch_available() {
+#if defined(__linux__) || defined(__ANDROID__)
+    std::lock_guard<std::mutex> lk(g_direct_mtx);
+    const char * mode = std::getenv("GGML_ELASTIC_CPU_BATCH_IO");
+    if (mode && std::strcmp(mode, "stream") == 0) return false;
+    if (mode && std::strcmp(mode, "aio") == 0) {
+        g_direct_batch_uring_unavailable = true;
+        return llama_direct_aio_init_locked();
+    }
+    if (!g_direct_batch_uring_unavailable) {
+        if (llama_uring::init()) return true;
+        g_direct_batch_uring_unavailable = true;
+    }
+    // Native AIO is retained as an explicit diagnostic/portability fallback.
+    // On OP12 it is a real batch but slower than publishing each sequential
+    // read immediately to PREPARE, so the default work-conserving fallback is
+    // the streaming path selected by the caller.
+    return false;
+#else
+    return false;
 #endif
 }
 
@@ -754,18 +1016,130 @@ std::vector<std::pair<llama_weight_movement_fn_t,  void *>>      g_weight_mov_pr
 std::vector<std::pair<llama_weight_stage_fn_t,     void *>>      g_weight_stage_providers;
 std::vector<std::pair<llama_weight_anchor_fn_t,    void *>>      g_weight_anchor_providers;
 std::vector<std::pair<llama_weight_transform_fn_t, void *>>      g_weight_transform_providers;
+struct working_set_provider {
+    llama_working_set_query_fn_t query_fn = nullptr;
+    llama_working_set_target_fn_t target_fn = nullptr;
+    void * user_data = nullptr;
+};
+std::vector<working_set_provider>                                g_working_set_providers;
 struct llama_weight_runtime_record {
     llama_weight_runtime_location desired = LLAMA_WEIGHT_RUNTIME_UNKNOWN;
     bool cpu_compute_resident = false;
     bool gpu_compute_resident = false;
 };
 std::unordered_map<std::string, llama_weight_runtime_record>      g_weight_runtime_state;
+std::unordered_map<std::string, std::vector<llama_weight_unit_slice>>
+                                                                    g_weight_unit_plan;
+uint64_t                                                          g_weight_unit_generation = 0;
 // Budget provider: 单 slot (预算是全局值)。
 std::mutex                                                       g_budget_mtx;
 llama_budget_fn_t                                                g_budget_fn = nullptr;
 void *                                                           g_budget_ud = nullptr;
 llama_budget_reset_fn_t                                          g_budget_reset_fn = nullptr;
 void *                                                           g_budget_reset_ud = nullptr;
+}
+
+void llama_weight_unit_plan_clear() {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_unit_plan.clear();
+    ++g_weight_unit_generation;
+}
+
+void llama_weight_unit_plan_add(
+        const char * name,
+        const llama_weight_unit_slice & slice) {
+    if (!name || !*name || slice.unit_id < 0) return;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_weight_unit_plan[name].push_back(slice);
+}
+
+static bool weight_unit_slices_equal(
+        const std::vector<llama_weight_unit_slice> & first,
+        const std::vector<llama_weight_unit_slice> & second) {
+    if (first.size() != second.size()) return false;
+    for (size_t i = 0; i < first.size(); ++i) {
+        if (
+            first[i].row_start != second[i].row_start ||
+            first[i].row_count != second[i].row_count ||
+            first[i].unit_id != second[i].unit_id ||
+            first[i].flags != second[i].flags
+        ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int llama_weight_unit_plan_replace(
+        const std::vector<std::pair<
+            std::string, llama_weight_unit_slice>> & entries) {
+    std::unordered_map<
+        std::string, std::vector<llama_weight_unit_slice>> next;
+    next.reserve(entries.size());
+    for (const auto & entry : entries) {
+        if (entry.first.empty() || entry.second.unit_id < 0) continue;
+        next[entry.first].push_back(entry.second);
+    }
+
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    int changed_weights = 0;
+    for (const auto & row : next) {
+        const auto old = g_weight_unit_plan.find(row.first);
+        if (
+            old == g_weight_unit_plan.end() ||
+            !weight_unit_slices_equal(old->second, row.second)
+        ) {
+            ++changed_weights;
+        }
+    }
+    for (const auto & row : g_weight_unit_plan) {
+        if (next.find(row.first) == next.end()) {
+            ++changed_weights;
+        }
+    }
+    if (changed_weights > 0) {
+        for (auto it = g_weight_unit_plan.begin();
+             it != g_weight_unit_plan.end();) {
+            if (next.find(it->first) == next.end()) {
+                it = g_weight_unit_plan.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto & row : next) {
+            const auto old = g_weight_unit_plan.find(row.first);
+            if (
+                old == g_weight_unit_plan.end() ||
+                !weight_unit_slices_equal(old->second, row.second)
+            ) {
+                g_weight_unit_plan[row.first] =
+                    std::move(row.second);
+            }
+        }
+        ++g_weight_unit_generation;
+    }
+    return changed_weights;
+}
+
+int llama_weight_unit_plan_query(
+        const char * name,
+        llama_weight_unit_slice * out,
+        int capacity) {
+    if (!name || !*name || capacity < 0) return -1;
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    auto found = g_weight_unit_plan.find(name);
+    if (found == g_weight_unit_plan.end()) return 0;
+    const int count = static_cast<int>(found->second.size());
+    if (out && capacity > 0) {
+        const int copy_count = std::min(count, capacity);
+        std::copy_n(found->second.begin(), copy_count, out);
+    }
+    return count;
+}
+
+uint64_t llama_weight_unit_plan_generation() {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    return g_weight_unit_generation;
 }
 void llama_budget_register(llama_budget_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_budget_mtx);
@@ -863,6 +1237,39 @@ void llama_weight_anchor_register(llama_weight_anchor_fn_t fn, void * user_data)
 void llama_weight_transform_register(llama_weight_transform_fn_t fn, void * user_data) {
     std::lock_guard<std::mutex> lk(g_weight_res_mtx);
     g_weight_transform_providers.emplace_back(fn, user_data);
+}
+void llama_working_set_register(
+        llama_working_set_query_fn_t query_fn,
+        llama_working_set_target_fn_t target_fn,
+        void * user_data) {
+    std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+    g_working_set_providers.push_back({query_fn, target_fn, user_data});
+}
+bool llama_working_set_query(const char * kind, llama_working_set_runtime_state * state) {
+    if (!kind || !state) return false;
+    std::vector<working_set_provider> providers;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        providers = g_working_set_providers;
+    }
+    for (const auto & provider : providers) {
+        if (provider.query_fn && provider.query_fn(kind, state, provider.user_data)) return true;
+    }
+    return false;
+}
+int llama_working_set_set_target(const char * kind, int target_capacity) {
+    if (!kind || target_capacity < -1) return -1;
+    std::vector<working_set_provider> providers;
+    {
+        std::lock_guard<std::mutex> lk(g_weight_res_mtx);
+        providers = g_working_set_providers;
+    }
+    for (const auto & provider : providers) {
+        if (!provider.target_fn) continue;
+        const int rc = provider.target_fn(kind, target_capacity, provider.user_data);
+        if (rc != -2) return rc;
+    }
+    return -2;
 }
 bool llama_weight_residency_query(const char * name) {
     std::vector<std::pair<llama_weight_residency_fn_t, void *>> snap;

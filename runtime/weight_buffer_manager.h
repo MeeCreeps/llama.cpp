@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace elastic {
@@ -35,6 +36,10 @@ struct block_meta {
     void    *backend_handle;     // 不透明 cl_mem 句柄；nullptr = 未分配
     void    *last_use_event;     // 不透明 cl_event；evict 前需 wait 此 event
     void    *prefetch_event;     // 不透明 cl_event；in-flight 上传写完才能用，nullptr = 没在 in-flight
+    // Dynamic Super-Tensor grouping. Blocks with the same non-negative id
+    // form one logical residency unit and must be evicted atomically.  A
+    // negative id keeps the historical per-block eviction semantics.
+    int64_t  eviction_group;
 };
 
 struct weight_buffer_manager {
@@ -42,6 +47,7 @@ struct weight_buffer_manager {
     uint64_t current_token;
     int      n_resident;
     size_t   resident_bytes;
+    std::unordered_map<int64_t, std::vector<int>> eviction_groups;
 
     // 驱逐策略：默认 MRU（evict 最近用过的）。LLM decode 是严格 round-robin
     // 访问 layer 0..N-1，刚用过的 weight 要等一整个 cycle 才再被访问，所以
@@ -102,13 +108,24 @@ void wbm_set_prefetch_event(weight_buffer_manager *wbm, int idx, void *event);
 // 适合给 RMSNorm 等小权重用，避免频繁换入换出。
 void wbm_set_pinned(weight_buffer_manager *wbm, int idx, bool pinned);
 
+// Reset/set logical residency-unit membership.  Backends refresh these ids at
+// graph entry after an ExecPlan working-unit diff is published.  Grouping
+// changes metadata only; it never reallocates or copies the pre-provisioned
+// physical row tiles.
+void wbm_clear_eviction_groups(weight_buffer_manager *wbm);
+void wbm_set_eviction_group(weight_buffer_manager *wbm,
+                            int idx,
+                            int64_t group_id);
+
 // LRU 选受害者：从已驻留 + 非 pinned 的 block 里挑 last_used_token 最小、且
 // 不是 exclude_idx 的。返回 block_idx；没合适候选时返回 -1。
 int  wbm_pick_lru_victim(const weight_buffer_manager *wbm, int exclude_idx);
 
 // 字节预算批量驱逐：贪心 LRU 挑 victim 直到 resident_bytes <= target_bytes。
 // out_victims 按选中顺序追加 block_idx；不会清空已有内容。
-// pinned + exclude_idx 跳过。返回选中的 victim 数（== out_victims 增加的长度）。
+// pinned + exclude_idx 跳过。具有相同 eviction_group 的 resident blocks
+// 会被一起选择；若组内任一 resident block pinned 或为 exclude_idx，则整个组
+// 不可驱逐。返回选中的 victim 数（== out_victims 增加的长度）。
 // 注意本函数**不实际释放 backend handle**，只调 wbm_mark_evicted；GPU 端的
 // clReleaseMemObject 由 OpenCL 包装层的 wbmcl_evict_batch 拿这个 victim 列表
 // 做批量同步 + 释放。

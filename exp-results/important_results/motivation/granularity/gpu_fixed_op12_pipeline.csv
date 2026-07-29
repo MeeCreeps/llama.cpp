@@ -1,0 +1,8 @@
+weight_budget_pct,total_budget_mib,multi_median_ms,tensor_median_ms,cut_median_ms,n_runs_per_mode,winner
+30,727,1247.833,1271.049,1590.780,3,multi
+40,905,1102.507,1093.907,1367.640,3,tensor
+50,1083,924.498,942.298,1137.951,3,multi
+60,1261,784.224,783.029,884.166,3,multi_tensor_tie
+70,1439,655.090,653.855,746.199,3,multi_tensor_tie
+80,1617,542.783,547.024,502.078,3,cut_p50_multi_mean
+90,1795,427.437,428.814,466.573,3,multi_tensor_tie

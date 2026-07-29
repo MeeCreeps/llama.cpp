@@ -30,6 +30,45 @@ static void test_native_roundtrip() {
     p.misc_bytes        = 5678;
     p.pred_per_token_ms = 12.5;
     p.bottleneck        = "disk";
+    p.working_unit.enabled = true;
+    p.working_unit.mode = "cut";
+    p.working_unit.cut_parts = 2;
+    p.working_unit.multi_tensors = 3;
+    p.working_unit.policy = "diff-tree";
+    p.working_unit.state_aware = true;
+    p.working_unit.predicted_ms = 9.25;
+    p.working_unit.switch_cost_ms = 0.5;
+    SuperTensorUnitPlan u0;
+    u0.unit_id = 10;
+    u0.fuse_layout = true;
+    u0.fuse_compute = true;
+    u0.tiles = {
+        {0, "blk.0.attn_q.weight", 0, 256, 0, 500},
+        {1, "blk.1.ffn_up.weight", 0, 256, 0, 1000},
+    };
+    SuperTensorUnitPlan u1;
+    u1.unit_id = 11;
+    u1.tiles = {
+        {0, "blk.0.attn_q.weight", 256, 256, 500, 500},
+    };
+    SuperTensorUnitPlan u2;
+    u2.unit_id = 12;
+    u2.tiles = {
+        {1, "blk.1.ffn_up.weight", 256, 256, 1000, 1000},
+    };
+    p.working_unit.units = {u0, u1, u2};
+
+    WorkingSetPlan ws;
+    ws.name = "dynamic_weights";
+    ws.kind = "expert_slices";
+    ws.target_capacity = 12;
+    ws.budget_capacity = 16;
+    ws.min_capacity = 1;
+    ws.max_capacity = 64;
+    ws.policy = "runtime_pressure";
+    ws.state_aware = true;
+    ws.coupled_to_core = true;
+    p.working_sets = {ws};
 
     WeightPlan w0; w0.weight_id = 0; w0.name = "blk.0.attn_q.weight"; w0.layer = 0;
     w0.byte_size = 1000; w0.location = Location::GPU; w0.pinned = true; w0.xform = Xform::GPU_CONVERT;
@@ -63,6 +102,29 @@ static void test_native_roundtrip() {
     CHECK(q.kv_bytes == 1234);
     CHECK(q.misc_bytes == 5678);
     CHECK(q.bottleneck == "disk");
+    CHECK(q.working_unit.enabled);
+    CHECK(q.working_unit.mode == "cut");
+    CHECK(q.working_unit.cut_parts == 2);
+    CHECK(q.working_unit.multi_tensors == 3);
+    CHECK(q.working_unit.policy == "diff-tree");
+    CHECK(q.working_unit.state_aware);
+    CHECK(q.working_unit.predicted_ms == 9.25);
+    CHECK(q.working_unit.switch_cost_ms == 0.5);
+    CHECK(q.working_unit.units.size() == 3);
+    CHECK(q.working_unit.units[0].unit_id == 10);
+    CHECK(q.working_unit.units[0].fuse_layout);
+    CHECK(q.working_unit.units[0].fuse_compute);
+    CHECK(q.working_unit.units[0].tiles.size() == 2);
+    CHECK(q.working_unit.units[0].tiles[1].weight_id == 1);
+    CHECK(q.working_unit.units[1].tiles[0].row_start == 256);
+    CHECK(q.working_unit.units[2].tiles[0].byte_offset == 1000);
+    CHECK(q.working_sets.size() == 1);
+    CHECK(q.working_sets[0].kind == "expert_slices");
+    CHECK(q.working_sets[0].target_capacity == 12);
+    CHECK(q.working_sets[0].budget_capacity == 16);
+    CHECK(q.working_sets[0].max_capacity == 64);
+    CHECK(q.working_sets[0].state_aware);
+    CHECK(q.working_sets[0].coupled_to_core);
     CHECK(q.weights.size() == 2);
     CHECK(q.ops.size() == 2);
     CHECK(q.timeline.size() == 2);
@@ -201,12 +263,38 @@ static void test_make_plan_synth_gpu_stages() {
     CHECK(q_xform == 1);
     CHECK(k_load == 1);
     CHECK(k_transfer == 0);
-    CHECK(k_xform == 0);
+    // CPU elastic weights still require CPU_REPACK/layout preparation after
+    // a disk reload. Keeping this stage explicit is required by the
+    // granularity cost model and its pipeline breakdown.
+    CHECK(k_xform == 1);
+}
+
+static void test_nullable_schedule_diagnostics() {
+    const std::string json = R"JSON({
+      "schema_version": 1,
+      "budget_mib": 1024,
+      "weights": [],
+      "ops": [],
+      "timeline": [],
+      "schedule": {
+        "kind": "none",
+        "status": null,
+        "objective_ms": null,
+        "events": []
+      }
+    })JSON";
+    ExecPlan plan;
+    std::string err;
+    CHECK(plan_from_json_string(json, plan, &err));
+    CHECK(plan.schedule_kind == "none");
+    CHECK(plan.schedule_status.empty());
+    CHECK(plan.schedule_objective_ms == 0.0);
 }
 
 int main(int argc, char ** argv) {
     test_native_roundtrip();
     test_make_plan_synth_gpu_stages();
+    test_nullable_schedule_diagnostics();
     // 可传一个真实 plan_*.json 路径;CMake 会传 runtime/plan/plans/plan_4144MiB.json
     test_make_plan_load(argc > 1 ? argv[1] : nullptr);
 

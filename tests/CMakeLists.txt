@@ -226,3 +226,12 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-elastic-weight-unit-plan.cpp)
+target_include_directories(
+    test-elastic-weight-unit-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_sources(
+    test-elastic-weight-unit-plan PRIVATE
+    ${PROJECT_SOURCE_DIR}/runtime/elastic_granularity.cpp)
+target_include_directories(
+    test-elastic-weight-unit-plan PRIVATE ${PROJECT_SOURCE_DIR}/runtime)

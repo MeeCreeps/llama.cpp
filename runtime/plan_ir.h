@@ -13,7 +13,8 @@
 //   * 用逻辑 id(weight_id / op_id / engine)描述,不含任何 cl_mem / 指针。
 //   * 可 JSON 序列化(native schema)+ 可加载现有 make_plan.py 产出的 plan_*.json。
 //
-// 实现单位 = 整个 weight tensor(不做 sub-tensor 切分)。
+// WorkingUnitPlan additionally selects how physical weight tiles are grouped
+// into schedulable units (sub-tensor / tensor / multi-tensor).
 
 #pragma once
 
@@ -103,6 +104,57 @@ struct ScheduleEvent {
     double      duration_ms = 0.0;
 };
 
+// Runtime-managed working set. Unlike WeightPlan, an entry represents a
+// bounded set of interchangeable slices/objects whose demand can change per
+// token (for example expert slices or multimodal encoder tiles).
+struct WorkingSetPlan {
+    std::string name;                 // stable logical resource name
+    std::string kind;                 // executor/backend capability key
+    int         target_capacity = -1; // -1 lets the backend choose
+    int         budget_capacity = -1; // hard ceiling under this plan's budget
+    int         min_capacity    = 0;  // correctness floor
+    int         max_capacity    = -1; // -1 means no plan-side ceiling
+    std::string policy;               // replacement/retention policy
+    bool        state_aware = false;  // target used observed runtime state
+    bool        coupled_to_core = false; // capacity change requires weight-plan reconciliation
+};
+
+// Smallest pre-provisioned row tile referenced by a schedulable Super-Tensor.
+// A whole-tensor tile uses row_start=0,row_count=-1. byte_size=0 lets the
+// backend derive the physical size.
+struct WorkingUnitTilePlan {
+    int         weight_id  = -1;
+    std::string weight_name;
+    int64_t     row_start  = 0;
+    int64_t     row_count  = -1;
+    size_t      byte_offset = 0;
+    size_t      byte_size   = 0;
+};
+
+// One schedulable unit. A unit containing part of one weight is CUT; all tiles
+// of one weight form Tensor; tiles from multiple weights form Multi. Thus one
+// plan can mix all three granularities.
+struct SuperTensorUnitPlan {
+    int unit_id = -1;
+    std::vector<WorkingUnitTilePlan> tiles;
+    bool fuse_layout  = false;
+    bool fuse_compute = false;
+};
+
+// Reconfigurable mixed partition. `mode` remains a backward-compatible
+// fallback for plans without explicit units.
+struct WorkingUnitPlan {
+    bool        enabled       = false;
+    std::string mode          = "tensor";
+    int         cut_parts     = 2;
+    int         multi_tensors = 2;
+    std::string policy;
+    bool        state_aware   = false;
+    double      predicted_ms  = 0.0;
+    double      switch_cost_ms = 0.0;
+    std::vector<SuperTensorUnitPlan> units;
+};
+
 // ── 整个 plan ──
 struct ExecPlan {
     int         schema_version = 1;
@@ -114,6 +166,8 @@ struct ExecPlan {
     std::vector<OpPlan>     ops;       // 按 op_id 索引
     std::vector<PlanEvent>  timeline;  // 按执行顺序
     std::vector<ScheduleEvent> schedule_events; // optional interval CP-SAT schedule
+    std::vector<WorkingSetPlan> working_sets;   // runtime-varying resources
+    WorkingUnitPlan working_unit;                // split/merge configuration
 
     std::string schedule_kind;
     std::string schedule_status;

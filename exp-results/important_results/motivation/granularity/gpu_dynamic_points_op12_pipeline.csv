@@ -1,0 +1,5 @@
+phase,weight_budget_pct,total_budget_mib,multi_median_of_run_p50_ms,tensor_median_of_run_p50_ms,cut_median_of_run_p50_ms,n_runs_per_mode,winner
+initial_90,90,1795,442.646,444.785,468.032,3,multi_tensor
+low_30,30,727,1182.592,1251.788,1573.288,3,multi
+mid_60,60,1261,817.399,804.517,908.247,3,tensor
+recovered_90,90,1795,443.076,456.585,479.459,3,multi

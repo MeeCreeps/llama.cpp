@@ -31,6 +31,14 @@ public:
     virtual const ExecPlan * get(int64_t budget_mib,
                                  size_t kv_bytes = 0, size_t misc_bytes = 0) = 0;
 
+    // Async providers may need a cheap same-budget poll so a result completed
+    // during the previous graph can be published. Table/synchronous providers
+    // keep the default false and retain the zero-call same-band fast path.
+    virtual bool needs_poll(int64_t budget_mib) const {
+        (void) budget_mib;
+        return false;
+    }
+
     // 可用档数(table = index 条目数;callback = 已缓存数)
     virtual int n_bands() const = 0;
 

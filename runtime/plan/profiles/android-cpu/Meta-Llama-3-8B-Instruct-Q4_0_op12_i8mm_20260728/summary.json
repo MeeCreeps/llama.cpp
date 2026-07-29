@@ -1,0 +1,11 @@
+{
+  "base_cost_dir": "runtime/plan/profiles/android-opencl/Meta-Llama-3-8B-Instruct-Q4_0_profiled_trace01",
+  "cpu_load_fixed_ms": 1.9815323974034338,
+  "cpu_load_ms_per_mib": 0.26401814668127627,
+  "cpu_xform_fixed_ms": 0.0,
+  "cpu_xform_ms_per_mib": 0.6072644141227629,
+  "device": "android-cpu-elastic",
+  "model": "OP12-Llama3-8B-Q4-CPU-pipeline-budgetfair-I8MM-workerpin-20260728",
+  "stage_model_source": "fixed-budget Tensor-mode runtime counters",
+  "stage_records": 0
+}

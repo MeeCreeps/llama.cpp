@@ -1,0 +1,6 @@
+phase,multi_median_ms,multi_fused_median_ms,tensor_median_ms,cut_median_ms,evidence_scope
+high_before,366.789,361.9905,304.318,361.911,derived_olmoe_mapped_trace_diagnostic_only
+decline,463.147,504.288,372.874,415.310,derived_olmoe_mapped_trace_diagnostic_only
+low,992.319,985.1475,883.403,867.717,derived_olmoe_mapped_trace_diagnostic_only
+recovery,283.890,263.156,249.384,309.4555,derived_olmoe_mapped_trace_diagnostic_only
+high_after,161.817,162.846,153.394,159.851,derived_olmoe_mapped_trace_diagnostic_only

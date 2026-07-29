@@ -1,0 +1,495 @@
+{
+  "calibration": {
+    "cpu": {
+      "compute_fit": {
+        "launch_ms": 0.0,
+        "mode_rate_ms_per_mib": {
+          "cut": 0.06134104414671362,
+          "multi": 0.05710004313591676,
+          "tensor": 0.05783592899956864
+        },
+        "samples": 21
+      },
+      "io_fit": {
+        "launch_ms": 1.9815323974034338,
+        "mode_rate_ms_per_mib": {
+          "cut": 0.20748241832038716,
+          "multi": 0.2472955128812764,
+          "tensor": 0.26401814668127627
+        },
+        "samples": 21
+      },
+      "pipeline_efficiency_residual_curve": {
+        "enabled": true,
+        "method": "observed_latency/pipeline_critical_stage",
+        "points": {
+          "0.252595287653924": {
+            "cut": {
+              "critical_stage_scale": 0.9986180789740352,
+              "observed_scale": 0.9656627131379308,
+              "residual_scale": 0.966999029428786
+            },
+            "multi": {
+              "critical_stage_scale": 0.9663002309085169,
+              "observed_scale": 1.0635249075605882,
+              "residual_scale": 1.1006153921340374
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.35940214765050194": {
+            "cut": {
+              "critical_stage_scale": 1.034414109906771,
+              "observed_scale": 0.9758593667762196,
+              "residual_scale": 0.9433933251975568
+            },
+            "multi": {
+              "critical_stage_scale": 1.048248084820792,
+              "observed_scale": 1.1166675226814247,
+              "residual_scale": 1.0652702722298124
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.46620900764707984": {
+            "cut": {
+              "critical_stage_scale": 0.9568733470888293,
+              "observed_scale": 0.8808696107731245,
+              "residual_scale": 0.920570745807753
+            },
+            "multi": {
+              "critical_stage_scale": 0.9745206045868031,
+              "observed_scale": 1.0280648974408229,
+              "residual_scale": 1.05494423884113
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.5730158676436578": {
+            "cut": {
+              "critical_stage_scale": 1.0107633476896982,
+              "observed_scale": 0.9873469009296393,
+              "residual_scale": 0.9768329086985773
+            },
+            "multi": {
+              "critical_stage_scale": 1.0368017630715554,
+              "observed_scale": 1.1038833536829096,
+              "residual_scale": 1.0647004982057737
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.6798227276402357": {
+            "cut": {
+              "critical_stage_scale": 1.0569678269591458,
+              "observed_scale": 1.0156406695571976,
+              "residual_scale": 0.9609002692912187
+            },
+            "multi": {
+              "critical_stage_scale": 1.0499251109841718,
+              "observed_scale": 1.1246673945998666,
+              "residual_scale": 1.0711882046002628
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.7866295876368135": {
+            "cut": {
+              "critical_stage_scale": 0.9735963649095833,
+              "observed_scale": 0.9729448578923249,
+              "residual_scale": 0.999330824312066
+            },
+            "multi": {
+              "critical_stage_scale": 1.0132288016680138,
+              "observed_scale": 1.1104711806365817,
+              "residual_scale": 1.0959727741734977
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "0.8934364476333915": {
+            "cut": {
+              "critical_stage_scale": 1.0193911708168542,
+              "observed_scale": 0.9672932502727196,
+              "residual_scale": 0.9488931020440489
+            },
+            "multi": {
+              "critical_stage_scale": 1.0197833580061424,
+              "observed_scale": 1.0217979676133284,
+              "residual_scale": 1.001975527048338
+            },
+            "tensor": {
+              "critical_stage_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          }
+        }
+      },
+      "planned_weight_mib": 4154.9765625,
+      "prepare_fit": {
+        "launch_ms": 0.0,
+        "mode_rate_ms_per_mib": {
+          "cut": 0.62048990347343,
+          "multi": 0.6236112103777293,
+          "tensor": 0.6072644141227629
+        },
+        "samples": 21,
+        "time_key": "stage_prepare_ms"
+      },
+      "ratios": [
+        30,
+        40,
+        50,
+        60,
+        70,
+        80,
+        90
+      ],
+      "runs_csv": [
+        "exp-results/Meta-Llama-3-8B-Instruct-Q4_0/granularity_cpu_pipeline_fixed_30_90_budgetfair_i8mm_workerpin_prep2_op12_20260728/runs.csv"
+      ],
+      "unplanned_pinned_mib": 281.8125,
+      "valid_rows": 21
+    }
+  },
+  "held_out": "dynamic nodes and full trace are not used",
+  "profiles": {
+    "cpu": {
+      "compute_launch_ms": 0.0,
+      "compute_ms_per_mib": 0.05783592899956864,
+      "cut_row_alignment": 64,
+      "hysteresis_ms": 0.05,
+      "io_bandwidth_mib_s": 3787.6184367251235,
+      "io_request_ms": 1.9815323974034338,
+      "max_merge_mib": 64.0,
+      "mode_compute_scale": {
+        "cut": 1.0606044582973868,
+        "multi": 0.9872763198174379,
+        "tensor": 1.0
+      },
+      "mode_fusion_scale": {
+        "cut": 1.0,
+        "multi": 1.0,
+        "tensor": 1.0
+      },
+      "mode_io_scale": {
+        "cut": 0.785864232926613,
+        "multi": 0.9366610439085178,
+        "tensor": 1.0
+      },
+      "mode_io_work_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 0.9922733443756591
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 0.9919036918641913
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 0.9933405002235689
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 0.9984953548767103
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 0.9953238531450085
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 0.9931626116267552
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 0.9981051190765465
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0010437566869748
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.00023466808736
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0002450320751002
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0002195389681667
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0002238155759655
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.0002076776842341
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_pipeline_efficiency_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 0.966999029428786
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 0.9433933251975568
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 0.920570745807753
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 0.9768329086985773
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 0.9609002692912187
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 0.999330824312066
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 0.9488931020440489
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 1.1006153921340374
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0652702722298124
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.05494423884113
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0647004982057737
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0711882046002628
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0959727741734977
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.001975527048338
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_prepare_scale": {
+        "cut": 1.021778798564662,
+        "multi": 1.0269187455658513,
+        "tensor": 1.0
+      },
+      "mode_prepare_work_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 0.9922755736473337
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 0.9919036918641913
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 0.9933405002235689
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 0.9984953548767103
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 0.9953238531450085
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 0.9931626116267552
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 0.9981073483482212
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0010437566869748
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.00023466808736
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0002450320751002
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0002195389681667
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0002238155759655
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.0002076776842341
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.252595287653924,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.35940214765050194,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.46620900764707984,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.5730158676436578,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.6798227276402357,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.7866295876368135,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8934364476333915,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_unit_overhead_ms": {
+        "cut": 0.0,
+        "multi": 0.0,
+        "tensor": 0.0
+      },
+      "multi_implementation": "multi",
+      "prepare_bandwidth_mib_s": 1646.7291294263832,
+      "prepare_launch_ms": 0.0,
+      "transition_fixed_ms": 0.02,
+      "transition_ms_per_mib": 0.0,
+      "wait_feedback_weight": 0.0
+    }
+  },
+  "schema_version": 1,
+  "source": "OP12-Llama3-8B-Q4-CPU-pipeline-budgetfair-I8MM-workerpin-20260728"
+}

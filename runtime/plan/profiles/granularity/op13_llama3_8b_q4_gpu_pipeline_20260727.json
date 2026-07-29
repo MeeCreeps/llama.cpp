@@ -1,0 +1,277 @@
+{
+  "calibration": {
+    "gpu": {
+      "compute_fit": {
+        "launch_ms": 0.0,
+        "mode_rate_ms_per_mib": {
+          "cut": 3.1723393286114234e-05,
+          "multi": 2.586627975524484e-05,
+          "tensor": 2.8606634974792744e-05
+        },
+        "samples": 9
+      },
+      "io_fit": {
+        "launch_ms": 0.0,
+        "mode_rate_ms_per_mib": {
+          "cut": 0.5563422235231323,
+          "multi": 0.4922209513990689,
+          "tensor": 0.5329248551170396
+        },
+        "samples": 9
+      },
+      "pipeline_efficiency_residual_curve": {
+        "enabled": true,
+        "method": "observed_latency/additive_phase_cost",
+        "points": {
+          "70": {
+            "cut": {
+              "additive_phase_scale": 1.0625403981036048,
+              "observed_scale": 1.0951820213586023,
+              "residual_scale": 1.0307203597277388
+            },
+            "multi": {
+              "additive_phase_scale": 0.9437009881211051,
+              "observed_scale": 1.0711374185927427,
+              "residual_scale": 1.1350389923034432
+            },
+            "tensor": {
+              "additive_phase_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "80": {
+            "cut": {
+              "additive_phase_scale": 0.89185973910628,
+              "observed_scale": 1.0215069370109555,
+              "residual_scale": 1.1453672502747945
+            },
+            "multi": {
+              "additive_phase_scale": 0.989135538422431,
+              "observed_scale": 1.0867754886231982,
+              "residual_scale": 1.0987124073577346
+            },
+            "tensor": {
+              "additive_phase_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          },
+          "90": {
+            "cut": {
+              "additive_phase_scale": 0.8257232848924674,
+              "observed_scale": 0.9390383070563454,
+              "residual_scale": 1.1372312301676644
+            },
+            "multi": {
+              "additive_phase_scale": 0.7789334162250173,
+              "observed_scale": 0.9159578832688046,
+              "residual_scale": 1.1759129396551704
+            },
+            "tensor": {
+              "additive_phase_scale": 1.0,
+              "observed_scale": 1.0,
+              "residual_scale": 1.0
+            }
+          }
+        }
+      },
+      "prepare_fit": {
+        "launch_ms": 0.0,
+        "mode_rate_ms_per_mib": {
+          "cut": 0.1511976293416694,
+          "multi": 0.1624966403753282,
+          "tensor": 0.17256918489065606
+        },
+        "samples": 9,
+        "time_key": "gpu_prepare_host_total_ms"
+      },
+      "ratios": [
+        70,
+        80,
+        90
+      ],
+      "runs_csv": [
+        "exp-results/Meta-Llama-3-8B-Instruct-Q4_0/granularity_gpu_pipeline_calibration_8b_70_90_op13_20260727/runs.csv"
+      ],
+      "valid_rows": 9
+    }
+  },
+  "held_out": "dynamic nodes and full trace are not used",
+  "profiles": {
+    "gpu": {
+      "compute_launch_ms": 0.0,
+      "compute_ms_per_mib": 2.8606634974792744e-05,
+      "cut_row_alignment": 64,
+      "hysteresis_ms": 0.05,
+      "io_bandwidth_mib_s": 1876.4371569428538,
+      "io_request_ms": 0.0,
+      "max_merge_mib": 64.0,
+      "mode_compute_scale": {
+        "cut": 1.1089522872602064,
+        "multi": 0.9042056074766355,
+        "tensor": 1.0
+      },
+      "mode_fusion_scale": {
+        "cut": 1.0,
+        "multi": 1.0,
+        "tensor": 1.0
+      },
+      "mode_io_scale": {
+        "cut": 1.043941220195012,
+        "multi": 0.9236216826309754,
+        "tensor": 1.0
+      },
+      "mode_io_work_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.001465668862296
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 0.9303087239067105
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 0.7836144656327905
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.1414629099562024
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.0700532639236033
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 0.8714345841292453
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_pipeline_efficiency_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.0307203597277388
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.1453672502747945
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.1372312301676644
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.1350389923034432
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.0987124073577346
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.1759129396551704
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_prepare_scale": {
+        "cut": 0.8761565944549822,
+        "multi": 0.9416318474140672,
+        "tensor": 1.0
+      },
+      "mode_prepare_work_curve": {
+        "cut": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 0.8979322265455465
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.018265959796775
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.0283583304834953
+          }
+        ],
+        "multi": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 0.95987862822724
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 0.9303688977247626
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.0837591805494486
+          }
+        ],
+        "tensor": [
+          {
+            "resident_ratio": 0.7,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.8,
+            "scale": 1.0
+          },
+          {
+            "resident_ratio": 0.9,
+            "scale": 1.0
+          }
+        ]
+      },
+      "mode_unit_overhead_ms": {
+        "cut": 0.0,
+        "multi": 0.0,
+        "tensor": 0.0
+      },
+      "multi_implementation": "multi",
+      "prepare_bandwidth_mib_s": 5794.777327328884,
+      "prepare_launch_ms": 0.0,
+      "transition_fixed_ms": 0.02,
+      "transition_ms_per_mib": 0.0,
+      "wait_feedback_weight": 0.25
+    }
+  },
+  "schema_version": 1,
+  "source": "OP13-Llama3-8B-Q4-GPU-pipeline-residual-20260727"
+}

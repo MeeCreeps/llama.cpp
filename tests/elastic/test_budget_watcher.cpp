@@ -22,6 +22,7 @@ using elastic::budget_watcher_get;
 using elastic::budget_watcher_init;
 using elastic::budget_watcher_interp_at;
 using elastic::budget_watcher_load_csv;
+using elastic::budget_watcher_reset_clock;
 using elastic::budget_watcher_shutdown;
 
 namespace {
@@ -164,7 +165,34 @@ void test_end_to_end() {
     std::printf("[OK] test_end_to_end\n");
 }
 
-// —— 用例 7：单点 schedule 处处返回该值 ——
+// —— 用例 7：decode 边界 reset 后从 t=0 重新 replay ——
+void test_reset_clock() {
+    std::string csv = "time_sec,budget_mb\n0.0,1000\n0.2,2000\n";
+    std::string p = write_tmp("bw_test_reset.csv", csv);
+
+    budget_watcher bw{};
+    budget_watcher_config cfg;
+    cfg.mode           = budget_watcher::INTERP_LINEAR;
+    cfg.tick_period_ms = 2;
+    [[maybe_unused]] int rc = budget_watcher_init(&bw, p.c_str(), cfg);
+    assert(rc == 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    assert(budget_watcher_get(&bw) > 1300);
+    for (int i = 0; i < 100; ++i) {
+        budget_watcher_reset_clock(&bw);
+        const size_t value = budget_watcher_get(&bw);
+        assert(value >= 1000 && value <= 1010);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const size_t after = budget_watcher_get(&bw);
+    assert(after >= 1000 && after < 1250);
+
+    budget_watcher_shutdown(&bw);
+    std::printf("[OK] test_reset_clock\n");
+}
+
+// —— 用例 8：单点 schedule 处处返回该值 ——
 void test_single_point() {
     std::vector<std::pair<double, size_t>> sched = {{0.0, 1234}};
     check_eq_sz(budget_watcher_interp_at(sched, budget_watcher::INTERP_LINEAR, -10.0), 1234, "single -10");
@@ -184,6 +212,7 @@ int main() {
     test_csv_unsorted();
     test_single_point();
     test_end_to_end();
+    test_reset_clock();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

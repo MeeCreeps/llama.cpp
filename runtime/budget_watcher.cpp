@@ -17,6 +17,11 @@ namespace elastic {
 
 namespace {
 
+int64_t steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // 把字符串两端的空白去掉
 std::string trim(const std::string &s) {
     size_t a = 0, b = s.size();
@@ -40,11 +45,17 @@ bool try_parse_double(const std::string &s, double &out) {
 void *budget_watcher_thread_main(void *arg) {
     auto *bw = static_cast<budget_watcher *>(arg);
     while (!bw->stop_flag.load(std::memory_order_acquire)) {
-        const auto now = std::chrono::steady_clock::now();
-        const double t_sec =
-            std::chrono::duration<double>(now - bw->t0).count();
+        const int64_t epoch_ns =
+            bw->t0_ns.load(std::memory_order_acquire);
+        const int64_t now_ns = steady_now_ns();
+        const double t_sec = static_cast<double>(
+            std::max<int64_t>(0, now_ns - epoch_ns)) * 1e-9;
         const size_t b = budget_watcher_interp_at(bw->schedule, bw->mode, t_sec);
-        bw->current_budget_mb.store(b, std::memory_order_release);
+        // Do not let an interpolation begun before reset_clock() overwrite
+        // the freshly installed B(0) value after the boundary.
+        if (epoch_ns == bw->t0_ns.load(std::memory_order_acquire)) {
+            bw->current_budget_mb.store(b, std::memory_order_release);
+        }
 
         // 用 nanosleep 这样停时延迟最多一个 tick；不需要更精细的唤醒
         struct timespec ts;
@@ -182,7 +193,7 @@ int budget_watcher_init(budget_watcher *bw,
     if (rc != 0) return rc;
 
     // 启动前先把 t0 设好并把 t=0 处的 B 写到原子量，保证立刻 get 也有合理值
-    bw->t0 = std::chrono::steady_clock::now();
+    bw->t0_ns.store(steady_now_ns(), std::memory_order_release);
     bw->current_budget_mb.store(
         budget_watcher_interp_at(bw->schedule, bw->mode, 0.0),
         std::memory_order_release);
@@ -202,7 +213,7 @@ size_t budget_watcher_get(const budget_watcher *bw) {
 
 void budget_watcher_reset_clock(budget_watcher *bw) {
     if (!bw || bw->schedule.empty()) return;
-    bw->t0 = std::chrono::steady_clock::now();
+    bw->t0_ns.store(steady_now_ns(), std::memory_order_release);
     bw->current_budget_mb.store(
         budget_watcher_interp_at(bw->schedule, bw->mode, 0.0),
         std::memory_order_release);

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 struct llama_file;
@@ -94,6 +96,26 @@ llama_mmap_registry_entry llama_mmap_registry_find(const void * host_ptr);
 // 返 0 成功, <0 失败.
 int llama_pread_direct(const char * filename, void * dst, size_t file_offset, size_t len);
 
+struct llama_pread_request {
+    const char * filename = nullptr;
+    void * dst = nullptr;
+    size_t file_offset = 0;
+    size_t len = 0;
+};
+
+// Read independent file offsets as one unit-level I/O submission when
+// io_uring is available. Destinations may have the same page bias as their
+// file offsets; aligned middles are submitted together and small edges reuse
+// the direct-I/O bounce pool. Returns 0 for a real batch, 1 for the
+// correctness-preserving sequential fallback, and <0 on failure.
+int llama_pread_direct_batch(const llama_pread_request * requests, size_t count);
+
+// Probe whether independent-offset direct reads can use a real kernel batch.
+// Android devices commonly deny io_uring_setup to unprivileged apps. Callers
+// use this to select a streaming per-tensor fallback instead of serializing a
+// whole Multi unit before exposing any completed LOAD to PREPARE.
+bool llama_pread_direct_batch_available();
+
 // === Weight pin schedule hook (shared with llama-context API) ===
 // elastic backends call llama_weight_pin_query during pin decision. Returns true
 // → force pin. Default = false (let elastic budget decide). LP solver / 自定义 schedule
@@ -135,12 +157,32 @@ enum llama_weight_transform_kind {
 };
 typedef int  (*llama_weight_transform_fn_t)(const char * name, llama_weight_transform_kind kind, void * user_data);
 
+struct llama_working_set_runtime_state {
+    int      active_capacity = -1;
+    int      pending_capacity = -1;
+    int      target_capacity = -1;
+    int      observed_required_capacity = 0;
+    uint64_t accesses = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t capacity_changes = 0;
+    size_t   resident_bytes = 0;
+};
+typedef bool (*llama_working_set_query_fn_t)(
+        const char * kind, llama_working_set_runtime_state * state, void * user_data);
+typedef int (*llama_working_set_target_fn_t)(
+        const char * kind, int target_capacity, void * user_data);
+
 void llama_weight_residency_register(llama_weight_residency_fn_t fn, void * user_data);
 void llama_weight_state_register    (llama_weight_state_fn_t     fn, void * user_data);
 void llama_weight_movement_register (llama_weight_movement_fn_t  fn, void * user_data);
 void llama_weight_stage_register    (llama_weight_stage_fn_t     fn, void * user_data);
 void llama_weight_anchor_register   (llama_weight_anchor_fn_t    fn, void * user_data);
 void llama_weight_transform_register(llama_weight_transform_fn_t fn, void * user_data);
+void llama_working_set_register(
+        llama_working_set_query_fn_t query_fn,
+        llama_working_set_target_fn_t target_fn,
+        void * user_data);
 
 // Public query/action used by llama_context.cpp.
 bool llama_weight_residency_query(const char * name);
@@ -149,6 +191,38 @@ int  llama_weight_movement_request(const char * name, bool evict);
 int  llama_weight_stage_request   (const char * name, const char * stage);
 int  llama_weight_anchor_request  (const char * anchor_name);
 int  llama_weight_transform_request(const char * name, llama_weight_transform_kind kind);
+bool llama_working_set_query(const char * kind, llama_working_set_runtime_state * state);
+int  llama_working_set_set_target(const char * kind, int target_capacity);
+
+// Mixed Super-Tensor partition published by the active ExecPlan. Backends
+// query row tiles by logical weight name at graph entry. unit_id may be shared
+// by tiles from different tensors (Multi), shared by all tiles of one tensor
+// (Tensor), or differ per tile (Cut).
+struct llama_weight_unit_slice {
+    int64_t row_start = 0;
+    int64_t row_count = -1;
+    int     unit_id = -1;
+    uint32_t flags = 0; // bit0=fuse_layout, bit1=fuse_compute
+};
+enum llama_weight_unit_flags : uint32_t {
+    LLAMA_WEIGHT_UNIT_FUSE_LAYOUT  = 1u << 0,
+    LLAMA_WEIGHT_UNIT_FUSE_COMPUTE = 1u << 1,
+};
+void llama_weight_unit_plan_clear();
+void llama_weight_unit_plan_add(
+        const char * name,
+        const llama_weight_unit_slice & slice);
+// Atomically replace the complete mixed frontier under one lock. Returns the
+// number of logical weights whose slice list changed; identical replacement
+// leaves the generation unchanged.
+int llama_weight_unit_plan_replace(
+        const std::vector<std::pair<
+            std::string, llama_weight_unit_slice>> & entries);
+int llama_weight_unit_plan_query(
+        const char * name,
+        llama_weight_unit_slice * out,
+        int capacity);
+uint64_t llama_weight_unit_plan_generation();
 
 // Canonical elastic runtime placement map. Backends still expose their own WBM
 // probes, but plan apply / staged movement update this shared map so online

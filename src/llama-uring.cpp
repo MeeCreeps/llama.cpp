@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <atomic>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -190,6 +191,93 @@ int submit_pread_aligned(const char *filename, void *dst, size_t file_offset, si
         return -6;
     }
     return 0;
+}
+
+int pread_aligned_batch(const pread_request * requests, size_t count) {
+    if (!requests || count == 0) return -2;
+    if (g_ring.ring_fd < 0 && !init(static_cast<unsigned>(std::max<size_t>(256, count)))) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lk(g_ring.mtx);
+    if (g_ring.n_inflight != 0 || count > g_ring.sq_entries) return -3;
+
+    const unsigned tail = __atomic_load_n(g_ring.sq_tail, __ATOMIC_ACQUIRE);
+    const unsigned head = __atomic_load_n(g_ring.sq_head, __ATOMIC_ACQUIRE);
+    if (tail - head + count > g_ring.sq_entries) return -4;
+
+    for (size_t i = 0; i < count; ++i) {
+        const pread_request & request = requests[i];
+        if (!request.filename || !request.dst || request.len == 0 ||
+            (reinterpret_cast<uintptr_t>(request.dst) & 4095U) ||
+            (request.file_offset & 4095U) || (request.len & 4095U)) {
+            return -5;
+        }
+        const int fd = get_or_open_fd(request.filename);
+        if (fd < 0) return -6;
+
+        const unsigned sq_index = (tail + static_cast<unsigned>(i)) & *g_ring.sq_mask;
+        struct io_uring_sqe * sqe = &g_ring.sqes[sq_index];
+        memset(sqe, 0, sizeof(*sqe));
+        sqe->opcode = IORING_OP_READ;
+        sqe->fd = fd;
+        sqe->off = request.file_offset;
+        sqe->addr = (__u64)(uintptr_t) request.dst;
+        sqe->len = (__u32) request.len;
+        // Zero is reserved so a malformed completion cannot alias request 0.
+        sqe->user_data = static_cast<__u64>(i + 1);
+        g_ring.sq_array[sq_index] = sq_index;
+    }
+
+    __atomic_store_n(g_ring.sq_tail, tail + static_cast<unsigned>(count), __ATOMIC_RELEASE);
+    const int submitted = sys_io_uring_enter(
+        g_ring.ring_fd, static_cast<unsigned>(count), 0, 0, nullptr);
+    if (submitted != static_cast<int>(count)) {
+        if (submitted < 0) {
+            // The kernel consumed no SQEs. Make the batch retry/fallback path
+            // reusable instead of leaving an artificial full SQ behind.
+            __atomic_store_n(g_ring.sq_tail, tail, __ATOMIC_RELEASE);
+            fprintf(stderr, "[uring] batch submit failed: %s\n", strerror(errno));
+        } else {
+            fprintf(stderr, "[uring] short batch submit: %d / %zu\n", submitted, count);
+        }
+        return -7;
+    }
+    g_ring.n_submitted += count;
+    g_ring.n_inflight += count;
+
+    size_t completed = 0;
+    bool ok = true;
+    while (completed < count) {
+        const int wait_rc = sys_io_uring_enter(
+            g_ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+        if (wait_rc < 0) {
+            fprintf(stderr, "[uring] batch wait failed: %s\n", strerror(errno));
+            ok = false;
+            break;
+        }
+        unsigned cq_head = __atomic_load_n(g_ring.cq_head, __ATOMIC_ACQUIRE);
+        const unsigned cq_tail = __atomic_load_n(g_ring.cq_tail, __ATOMIC_ACQUIRE);
+        while (cq_head != cq_tail && completed < count) {
+            const struct io_uring_cqe * cqe = &g_ring.cqes[cq_head & *g_ring.cq_mask];
+            const size_t request_index = cqe->user_data > 0
+                ? static_cast<size_t>(cqe->user_data - 1) : count;
+            if (request_index >= count ||
+                cqe->res != static_cast<int>(requests[request_index].len)) {
+                fprintf(stderr,
+                        "[uring] batch completion mismatch: request=%zu res=%d expected=%zu\n",
+                        request_index, cqe->res,
+                        request_index < count ? requests[request_index].len : 0);
+                ok = false;
+            }
+            ++cq_head;
+            ++completed;
+            --g_ring.n_inflight;
+            ++g_ring.n_completed;
+        }
+        __atomic_store_n(g_ring.cq_head, cq_head, __ATOMIC_RELEASE);
+    }
+    return ok && completed == count ? 0 : -8;
 }
 
 int wait_all() {

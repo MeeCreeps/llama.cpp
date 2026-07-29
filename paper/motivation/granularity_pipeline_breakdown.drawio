@@ -1,0 +1,392 @@
+<mxfile host="app.diagrams.net" modified="2026-07-27T22:30:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="granularity-motivation-v2" name="Granularity Motivation">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="1" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="Why Working-Unit Granularity Matters under Dynamic Memory Budgets" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=26;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="1520" height="45" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="panel_a" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9D1D9;strokeWidth=2;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="35" y="80" width="850" height="745" as="geometry"/>
+        </mxCell>
+        <mxCell id="panel_b" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9D1D9;strokeWidth=2;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="910" y="80" width="655" height="745" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="a_title" value="(a) Pipeline behavior and granularity trade-offs" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=20;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="58" y="94" width="650" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="b_title" value="(b) Measured cost breakdown" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=20;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="932" y="94" width="500" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="b_subtitle" value="Previous OP13 CPU fixed-budget results, 3-run median at 60% budget" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=2;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="935" y="122" width="560" height="24" as="geometry"/>
+        </mxCell>
+
+        <!-- Shared legend -->
+        <mxCell id="leg_io" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;" vertex="1" parent="1">
+          <mxGeometry x="65" y="134" width="24" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_io_t" value="I/O" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#253858;" vertex="1" parent="1">
+          <mxGeometry x="94" y="128" width="42" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_layout" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;" vertex="1" parent="1">
+          <mxGeometry x="140" y="134" width="24" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_layout_t" value="Layout preparation" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#253858;" vertex="1" parent="1">
+          <mxGeometry x="169" y="128" width="125" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_compute" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;" vertex="1" parent="1">
+          <mxGeometry x="300" y="134" width="24" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_compute_t" value="Compute" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#253858;" vertex="1" parent="1">
+          <mxGeometry x="329" y="128" width="68" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_wait" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A7A7A7;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="405" y="134" width="24" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_wait_t" value="Exposed wait" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#253858;" vertex="1" parent="1">
+          <mxGeometry x="434" y="128" width="94" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_overhead" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7C6C7;strokeColor=#C74B50;" vertex="1" parent="1">
+          <mxGeometry x="535" y="134" width="24" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_overhead_t" value="Unit overhead" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#253858;" vertex="1" parent="1">
+          <mxGeometry x="564" y="128" width="100" height="25" as="geometry"/>
+        </mxCell>
+
+        <!-- Multi pipeline -->
+        <mxCell id="multi_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="55" y="165" width="810" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_name" value="Multi-tensor" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=18;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="65" y="211" width="115" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_desc" value="2 tensors / unit" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#6B778C;" vertex="1" parent="1">
+          <mxGeometry x="68" y="243" width="110" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_io_lane" value="I/O" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="177" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_l_lane" value="Layout" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="211" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_c_lane" value="Compute" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="245" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_io_ab" value="Coalesced load A + B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="178" width="190" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_io_cd" value="Load C + D" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="178" width="145" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_layout_ab" value="Prepare A + B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="430" y="212" width="180" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_wait" value="wait until both tensors are ready" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A7A7A7;strokeColor=#666666;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="246" width="370" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_compute" value="Fused compute A + B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="610" y="246" width="180" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_pro" value="✓ Best amortization: fewer I/O requests, launches, and syncs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="240" y="288" width="310" height="31" as="geometry"/>
+        </mxCell>
+        <mxCell id="multi_con" value="✕ Largest readiness coupling and head-of-line blocking" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="560" y="288" width="285" height="31" as="geometry"/>
+        </mxCell>
+
+        <!-- Tensor pipeline -->
+        <mxCell id="tensor_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="55" y="345" width="810" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_name" value="Tensor" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=18;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="65" y="391" width="115" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_desc" value="1 tensor / unit" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#6B778C;" vertex="1" parent="1">
+          <mxGeometry x="68" y="423" width="110" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_io_lane" value="I/O" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="357" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_l_lane" value="Layout" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="391" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_c_lane" value="Compute" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="425" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_io_a" value="Load A" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="358" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_io_b" value="Load B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="440" y="358" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_io_c" value="Load C" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="358" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_layout_a" value="Prep A" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="340" y="392" width="85" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_layout_b" value="Prep B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="392" width="85" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_layout_c" value="Prep C" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="740" y="392" width="85" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_wait_a" value="wait" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A7A7A7;strokeColor=#666666;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="426" width="185" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_compute_a" value="Compute A" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="425" y="426" width="105" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_wait_b" value="wait" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A7A7A7;strokeColor=#666666;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="530" y="426" width="95" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_compute_b" value="Compute B" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="625" y="426" width="105" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_pro" value="✓ Balanced execution efficiency and scheduling flexibility" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="240" y="468" width="310" height="31" as="geometry"/>
+        </mxCell>
+        <mxCell id="tensor_con" value="✕ Must wait for the complete tensor to become ready" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#8A5200;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="560" y="468" width="285" height="31" as="geometry"/>
+        </mxCell>
+
+        <!-- Cut pipeline -->
+        <mxCell id="cut_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="55" y="525" width="810" height="205" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_name" value="Cut" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=18;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="65" y="578" width="115" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_desc" value="½ tensor / unit" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#6B778C;" vertex="1" parent="1">
+          <mxGeometry x="68" y="610" width="110" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_io_lane" value="I/O" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="537" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_l_lane" value="Layout" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="571" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_c_lane" value="Compute" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="180" y="605" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_io_a0" value="A₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="538" width="55" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_io_a1" value="A₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="340" y="538" width="55" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_io_b0" value="B₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="440" y="538" width="55" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_io_b1" value="B₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#4C78A8;strokeColor=#2F5597;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="538" width="55" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_layout_a0" value="P₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="295" y="572" width="45" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_layout_a1" value="P₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="395" y="572" width="45" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_layout_b0" value="P₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="495" y="572" width="45" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_layout_b1" value="P₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2A65A;strokeColor=#C97A20;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="595" y="572" width="45" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_wait" value="short wait" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A7A7A7;strokeColor=#666666;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="606" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_compute_a0" value="C₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="340" y="606" width="50" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_overhead_0" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7C6C7;strokeColor=#C74B50;" vertex="1" parent="1">
+          <mxGeometry x="390" y="606" width="12" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_compute_a1" value="C₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="440" y="606" width="50" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_overhead_1" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7C6C7;strokeColor=#C74B50;" vertex="1" parent="1">
+          <mxGeometry x="490" y="606" width="12" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_compute_b0" value="C₀" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="606" width="50" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_overhead_2" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7C6C7;strokeColor=#C74B50;" vertex="1" parent="1">
+          <mxGeometry x="590" y="606" width="12" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_compute_b1" value="C₁" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#59A14F;strokeColor=#2D7D32;fontColor=#FFFFFF;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="606" width="50" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_more" value="⋯" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=20;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="705" y="600" width="45" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_pro" value="✓ Earliest ready points and the least head-of-line wait" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="240" y="649" width="310" height="31" as="geometry"/>
+        </mxCell>
+        <mxCell id="cut_con" value="✕ Most requests, kernels, synchronization, and bookkeeping" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="560" y="649" width="285" height="31" as="geometry"/>
+        </mxCell>
+        <mxCell id="timeline_axis" value="" style="endArrow=classic;html=1;strokeColor=#344563;strokeWidth=1.5;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="240" y="704" as="sourcePoint"/>
+            <mxPoint x="825" y="704" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="timeline_t" value="Time" style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=2;fontColor=#344563;" vertex="1" parent="1">
+          <mxGeometry x="805" y="706" width="50" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_takeaway" value="Coarser units improve amortization; finer units improve pipeline schedulability." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF2FF;strokeColor=#6C8EBF;fontColor=#17365D;fontFamily=Helvetica;fontSize=14;fontStyle=1;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="155" y="760" width="620" height="42" as="geometry"/>
+        </mxCell>
+
+        <!-- Panel (b): end-to-end latency at 60% -->
+        <mxCell id="latency_header" value="End-to-end latency (ms/token)" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=15;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="935" y="155" width="300" height="27" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_m_label" value="Multi-F" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#344563;" vertex="1" parent="1">
+          <mxGeometry x="935" y="190" width="75" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_m_bar" value="515.3" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#7EA6D8;strokeColor=#4C78A8;fontColor=#172B4D;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=right;spacingRight=6;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="190" width="258" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_t_label" value="Tensor" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#344563;" vertex="1" parent="1">
+          <mxGeometry x="935" y="222" width="75" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_t_bar" value="459.0  ✓" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#A9D6A3;strokeColor=#59A14F;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=right;spacingRight=6;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="222" width="230" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_c_label" value="Cut" style="text;html=1;align=right;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#344563;" vertex="1" parent="1">
+          <mxGeometry x="935" y="254" width="75" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_c_bar" value="487.0" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F3C27D;strokeColor=#D89A3D;fontColor=#704000;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=right;spacingRight=6;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="254" width="244" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="lat_annotation" value="Tensor wins by balancing pipeline wait and execution overhead." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="196" width="235" height="72" as="geometry"/>
+        </mxCell>
+
+        <!-- Panel (b): cost matrix -->
+        <mxCell id="matrix_header" value="Component costs (lower is better)" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=15;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="935" y="300" width="300" height="27" as="geometry"/>
+        </mxCell>
+        <mxCell id="matrix_mode_m" value="Multi-F" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF2FF;strokeColor=#7EA6D8;fontColor=#17365D;fontFamily=Helvetica;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="330" width="115" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="matrix_mode_t" value="Tensor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F4F8;strokeColor=#AAB7C4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="330" width="115" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="matrix_mode_c" value="Cut" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#704000;fontFamily=Helvetica;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="330" width="115" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Wait row -->
+        <mxCell id="row_wait_l" value="Exposed wait&lt;br&gt;(ms/token)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="935" y="365" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_wait_m" value="390.5" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="365" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_wait_t" value="331.8" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#8A5200;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="365" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_wait_c" value="261.3  ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="365" width="115" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- I/O row -->
+        <mxCell id="row_io_l" value="Direct read&lt;br&gt;(GiB/run)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="935" y="420" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_io_m" value="18.84  ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="420" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_io_t" value="18.86" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F7F1;strokeColor=#A0BFA3;fontColor=#315C35;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="420" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_io_c" value="19.85" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="420" width="115" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Layout row -->
+        <mxCell id="row_layout_l" value="Layout work&lt;br&gt;(ms/token)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="935" y="475" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_layout_m" value="335.9" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#8A5200;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="475" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_layout_t" value="330.5  ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="475" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_layout_c" value="331.6" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F7F1;strokeColor=#A0BFA3;fontColor=#315C35;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="475" width="115" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Compute row -->
+        <mxCell id="row_compute_l" value="Compute work&lt;br&gt;(ms/token)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="935" y="530" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_compute_m" value="67.8  ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="530" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_compute_t" value="70.6" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#8A5200;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="530" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_compute_c" value="72.9" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="530" width="115" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Unit row -->
+        <mxCell id="row_units_l" value="Working units&lt;br&gt;(per run)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#D8DEE4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="935" y="585" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_units_m" value="4,925  ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="585" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_units_t" value="9,150" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#8A5200;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="585" width="115" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="row_units_c" value="15,475" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#D47A72;fontColor=#A61B1B;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="585" width="115" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Cross-budget evidence -->
+        <mxCell id="cross_header" value="Budget-dependent winner in the same previous CPU sweep" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=14;fontStyle=1;fontColor=#172B4D;" vertex="1" parent="1">
+          <mxGeometry x="935" y="650" width="480" height="26" as="geometry"/>
+        </mxCell>
+        <mxCell id="winner_30" value="30%&lt;br&gt;&lt;b&gt;Cut: 752 ms&lt;/b&gt;&lt;br&gt;wait dominates" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#DDAA55;fontColor=#704000;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="940" y="682" width="165" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="winner_arrow_1" value="" style="endArrow=classic;html=1;strokeColor=#7A869A;strokeWidth=1.5;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1110" y="719" as="sourcePoint"/>
+            <mxPoint x="1150" y="719" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="winner_60" value="50–60%&lt;br&gt;&lt;b&gt;Tensor: 552 / 459 ms&lt;/b&gt;&lt;br&gt;best balance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F4EA;strokeColor=#67A970;fontColor=#1B5E20;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="1155" y="682" width="180" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="winner_arrow_2" value="" style="endArrow=classic;html=1;strokeColor=#7A869A;strokeWidth=1.5;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1340" y="719" as="sourcePoint"/>
+            <mxPoint x="1380" y="719" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="winner_90" value="90%&lt;br&gt;&lt;b&gt;Cut ≈ Tensor: 140 ms&lt;/b&gt;&lt;br&gt;wait benefit ≈ overhead" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F4F8;strokeColor=#AAB7C4;fontColor=#344563;fontFamily=Helvetica;fontSize=12;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="1385" y="682" width="160" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="b_note" value="Stage counters diagnose cost but are non-additive because I/O, layout, and compute overlap in the pipeline." style="text;html=1;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontStyle=2;fontColor=#5E6C84;" vertex="1" parent="1">
+          <mxGeometry x="940" y="774" width="600" height="28" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="design_banner" value="Design implication: split when exposed memory wait dominates; merge/fuse when I/O, compute, and per-unit overhead dominate." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF2FF;strokeColor=#4A72B2;strokeWidth=2;fontColor=#17365D;fontFamily=Helvetica;fontSize=16;fontStyle=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="180" y="842" width="1240" height="42" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

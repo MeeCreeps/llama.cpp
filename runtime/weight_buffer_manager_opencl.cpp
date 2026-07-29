@@ -2,6 +2,7 @@
 
 #include "weight_buffer_manager_opencl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -243,7 +244,86 @@ void release_host_staging(wbm_opencl_ctx *octx, int idx) {
     if (released) octx->async_load_cv.notify_all();
 }
 
+cl_mem retain_pool_take_buffer(wbm_opencl_ctx *octx, size_t nbytes) {
+    if (!octx || !octx->retain_cl_mem) return nullptr;
+    std::lock_guard<std::mutex> lock(octx->soa_pool_mtx);
+    auto it = octx->retained_buffers_by_size.find(nbytes);
+    if (it == octx->retained_buffers_by_size.end() || it->second.empty()) {
+        return nullptr;
+    }
+    cl_mem cached = static_cast<cl_mem>(it->second.back());
+    it->second.pop_back();
+    for (auto lit = octx->retain_order_sizes.rbegin();
+         lit != octx->retain_order_sizes.rend(); ++lit) {
+        if (*lit == nbytes) {
+            octx->retain_order_sizes.erase(std::next(lit).base());
+            break;
+        }
+    }
+    octx->cached_bytes -= std::min(octx->cached_bytes, nbytes);
+    return cached;
+}
+
+void retain_pool_put_buffer(
+        wbm_opencl_ctx *octx, cl_mem buffer, size_t nbytes) {
+    if (!octx || !buffer || !octx->retain_cl_mem) return;
+    std::lock_guard<std::mutex> lock(octx->soa_pool_mtx);
+    wbmcl_retain_pool_trim_locked(octx, nbytes);
+    octx->retained_buffers_by_size[nbytes].push_back(
+        static_cast<void *>(buffer));
+    octx->retain_order_sizes.push_back(nbytes);
+    octx->cached_bytes += nbytes;
+}
+
 }  // namespace
+
+void wbmcl_retain_pool_trim_locked(
+        wbm_opencl_ctx *octx, size_t incoming_bytes) {
+    if (!octx || octx->cache_byte_limit == 0) return;
+    while (octx->cached_bytes + incoming_bytes > octx->cache_byte_limit &&
+           !octx->retain_order_sizes.empty()) {
+        const size_t old_sz = octx->retain_order_sizes.front();
+        octx->retain_order_sizes.pop_front();
+
+        auto soa = octx->soa_pool_by_size.find(old_sz);
+        if (soa != octx->soa_pool_by_size.end() && !soa->second.empty()) {
+            soa_pool_entry entry = soa->second.back();
+            soa->second.pop_back();
+            if (entry.ready_event) {
+                cl_event ready = static_cast<cl_event>(entry.ready_event);
+                clWaitForEvents(1, &ready);
+                clReleaseEvent(ready);
+            }
+            if (entry.q) {
+                clReleaseMemObject(static_cast<cl_mem>(entry.q));
+                octx->n_releases += 1;
+            }
+            if (entry.d) {
+                clReleaseMemObject(static_cast<cl_mem>(entry.d));
+                octx->n_releases += 1;
+            }
+            if (entry.parent) {
+                octx->soa_pooled_parents.erase(entry.parent);
+                clReleaseMemObject(static_cast<cl_mem>(entry.parent));
+                octx->n_releases += 1;
+            }
+            octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+            continue;
+        }
+
+        auto ordinary = octx->retained_buffers_by_size.find(old_sz);
+        if (ordinary == octx->retained_buffers_by_size.end() ||
+            ordinary->second.empty()) {
+            continue;
+        }
+        cl_mem old_buffer =
+            static_cast<cl_mem>(ordinary->second.back());
+        ordinary->second.pop_back();
+        clReleaseMemObject(old_buffer);
+        octx->n_releases += 1;
+        octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
+    }
+}
 
 int wbmcl_init(wbm_opencl_ctx *octx,
                weight_buffer_manager *wbm,
@@ -271,6 +351,8 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->soa_staging = nullptr;
     octx->soa_staging_capacity = 0;
     octx->soa_staging_last_use_ev = nullptr;
+    octx->soa_pooled_parents.clear();
+    octx->soa_double_evict = 0;
     octx->soa_staging_slots.clear();
     octx->soa_staging_slot_capacity.clear();
     octx->soa_staging_slot_last_use_ev.clear();
@@ -313,6 +395,8 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->async_load_bytes_by_idx.clear();
     octx->async_load_enqueued = 0;
     octx->async_load_completed = 0;
+    octx->async_load_units_enqueued = 0;
+    octx->async_load_units_completed = 0;
     octx->async_load_waits = 0;
     octx->async_load_wait_us = 0;
     octx->async_load_pending_bytes = 0;
@@ -322,10 +406,13 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->async_load_throttle_wait_us = 0;
     octx->async_load_throttle_skipped = 0;
     octx->async_soa_reload_worker_started = false;
+    octx->async_soa_reload_shutdown = false;
     octx->async_soa_reload_queue.clear();
     octx->async_soa_reload_state.clear();
     octx->async_soa_reload_enqueued = 0;
     octx->async_soa_reload_completed = 0;
+    octx->async_soa_reload_units_enqueued = 0;
+    octx->async_soa_reload_units_completed = 0;
     octx->async_soa_reload_waits = 0;
     octx->async_soa_reload_wait_us = 0;
     octx->async_load_direct_read_calls = 0;
@@ -346,6 +433,13 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     octx->stage_xform_ok = 0;
     octx->stage_xform_us = 0;
     octx->stage_xform_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(octx->soa_prepare_stats_mtx);
+        octx->soa_prepare_calls = 0;
+        octx->soa_prepare_ok = 0;
+        octx->soa_prepare_us = 0;
+        octx->soa_prepare_bytes = 0;
+    }
     octx->soa_pool_hit = 0;
     octx->soa_pool_miss = 0;
     octx->parent_pool_hit = 0;
@@ -361,26 +455,36 @@ int wbmcl_init(wbm_opencl_ctx *octx,
     if (octx->async_stage_load) {
         octx->async_load_worker = std::thread([octx]() {
             for (;;) {
-                int idx = -1;
+                std::vector<int> task;
                 {
                     std::unique_lock<std::mutex> lock(octx->async_load_mtx);
                     octx->async_load_cv.wait(lock, [octx]() {
                         return octx->async_load_shutdown || !octx->async_load_queue.empty();
                     });
                     if (octx->async_load_shutdown && octx->async_load_queue.empty()) break;
-                    idx = octx->async_load_queue.front();
+                    task = std::move(octx->async_load_queue.front());
                     octx->async_load_queue.pop_front();
                 }
-                const int rc = wbmcl_load_host(octx, idx);
+                for (int idx : task) {
+                    const int rc = wbmcl_load_host(octx, idx);
+                    {
+                        std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+                        auto bit = octx->async_load_bytes_by_idx.find(idx);
+                        if (bit != octx->async_load_bytes_by_idx.end()) {
+                            octx->async_load_pending_bytes -=
+                                std::min(octx->async_load_pending_bytes, bit->second);
+                            octx->async_load_bytes_by_idx.erase(bit);
+                        }
+                        octx->async_load_state[idx] = rc == 0 ? 2 : rc;
+                        octx->async_load_completed++;
+                    }
+                    // Publish each tensor as soon as it is available so the
+                    // PREPARE worker may overlap tensor i with LOAD of i+1.
+                    octx->async_load_cv.notify_all();
+                }
                 {
                     std::lock_guard<std::mutex> lock(octx->async_load_mtx);
-                    auto bit = octx->async_load_bytes_by_idx.find(idx);
-                    if (bit != octx->async_load_bytes_by_idx.end()) {
-                        octx->async_load_pending_bytes -= std::min(octx->async_load_pending_bytes, bit->second);
-                        octx->async_load_bytes_by_idx.erase(bit);
-                    }
-                    octx->async_load_state[idx] = rc == 0 ? 2 : rc;
-                    octx->async_load_completed++;
+                    octx->async_load_units_completed++;
                 }
                 octx->async_load_cv.notify_all();
             }
@@ -497,9 +601,11 @@ void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
         const double throttle_ms = octx->async_load_throttle_wait_us / 1000.0;
         const double throttle_avg = octx->async_load_throttle_waits ? throttle_ms / octx->async_load_throttle_waits : 0.0;
         std::fprintf(out,
-                     "async load worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms "
+                     "async_load   : units=%llu/%llu tensors=%llu/%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms "
                      "throttle_waits=%llu throttle_total=%.3f ms throttle_avg=%.3f ms throttle_skipped=%llu "
                      "max_pending=%zu MB max_pending_count=%zu\n",
+                     (unsigned long long) octx->async_load_units_enqueued,
+                     (unsigned long long) octx->async_load_units_completed,
                      (unsigned long long) octx->async_load_enqueued,
                      (unsigned long long) octx->async_load_completed,
                      (unsigned long long) octx->async_load_waits,
@@ -514,13 +620,34 @@ void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out) {
         octx->async_soa_reload_enqueued > 0 || octx->async_soa_reload_completed > 0) {
         const double wait_ms = octx->async_soa_reload_wait_us / 1000.0;
         const double avg_wait = octx->async_soa_reload_waits ? wait_ms / octx->async_soa_reload_waits : 0.0;
-        std::fprintf(out, "async prepare worker enqueued=%llu completed=%llu waits=%llu wait_total=%.3f ms wait_avg=%.3f ms\n",
+        std::fprintf(out,
+                     "async_prepare: units=%llu/%llu tensors=%llu/%llu waits=%llu "
+                     "wait_total=%.3f ms wait_avg=%.3f ms\n",
+                     (unsigned long long) octx->async_soa_reload_units_enqueued,
+                     (unsigned long long) octx->async_soa_reload_units_completed,
                      (unsigned long long) octx->async_soa_reload_enqueued,
                      (unsigned long long) octx->async_soa_reload_completed,
                      (unsigned long long) octx->async_soa_reload_waits,
                      wait_ms, avg_wait);
     }
     std::fprintf(out, "======================================================\n");
+}
+
+void wbmcl_get_soa_prepare_state(wbm_opencl_ctx *octx,
+                                 uint64_t *calls,
+                                 uint64_t *ok,
+                                 uint64_t *us,
+                                 size_t *bytes) {
+    if (calls) *calls = 0;
+    if (ok) *ok = 0;
+    if (us) *us = 0;
+    if (bytes) *bytes = 0;
+    if (!octx) return;
+    std::lock_guard<std::mutex> lock(octx->soa_prepare_stats_mtx);
+    if (calls) *calls = octx->soa_prepare_calls;
+    if (ok) *ok = octx->soa_prepare_ok;
+    if (us) *us = octx->soa_prepare_us;
+    if (bytes) *bytes = octx->soa_prepare_bytes;
 }
 
 int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
@@ -588,19 +715,7 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
 
     cl_int err = CL_SUCCESS;
     // Retain 模式：从 size 池里拿一个同 size 的 cl_mem 复用，省 clCreateBuffer
-    if (octx->retain_cl_mem) {
-        auto it = octx->retained_buffers_by_size.find(meta->byte_size);
-        if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
-            cl_mem cached = static_cast<cl_mem>(it->second.back());
-            it->second.pop_back();
-            // 从 FIFO 列表里移除一个 == 该 size 的 entry（LIFO 找最近的就行）
-            for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
-                if (*lit == meta->byte_size) {
-                    octx->retain_order_sizes.erase(std::next(lit).base());
-                    break;
-                }
-            }
-            octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
+    if (cl_mem cached = retain_pool_take_buffer(octx, meta->byte_size)) {
             if (octx->xfer_queue) {
                 cl_command_queue use_q = octx->xfer_queue;
                 if (octx->n_xfer_extra > 0) {
@@ -644,9 +759,8 @@ int wbmcl_ensure_resident(wbm_opencl_ctx *octx, int idx) {
             octx->bytes_uploaded_total += meta->byte_size;
             wbm_mark_resident(octx->wbm, idx, static_cast<void *>(cached));
             return 0;
-        }
-        // 没缓存的话走下面正常 create
     }
+    // 没缓存的话走下面正常 create
 
     // GGML_ELASTIC_USE_HOST_PTR=1 实验：让 OpenCL 用 mmap 指针直接做 cl_mem
     // 后备存储，省掉显式的 host→GPU memcpy。Adreno unified memory 下可能
@@ -791,23 +905,7 @@ int wbmcl_evict(wbm_opencl_ctx *octx, int idx) {
 
     // Retain 模式：cl_mem 按 size 入池，cap 检查
     if (octx->retain_cl_mem) {
-        if (octx->cache_byte_limit > 0) {
-            while (octx->cached_bytes + meta->byte_size > octx->cache_byte_limit &&
-                   !octx->retain_order_sizes.empty()) {
-                size_t old_sz = octx->retain_order_sizes.front();
-                octx->retain_order_sizes.pop_front();
-                auto pit = octx->retained_buffers_by_size.find(old_sz);
-                if (pit == octx->retained_buffers_by_size.end() || pit->second.empty()) continue;
-                cl_mem old_buf = static_cast<cl_mem>(pit->second.back());
-                pit->second.pop_back();
-                clReleaseMemObject(old_buf);
-                octx->n_releases += 1;
-                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-            }
-        }
-        octx->retained_buffers_by_size[meta->byte_size].push_back(static_cast<void *>(buf));
-        octx->retain_order_sizes.push_back(meta->byte_size);
-        octx->cached_bytes += meta->byte_size;
+        retain_pool_put_buffer(octx, buf, meta->byte_size);
         octx->bytes_evicted_total += meta->byte_size;
         wbm_mark_evicted(octx->wbm, idx);
         return 0;
@@ -868,19 +966,41 @@ int wbmcl_load_host(wbm_opencl_ctx *octx, int idx) {
     return 0;
 }
 
-int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
+int wbmcl_load_host_async_unit(wbm_opencl_ctx *octx,
+                               const int *indices, size_t n_indices) {
     if (!octx || !octx->wbm) return -1;
-    if (!octx->async_stage_load) return wbmcl_load_host(octx, idx);
-    const block_meta *meta = wbm_get(octx->wbm, idx);
-    if (!meta) return -2;
-    if (!meta->host_ptr || meta->byte_size == 0) return -3;
+    if (!indices || n_indices == 0) return 0;
+    if (!octx->async_stage_load) {
+        for (size_t i = 0; i < n_indices; ++i) {
+            const int rc = wbmcl_load_host(octx, indices[i]);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
+    std::vector<int> task;
+    size_t task_bytes = 0;
     {
         std::lock_guard<std::mutex> staging_lock(octx->host_staging_mtx);
-        auto hit = octx->host_staging_by_idx.find(idx);
-        if (hit != octx->host_staging_by_idx.end() && hit->second.size() >= meta->byte_size) {
-            return 0;
+        task.reserve(n_indices);
+        for (size_t i = 0; i < n_indices; ++i) {
+            const int idx = indices[i];
+            if (idx < 0 || std::find(task.begin(), task.end(), idx) != task.end()) continue;
+            const block_meta * meta = wbm_get(octx->wbm, idx);
+            if (!meta) return -2;
+            if (meta->resident) continue;
+            if (!meta->host_ptr || meta->byte_size == 0) return -3;
+            auto hit = octx->host_staging_by_idx.find(idx);
+            if (hit != octx->host_staging_by_idx.end() &&
+                hit->second.size() >= meta->byte_size) {
+                continue;
+            }
+            task.push_back(idx);
+            task_bytes += meta->byte_size;
         }
     }
+    if (task.empty()) return 0;
+
     size_t staged_bytes = 0;
     const bool legacy_unbounded = async_stage_load_legacy_unbounded_enabled();
     const size_t max_staged_bytes = legacy_unbounded ? 0 : async_stage_load_max_staged_bytes();
@@ -890,17 +1010,27 @@ int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
     }
     {
         std::unique_lock<std::mutex> lock(octx->async_load_mtx);
-        auto it = octx->async_load_state.find(idx);
-        if (it != octx->async_load_state.end() && it->second == 1) return 0;
+        // Drop members already covered by an earlier unit.  Never split a
+        // remaining Multi task merely to satisfy a pending-count cap.
+        task.erase(std::remove_if(task.begin(), task.end(), [&](int idx) {
+            auto it = octx->async_load_state.find(idx);
+            return it != octx->async_load_state.end() && it->second == 1;
+        }), task.end());
+        if (task.empty()) return 0;
+        task_bytes = 0;
+        for (int idx : task) {
+            const block_meta * meta = wbm_get(octx->wbm, idx);
+            if (meta) task_bytes += meta->byte_size;
+        }
         if (max_staged_bytes > 0 &&
-            staged_bytes + octx->async_load_pending_bytes + meta->byte_size > max_staged_bytes &&
-            (staged_bytes + octx->async_load_pending_bytes > 0 || meta->byte_size > max_staged_bytes)) {
-            octx->async_load_throttle_skipped++;
+            staged_bytes + octx->async_load_pending_bytes + task_bytes > max_staged_bytes &&
+            (staged_bytes + octx->async_load_pending_bytes > 0 || task_bytes > max_staged_bytes)) {
+            octx->async_load_throttle_skipped += task.size();
             return 0;
         }
         const size_t max_pending_bytes = legacy_unbounded ? 0 : async_stage_load_max_pending_bytes();
         const size_t max_pending_count = legacy_unbounded ? 0 : async_stage_load_max_pending_count();
-        if ((max_pending_bytes > 0 || max_pending_count > 0) && meta->byte_size > 0) {
+        if ((max_pending_bytes > 0 || max_pending_count > 0) && task_bytes > 0) {
             const uint64_t wait_t0 = now_us();
             bool waited = false;
             octx->async_load_cv.wait(lock, [&]() {
@@ -908,11 +1038,11 @@ int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
                 const size_t pending_count = octx->async_load_bytes_by_idx.size();
                 const bool bytes_ok =
                     max_pending_bytes == 0 ||
-                    octx->async_load_pending_bytes + meta->byte_size <= max_pending_bytes ||
+                    octx->async_load_pending_bytes + task_bytes <= max_pending_bytes ||
                     octx->async_load_pending_bytes == 0;
                 const bool count_ok =
                     max_pending_count == 0 ||
-                    pending_count < max_pending_count ||
+                    pending_count + task.size() <= max_pending_count ||
                     pending_count == 0;
                 const bool ok = bytes_ok && count_ok;
                 if (!ok) waited = true;
@@ -924,18 +1054,27 @@ int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
             }
         }
         if (octx->async_load_shutdown) return -10;
-        octx->async_load_state[idx] = 1;
-        octx->async_load_bytes_by_idx[idx] = meta->byte_size;
-        octx->async_load_pending_bytes += meta->byte_size;
+        for (int idx : task) {
+            const block_meta * meta = wbm_get(octx->wbm, idx);
+            if (!meta) continue;
+            octx->async_load_state[idx] = 1;
+            octx->async_load_bytes_by_idx[idx] = meta->byte_size;
+            octx->async_load_pending_bytes += meta->byte_size;
+        }
         octx->async_load_max_pending_bytes_seen =
             std::max(octx->async_load_max_pending_bytes_seen, octx->async_load_pending_bytes);
         octx->async_load_max_pending_count_seen =
             std::max(octx->async_load_max_pending_count_seen, octx->async_load_bytes_by_idx.size());
-        octx->async_load_queue.push_back(idx);
-        octx->async_load_enqueued++;
+        octx->async_load_enqueued += task.size();
+        octx->async_load_units_enqueued++;
+        octx->async_load_queue.push_back(std::move(task));
     }
     octx->async_load_cv.notify_one();
     return 0;
+}
+
+int wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx) {
+    return wbmcl_load_host_async_unit(octx, &idx, 1);
 }
 
 int wbmcl_wait_host_load(wbm_opencl_ctx *octx, int idx) {
@@ -967,6 +1106,64 @@ int wbmcl_wait_host_load(wbm_opencl_ctx *octx, int idx) {
     return state >= 0 ? 0 : state;
 }
 
+static uint64_t wbmcl_host_source_us(wbm_opencl_ctx *octx) {
+    if (!octx || !octx->stage_detail) return 0;
+    std::lock_guard<std::mutex> lock(octx->stage_detail_mtx);
+    return octx->stage_detail_buckets[
+        static_cast<int>(wbmcl_stage_detail_kind::HOST_SRC)].us;
+}
+
+static int wbmcl_run_soa_prepare(
+        wbm_opencl_ctx *octx,
+        int idx,
+        const std::function<int()> &fn) {
+    if (!octx || !octx->wbm || idx < 0 || !fn) return -1;
+    const block_meta *meta = wbm_get(octx->wbm, idx);
+    if (!meta) return -2;
+
+    const uint64_t host_src_before = wbmcl_host_source_us(octx);
+    const uint64_t t0 = now_us();
+    const int rc = fn();
+    const uint64_t wall_us = now_us() - t0;
+    const uint64_t host_src_after = wbmcl_host_source_us(octx);
+    const uint64_t host_src_us =
+        host_src_after >= host_src_before ? host_src_after - host_src_before : 0;
+    const uint64_t prepare_us =
+        wall_us > host_src_us ? wall_us - host_src_us : 0;
+
+    {
+        std::lock_guard<std::mutex> lock(octx->soa_prepare_stats_mtx);
+        octx->soa_prepare_calls++;
+        octx->soa_prepare_us += prepare_us;
+        if (rc == 0) {
+            octx->soa_prepare_ok++;
+            octx->soa_prepare_bytes += meta->byte_size;
+        }
+    }
+    return rc;
+}
+
+int wbmcl_reload_soa_sync(wbm_opencl_ctx *octx, int idx) {
+    if (!octx) return -1;
+    auto it = octx->soa_per_idx.find(idx);
+    if (it == octx->soa_per_idx.end() || !it->second.reload_fn) return -2;
+    return wbmcl_run_soa_prepare(octx, idx, it->second.reload_fn);
+}
+
+int wbmcl_transfer_soa_sync(wbm_opencl_ctx *octx, int idx) {
+    if (!octx) return -1;
+    auto it = octx->soa_per_idx.find(idx);
+    if (it == octx->soa_per_idx.end() || !it->second.transfer_fn) return -2;
+    return wbmcl_run_soa_prepare(octx, idx, it->second.transfer_fn);
+}
+
+int wbmcl_xform_soa_sync(wbm_opencl_ctx *octx, int idx) {
+    if (!octx) return -1;
+    auto it = octx->soa_per_idx.find(idx);
+    if (it == octx->soa_per_idx.end() || !it->second.xform_fn) return -2;
+    return wbmcl_run_soa_prepare(octx, idx, it->second.xform_fn);
+}
+
 static void wbmcl_start_soa_reload_worker(wbm_opencl_ctx *octx) {
     if (!octx) return;
     {
@@ -974,59 +1171,92 @@ static void wbmcl_start_soa_reload_worker(wbm_opencl_ctx *octx) {
         if (octx->async_soa_reload_worker_started) return;
         octx->async_soa_reload_worker_started = true;
     }
-    std::thread([octx]() {
+    octx->async_soa_reload_worker = std::thread([octx]() {
         for (;;) {
-            int idx = -1;
+            std::vector<int> task;
             {
                 std::unique_lock<std::mutex> lock(octx->async_soa_reload_mtx);
                 octx->async_soa_reload_cv.wait(lock, [octx]() {
-                    return !octx->async_soa_reload_queue.empty();
+                    return octx->async_soa_reload_shutdown ||
+                           !octx->async_soa_reload_queue.empty();
                 });
-                idx = octx->async_soa_reload_queue.front();
+                if (octx->async_soa_reload_shutdown &&
+                    octx->async_soa_reload_queue.empty()) break;
+                task = std::move(octx->async_soa_reload_queue.front());
                 octx->async_soa_reload_queue.pop_front();
             }
-            int rc = -2;
-            auto it = octx->soa_per_idx.find(idx);
-            if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
-                const block_meta *meta = wbm_get(octx->wbm, idx);
-                rc = (meta && meta->resident) ? 0 : it->second.reload_fn();
+            for (int idx : task) {
+                int rc = -2;
+                auto it = octx->soa_per_idx.find(idx);
+                if (it != octx->soa_per_idx.end() && it->second.reload_fn) {
+                    const block_meta *meta = wbm_get(octx->wbm, idx);
+                    rc = (meta && meta->resident) ? 0 :
+                        wbmcl_reload_soa_sync(octx, idx);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
+                    octx->async_soa_reload_state[idx] = rc == 0 ? 2 : rc;
+                    octx->async_soa_reload_completed++;
+                }
+                // PREPARE for tensor i may be consumed while the same logical
+                // unit continues materializing tensor i+1.
+                octx->async_soa_reload_cv.notify_all();
             }
             {
                 std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
-                octx->async_soa_reload_state[idx] = rc == 0 ? 2 : rc;
-                octx->async_soa_reload_completed++;
+                octx->async_soa_reload_units_completed++;
             }
             octx->async_soa_reload_cv.notify_all();
         }
-    }).detach();
+    });
 }
 
-int wbmcl_soa_reload_async(wbm_opencl_ctx *octx, int idx) {
+int wbmcl_soa_reload_async_unit(wbm_opencl_ctx *octx,
+                                const int *indices, size_t n_indices) {
     if (!octx || !octx->wbm) return -1;
-    const block_meta *meta = wbm_get(octx->wbm, idx);
-    if (!meta) return -2;
-    if (meta->resident) return 0;
-    auto it = octx->soa_per_idx.find(idx);
-    if (it == octx->soa_per_idx.end() || !it->second.reload_fn) return -3;
+    if (!indices || n_indices == 0) return 0;
+    std::vector<int> task;
+    task.reserve(n_indices);
+    for (size_t i = 0; i < n_indices; ++i) {
+        const int idx = indices[i];
+        if (idx < 0 || std::find(task.begin(), task.end(), idx) != task.end()) continue;
+        const block_meta *meta = wbm_get(octx->wbm, idx);
+        if (!meta) return -2;
+        if (meta->resident) continue;
+        auto it = octx->soa_per_idx.find(idx);
+        if (it == octx->soa_per_idx.end() || !it->second.reload_fn) return -3;
+        task.push_back(idx);
+    }
+    if (task.empty()) return 0;
     wbmcl_start_soa_reload_worker(octx);
     {
         std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
-        auto cur = octx->async_soa_reload_state.find(idx);
-        if (cur != octx->async_soa_reload_state.end() && cur->second == 1) return 0;
+        task.erase(std::remove_if(task.begin(), task.end(), [&](int idx) {
+            auto cur = octx->async_soa_reload_state.find(idx);
+            return cur != octx->async_soa_reload_state.end() && cur->second == 1;
+        }), task.end());
+        if (task.empty()) return 0;
         const size_t max_pending = async_stage_prepare_max_pending();
         if (max_pending > 0) {
             size_t pending = 0;
             for (const auto & kv : octx->async_soa_reload_state) {
                 if (kv.second == 1) pending++;
             }
-            if (pending >= max_pending) return 0;
+            // Preserve unit atomicity: defer the entire unit instead of
+            // enqueuing only the first member of a Multi task.
+            if (pending > 0 && pending + task.size() > max_pending) return 0;
         }
-        octx->async_soa_reload_state[idx] = 1;
-        octx->async_soa_reload_queue.push_back(idx);
-        octx->async_soa_reload_enqueued++;
+        for (int idx : task) octx->async_soa_reload_state[idx] = 1;
+        octx->async_soa_reload_enqueued += task.size();
+        octx->async_soa_reload_units_enqueued++;
+        octx->async_soa_reload_queue.push_back(std::move(task));
     }
     octx->async_soa_reload_cv.notify_one();
     return 0;
+}
+
+int wbmcl_soa_reload_async(wbm_opencl_ctx *octx, int idx) {
+    return wbmcl_soa_reload_async_unit(octx, &idx, 1);
 }
 
 int wbmcl_wait_soa_reload(wbm_opencl_ctx *octx, int idx) {
@@ -1072,9 +1302,10 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
         if (async_stage_prepare_enabled()) {
             rc = wbmcl_soa_reload_async(octx, idx);
         } else if (soa->second.transfer_fn) {
-            rc = soa->second.transfer_fn();
+            rc = wbmcl_transfer_soa_sync(octx, idx);
         } else {
-            rc = soa_reload_on_transfer_enabled() ? soa->second.reload_fn() : 0;
+            rc = soa_reload_on_transfer_enabled() ?
+                wbmcl_reload_soa_sync(octx, idx) : 0;
         }
     } else {
         const int wait_rc = wbmcl_wait_host_load(octx, idx);
@@ -1097,21 +1328,7 @@ int wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx) {
             if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         } else {
             cl_int err = CL_SUCCESS;
-            cl_mem buf = nullptr;
-            if (octx->retain_cl_mem) {
-                auto it = octx->retained_buffers_by_size.find(meta->byte_size);
-                if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
-                    buf = static_cast<cl_mem>(it->second.back());
-                    it->second.pop_back();
-                    for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
-                        if (*lit == meta->byte_size) {
-                            octx->retain_order_sizes.erase(std::next(lit).base());
-                            break;
-                        }
-                    }
-                    octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
-                }
-            }
+            cl_mem buf = retain_pool_take_buffer(octx, meta->byte_size);
             if (!buf) {
                 buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY, meta->byte_size, nullptr, &err);
                 if (err != CL_SUCCESS) {
@@ -1193,10 +1410,10 @@ int wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx) {
             if (release_stage_after_xform_enabled()) release_host_staging(octx, idx);
             rc = 0;
         } else if (it->second.xform_fn) {
-            rc = it->second.xform_fn();
+            rc = wbmcl_xform_soa_sync(octx, idx);
             if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         } else {
-            rc = it->second.reload_fn();
+            rc = wbmcl_reload_soa_sync(octx, idx);
             if (rc == 0 && (!octx->async_stage_load || release_stage_after_xform_enabled())) release_host_staging(octx, idx);
         }
     } else {
@@ -1226,17 +1443,54 @@ int wbmcl_prepare_backend(wbm_opencl_ctx *octx, int idx) {
             return wbmcl_soa_reload_async(octx, idx);
         }
         if (soa->second.xform_fn) {
-            return soa->second.xform_fn();
+            return wbmcl_xform_soa_sync(octx, idx);
         }
         if (soa->second.transfer_fn) {
-            return soa->second.transfer_fn();
+            return wbmcl_transfer_soa_sync(octx, idx);
         }
-        return soa->second.reload_fn();
+        return wbmcl_reload_soa_sync(octx, idx);
     }
 
     int rc = wbmcl_dma_to_backend(octx, idx);
     if (rc != 0) return rc;
     return wbmcl_transform_backend(octx, idx);
+}
+
+int wbmcl_prepare_backend_unit(wbm_opencl_ctx *octx,
+                               const int *indices, size_t n_indices) {
+    if (!octx || !octx->wbm) return -1;
+    if (!indices || n_indices == 0) return 0;
+    if (!async_stage_prepare_enabled()) {
+        for (size_t i = 0; i < n_indices; ++i) {
+            const int rc = wbmcl_prepare_backend(octx, indices[i]);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
+    std::vector<int> soa_indices;
+    soa_indices.reserve(n_indices);
+    for (size_t i = 0; i < n_indices; ++i) {
+        const int idx = indices[i];
+        const block_meta * meta = wbm_get(octx->wbm, idx);
+        if (!meta) return -2;
+        if (meta->resident) continue;
+        auto soa = octx->soa_per_idx.find(idx);
+        if (soa != octx->soa_per_idx.end() &&
+            (soa->second.xform_fn || soa->second.transfer_fn || soa->second.reload_fn)) {
+            soa_indices.push_back(idx);
+            continue;
+        }
+        // Non-SOA tensors retain the existing correctness path.  Model
+        // weight units in the OpenCL Q4 path are SOA, so this fallback is not
+        // used for the measured granularity tasks.
+        const int rc = wbmcl_prepare_backend(octx, idx);
+        if (rc != 0) return rc;
+    }
+    return soa_indices.empty()
+        ? 0
+        : wbmcl_soa_reload_async_unit(
+              octx, soa_indices.data(), soa_indices.size());
 }
 
 int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
@@ -1253,20 +1507,7 @@ int wbmcl_prefetch_async(wbm_opencl_ctx *octx, int idx) {
     // Retain pool 优先 (跟 ensure_resident 对齐) — 之前 prefetch 直接 clCreateBuffer
     // 不查池, 导致 prefetch 是热路径时 10000+ 次 alloc/release, Adreno driver 开销
     // 主导 (实测 5000 MB budget 3B F16 eval 6500 ms/tok vs ceiling 183).
-    if (octx->retain_cl_mem) {
-        auto it = octx->retained_buffers_by_size.find(meta->byte_size);
-        if (it != octx->retained_buffers_by_size.end() && !it->second.empty()) {
-            buf = static_cast<cl_mem>(it->second.back());
-            it->second.pop_back();
-            for (auto lit = octx->retain_order_sizes.rbegin(); lit != octx->retain_order_sizes.rend(); ++lit) {
-                if (*lit == meta->byte_size) {
-                    octx->retain_order_sizes.erase(std::next(lit).base());
-                    break;
-                }
-            }
-            octx->cached_bytes -= std::min(octx->cached_bytes, meta->byte_size);
-        }
-    }
+    buf = retain_pool_take_buffer(octx, meta->byte_size);
     if (!buf) {
         buf = clCreateBuffer(octx->cl_ctx, CL_MEM_READ_ONLY,
                              meta->byte_size, nullptr, &err);
@@ -1366,23 +1607,7 @@ int wbmcl_evict_batch(wbm_opencl_ctx *octx, const int *victims, int n_victims) {
         if (buf) {
             // Retain 模式：cl_mem 按 size 入池。pool 满时 FIFO 释放最早 size。
             if (octx->retain_cl_mem) {
-                if (octx->cache_byte_limit > 0) {
-                    while (octx->cached_bytes + m->byte_size > octx->cache_byte_limit &&
-                           !octx->retain_order_sizes.empty()) {
-                        size_t old_sz = octx->retain_order_sizes.front();
-                        octx->retain_order_sizes.pop_front();
-                        auto pit = octx->retained_buffers_by_size.find(old_sz);
-                        if (pit == octx->retained_buffers_by_size.end() || pit->second.empty()) continue;
-                        cl_mem old_buf = static_cast<cl_mem>(pit->second.back());
-                        pit->second.pop_back();
-                        clReleaseMemObject(old_buf);
-                        octx->n_releases += 1;
-                        octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-                    }
-                }
-                octx->retained_buffers_by_size[m->byte_size].push_back(static_cast<void *>(buf));
-                octx->retain_order_sizes.push_back(m->byte_size);
-                octx->cached_bytes += m->byte_size;
+                retain_pool_put_buffer(octx, buf, m->byte_size);
                 octx->bytes_evicted_total += m->byte_size;
                 wbm_mark_evicted(octx->wbm, v);
                 if (octx->async_stage_load && async_load_on_evict_enabled()) wbmcl_load_host_async(octx, v);
@@ -1411,18 +1636,59 @@ cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx) {
     return static_cast<cl_mem>(meta->backend_handle);
 }
 
+void wbmcl_wait_async_idle(wbm_opencl_ctx *octx) {
+    if (!octx) return;
+    {
+        std::unique_lock<std::mutex> lock(octx->async_load_mtx);
+        octx->async_load_cv.wait(lock, [octx]() {
+            if (!octx->async_load_queue.empty()) return false;
+            return std::none_of(
+                octx->async_load_state.begin(),
+                octx->async_load_state.end(),
+                [](const auto &entry) { return entry.second == 1; });
+        });
+    }
+    {
+        std::unique_lock<std::mutex> lock(octx->async_soa_reload_mtx);
+        octx->async_soa_reload_cv.wait(lock, [octx]() {
+            if (!octx->async_soa_reload_queue.empty()) return false;
+            return std::none_of(
+                octx->async_soa_reload_state.begin(),
+                octx->async_soa_reload_state.end(),
+                [](const auto &entry) { return entry.second == 1; });
+        });
+    }
+}
+
+void wbmcl_stop_async_workers(wbm_opencl_ctx *octx) {
+    if (!octx) return;
+
+    // Join based on std::thread lifetime itself. This remains safe and
+    // idempotent even if feature flags have already changed during teardown.
+    {
+        std::lock_guard<std::mutex> lock(octx->async_load_mtx);
+        octx->async_load_shutdown = true;
+    }
+    octx->async_load_cv.notify_all();
+    if (octx->async_load_worker.joinable()) {
+        octx->async_load_worker.join();
+    }
+    octx->async_stage_load = false;
+
+    {
+        std::lock_guard<std::mutex> lock(octx->async_soa_reload_mtx);
+        octx->async_soa_reload_shutdown = true;
+    }
+    octx->async_soa_reload_cv.notify_all();
+    if (octx->async_soa_reload_worker.joinable()) {
+        octx->async_soa_reload_worker.join();
+    }
+    octx->async_soa_reload_worker_started = false;
+}
+
 void wbmcl_shutdown(wbm_opencl_ctx *octx) {
     if (!octx || !octx->wbm) return;
-    if (octx->async_stage_load) {
-        {
-            std::lock_guard<std::mutex> lock(octx->async_load_mtx);
-            octx->async_load_shutdown = true;
-        }
-        octx->async_load_cv.notify_all();
-        if (octx->async_load_worker.joinable()) {
-            octx->async_load_worker.join();
-        }
-    }
+    wbmcl_stop_async_workers(octx);
     if (octx->soa_staging_last_use_ev) {
         clWaitForEvents(1, &octx->soa_staging_last_use_ev);
         clReleaseEvent(octx->soa_staging_last_use_ev);

@@ -3,6 +3,7 @@
 #include "plan_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -131,24 +132,73 @@ public:
         no_cache_ = e && *e && *e != '0';
         const char * a = std::getenv("GGML_ELASTIC_CALLBACK_ASYNC");
         async_ = a && *a && *a != '0';
+        const char * w = std::getenv("GGML_ELASTIC_CALLBACK_ASYNC_WAIT_MS");
+        async_wait_ms_ = w && *w ? std::max(0, std::atoi(w)) : 0;
     }
 
     const ExecPlan * get(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) override {
         if (!fn_) return nullptr;
         if (async_) {
+            // Decode must never start without an initial plan.  This also
+            // establishes the last known-safe (budget <= current) fallback.
+            if (!last_ready_) {
+                auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
+                if (!plan) return nullptr;
+                return store_ready(budget_mib, std::move(plan));
+            }
+
+            // A falling budget cannot keep using the previous, larger plan.
+            // Drain any obsolete request and solve the current lower budget
+            // before returning.  Rising budgets may safely keep the smaller
+            // ready plan while an exact replacement is prepared.
+            if (budget_mib < last_ready_budget_) {
+                if (pending_) {
+                    pending_future_.wait();
+                    if (const ExecPlan * ready = poll_async(budget_mib)) {
+                        return ready;
+                    }
+                }
+                auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
+                if (!plan) return nullptr;
+                return store_ready(budget_mib, std::move(plan));
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(async_wait_ms_);
             if (const ExecPlan * ready = poll_async(budget_mib)) {
                 return ready;
             }
-            if (!last_ready_) {
-                // First plan is blocking so decode never starts without a plan.
-                auto plan = solve_once(budget_mib, kv_bytes, misc_bytes);
-                if (!plan) return nullptr;
-                history_.push_back(std::move(plan));
-                last_ready_ = history_.back().get();
+            if (last_ready_budget_ == budget_mib) {
                 return last_ready_;
+            }
+
+            // If a request for an earlier budget is still running, give it
+            // only the configured total callback allowance, consume/discard
+            // it, then launch the current request.  Crucially, an obsolete
+            // result is never returned and therefore never causes a pointless
+            // intermediate apply (e.g. apply 4224 at B=4608, then 4608 at the
+            // next decode).
+            if (pending_ && last_requested_budget_ != budget_mib &&
+                async_wait_ms_ > 0) {
+                wait_until(deadline);
+                if (const ExecPlan * ready = poll_async(budget_mib)) {
+                    return ready;
+                }
             }
             if (!pending_ && (no_cache_ || last_requested_budget_ != budget_mib)) {
                 start_async(budget_mib, kv_bytes, misc_bytes);
+            }
+
+            // Remote planning is normally tens of milliseconds while one
+            // decode is orders of magnitude longer.  A short bounded wait
+            // lets a newly observed stable budget use its exact plan in the
+            // same decode; the wait is part of measured Online latency.
+            if (pending_ && last_requested_budget_ == budget_mib &&
+                async_wait_ms_ > 0) {
+                wait_until(deadline);
+                if (const ExecPlan * ready = poll_async(budget_mib)) {
+                    return ready;
+                }
             }
             return last_ready_;
         }
@@ -168,6 +218,11 @@ public:
         return it->second.get();
     }
 
+    bool needs_poll(int64_t budget_mib) const override {
+        return async_ && (
+            pending_ || !last_ready_ || last_ready_budget_ != budget_mib);
+    }
+
     int n_bands() const override { return (int) (cache_.size() + history_.size()); }
 
 private:
@@ -177,6 +232,14 @@ private:
         plan->kv_bytes   = kv_bytes;
         plan->misc_bytes = misc_bytes;
         return plan;
+    }
+
+    const ExecPlan * store_ready(
+            int64_t budget_mib, std::unique_ptr<ExecPlan> plan) {
+        history_.push_back(std::move(plan));
+        last_ready_ = history_.back().get();
+        last_ready_budget_ = budget_mib;
+        return last_ready_;
     }
 
     void start_async(int64_t budget_mib, size_t kv_bytes, size_t misc_bytes) {
@@ -194,6 +257,13 @@ private:
         });
     }
 
+    void wait_until(const std::chrono::steady_clock::time_point & deadline) {
+        if (!pending_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        pending_future_.wait_for(deadline - now);
+    }
+
     const ExecPlan * poll_async(int64_t current_budget_mib) {
         if (!pending_) return nullptr;
         if (pending_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
@@ -201,25 +271,15 @@ private:
         }
         pending_ = false;
         auto result = pending_future_.get();
-        static const int64_t async_max_stale_mib = []() {
-            const char * e = std::getenv("GGML_ELASTIC_CALLBACK_ASYNC_MAX_STALE_MB");
-            if (!e || !*e) return (int64_t) 512;
-            const long long v = std::atoll(e);
-            return v >= 0 ? (int64_t) v : (int64_t) 512;
-        }();
-        // A stale async result is safe when it was solved for a budget no
-        // larger than the current budget, but a very old low-budget plan can
-        // destroy performance after memory recovers. Accept only bounded-stale
-        // conservative results; reject plans that are too high or too old.
-        if (result.first > current_budget_mib ||
-            (async_max_stale_mib > 0 && current_budget_mib - result.first > async_max_stale_mib)) {
+        // Only an exact-budget result is publishable.  A lower-budget result
+        // is memory-safe but can make a rising trace chase one bucket behind
+        // forever; a higher-budget result is unsafe after a budget drop.
+        if (result.first != current_budget_mib) {
             return nullptr;
         }
         auto plan = std::move(result.second);
         if (!plan) return nullptr;
-        history_.push_back(std::move(plan));
-        last_ready_ = history_.back().get();
-        return last_ready_;
+        return store_ready(result.first, std::move(plan));
     }
 
     std::function<bool(int64_t, ExecPlan &)>         fn_;
@@ -227,10 +287,12 @@ private:
     std::vector<std::unique_ptr<ExecPlan>>           history_;
     std::future<std::pair<int64_t, std::unique_ptr<ExecPlan>>> pending_future_;
     const ExecPlan *                                 last_ready_ = nullptr;
+    int64_t                                          last_ready_budget_ = -1;
     int64_t                                          last_requested_budget_ = -1;
     bool                                             pending_ = false;
     bool                                             no_cache_ = false;
     bool                                             async_ = false;
+    int                                              async_wait_ms_ = 0;
 };
 
 }  // namespace

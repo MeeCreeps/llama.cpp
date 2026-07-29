@@ -6,9 +6,46 @@
 #include "traits.h"
 #include "ggml.h"
 
+#include <atomic>
+
 // GGML internal header
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
+
+// Reuse the native CPU repack implementation from buffers that provide their
+// own residency/storage policy (for example CPU_Elastic).  A compatible
+// buffer initializes the tensor trait once, repacks every raw materialization
+// through ggml_backend_cpu_repack_tensor(), and keeps tensor->extra attached so
+// the normal CPU backend selects the matching interleaved compute kernel.
+bool ggml_backend_cpu_repack_tensor_init(struct ggml_tensor * tensor);
+bool ggml_backend_cpu_repack_tensor_compatible(const struct ggml_tensor * tensor);
+int  ggml_backend_cpu_repack_tensor(struct ggml_tensor * tensor, const void * data, size_t size);
+int  ggml_backend_cpu_repack_row_alignment(const struct ggml_tensor * tensor);
+
+// Pair operations used by CPU_Elastic's multi_fused working unit.  The pair
+// repack traverses the two tensors in one parallel transformation invocation
+// while retaining their independent destinations.  The MUL_MAT pair shares a
+// single quantized activation and distributes the combined output-row groups
+// across one CPU kernel dispatch.
+bool ggml_backend_cpu_repack_tensor_pair_compatible(
+        const struct ggml_tensor * first, const struct ggml_tensor * second);
+int ggml_backend_cpu_repack_tensor_pair(
+        struct ggml_tensor * first, const void * first_data, size_t first_size,
+        struct ggml_tensor * second, const void * second_data, size_t second_size);
+
+struct ggml_backend_cpu_repack_pair_sync {
+    std::atomic<int>  quantize_arrivals{0};
+    std::atomic<bool> quantize_ready{false};
+};
+
+bool ggml_backend_cpu_repack_mul_mat_pair_compatible(
+        const struct ggml_tensor * first, const struct ggml_tensor * second);
+size_t ggml_backend_cpu_repack_mul_mat_pair_work_size(
+        const struct ggml_tensor * first, const struct ggml_tensor * second);
+int ggml_backend_cpu_repack_mul_mat_pair_compute_thread(
+        struct ggml_tensor * first, struct ggml_tensor * second,
+        void * workspace, size_t workspace_size, int ith, int nth,
+        struct ggml_backend_cpu_repack_pair_sync * sync);
 
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {

@@ -1,0 +1,4 @@
+granularity,units,unit_definition,weights_mib,gflop,io_s,io_mib_s,layout_preparation_s,layout_preparation_mib_s,compute_s,compute_gflop_s
+multi,680,"2 tensors; 2.25 MiB",1530,5.704253,0.577,2651,9.138,167.4,0.697,8.18
+tensor,1360,"1 tensor; 1.125 MiB",1530,5.704253,0.663,2309,9.118,167.8,1.207,4.72
+cut,2720,"half tensor [4096,256]; 0.5625 MiB",1530,5.704253,0.712,2149,6.477,236.2,2.204,2.59

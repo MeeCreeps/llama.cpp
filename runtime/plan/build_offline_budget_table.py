@@ -39,15 +39,38 @@ def main() -> None:
     ap.add_argument("--kv-mib", type=int, default=128)
     ap.add_argument("--misc-mib", type=int, default=256)
     ap.add_argument("--safety-mib", type=int, default=64)
+    ap.add_argument("--planner-stream-reserve-mib", type=int, default=0)
     ap.add_argument("--time-limit-ms", type=int, default=20)
     ap.add_argument("--prefetch-distance", type=int, default=1)
     ap.add_argument("--allow-cpu-fallback", action="store_true")
+    ap.add_argument(
+        "--allow-output-cpu", action="store_true",
+        help="allow output.weight on CPU in a CPU-only placement space")
+    ap.add_argument(
+        "--allow-output-disk", action="store_true",
+        help="allow output.weight to be non-resident in a CPU-only plan")
     ap.add_argument("--transition-weight", type=float, default=0.1)
     ap.add_argument("--disk-reload-multiplier", type=float, default=1.0)
     ap.add_argument("--disk-gpu-reload-multiplier", type=float, default=4.0)
     ap.add_argument("--overlap-model", choices=("pipeline", "none"), default="pipeline")
     ap.add_argument("--cp-objective", choices=("resource_makespan", "interval_makespan", "sum"), default="resource_makespan")
     ap.add_argument("--allowed-placements", default="cpu,gpu,disk_cpu,disk_gpu")
+    ap.add_argument(
+        "--force-weight-placement", action="append", default=[],
+        metavar="WEIGHT=PLACEMENT")
+    ap.add_argument("--dynamic-active-experts", type=float, default=0.0)
+    ap.add_argument("--dynamic-total-experts", type=float, default=0.0)
+    ap.add_argument("--dynamic-weight-pattern", default="_exps.weight")
+    ap.add_argument(
+        "--granularity-policy",
+        choices=(
+            "none", "fixed-multi", "fixed-tensor", "fixed-cut",
+            "offline"),
+        default="none")
+    ap.add_argument(
+        "--granularity-backend", choices=("cpu", "gpu"), default="cpu")
+    ap.add_argument("--granularity-profile", type=Path)
+    ap.add_argument("--granularity-beam-width", type=int, default=128)
     ap.add_argument("--top-k", type=int, default=1,
                     help="number of diverse candidate plans to preserve per budget")
     ap.add_argument("--candidate-placement-specs", default="",
@@ -57,6 +80,11 @@ def main() -> None:
     ap.add_argument("--chain-state", action="store_true",
                     help="build each budget using the previous lower-budget plan as current state")
     args = ap.parse_args()
+
+    if (args.dynamic_active_experts > 0) != (args.dynamic_total_experts > 0):
+        raise SystemExit("--dynamic-active-experts and --dynamic-total-experts must be set together")
+    if args.dynamic_active_experts > args.dynamic_total_experts:
+        raise SystemExit("--dynamic-active-experts cannot exceed --dynamic-total-experts")
 
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
     if not budgets:
@@ -84,6 +112,8 @@ def main() -> None:
                 "--kv-mib", str(args.kv_mib),
                 "--misc-mib", str(args.misc_mib),
                 "--safety-mib", str(args.safety_mib),
+                "--planner-stream-reserve-mib",
+                str(args.planner_stream_reserve_mib),
                 "--time-limit-ms", str(args.time_limit_ms),
                 "--prefetch-distance", str(args.prefetch_distance),
                 "--transition-weight", str(args.transition_weight),
@@ -91,11 +121,29 @@ def main() -> None:
                 "--disk-gpu-reload-multiplier", str(args.disk_gpu_reload_multiplier),
                 "--overlap-model", str(args.overlap_model),
                 "--cp-objective", str(args.cp_objective),
+                "--dynamic-active-experts", str(args.dynamic_active_experts),
+                "--dynamic-total-experts", str(args.dynamic_total_experts),
+                "--dynamic-weight-pattern", str(args.dynamic_weight_pattern),
+                "--granularity-policy", args.granularity_policy,
+                "--granularity-backend", args.granularity_backend,
+                "--granularity-beam-width",
+                str(args.granularity_beam_width),
             ]
+            if args.granularity_profile:
+                cmd.extend([
+                    "--granularity-profile",
+                    str(args.granularity_profile),
+                ])
             if args.chain_state and prev_state is not None:
                 cmd.extend(["--state", str(prev_state)])
             if args.allow_cpu_fallback:
                 cmd.append("--allow-cpu-fallback")
+            if args.allow_output_cpu:
+                cmd.append("--allow-output-cpu")
+            if args.allow_output_disk:
+                cmd.append("--allow-output-disk")
+            for forced in args.force_weight_placement:
+                cmd.extend(["--force-weight-placement", forced])
             for k in range(n_candidates):
                 out = args.out_dir / (f"plan_{b}MiB.json" if k == 0 else f"plan_{b}MiB_cand{k}.json")
                 cand_cmd = list(cmd)
@@ -130,6 +178,11 @@ def main() -> None:
         "top_k": max(1, args.top_k),
         "candidate_diversity": "distance" if use_distance_diversity else "placement_specs",
         "candidate_min_distance": args.candidate_min_distance if use_distance_diversity else 0,
+        "dynamic_active_experts": args.dynamic_active_experts,
+        "dynamic_total_experts": args.dynamic_total_experts,
+        "dynamic_weight_pattern": args.dynamic_weight_pattern,
+        "planner_stream_reserve_mib":
+            max(0, args.planner_stream_reserve_mib),
     }, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"out_dir": str(args.out_dir), "budgets": len(index), "top_k": max(1, args.top_k)}, indent=2))
 

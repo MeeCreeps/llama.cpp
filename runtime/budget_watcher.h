@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <pthread.h>
 #include <string>
 #include <vector>
@@ -39,7 +40,9 @@ struct budget_watcher {
     interp_mode         mode;
     int                 tick_period_ms;               // 后台线程采样周期
 
-    std::chrono::steady_clock::time_point t0;
+    // reset_clock() runs on the decode thread while the watcher pthread
+    // samples this epoch. A plain time_point here is a C++ data race.
+    std::atomic<int64_t> t0_ns;
 };
 
 struct budget_watcher_config {

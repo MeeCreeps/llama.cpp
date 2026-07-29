@@ -12,6 +12,11 @@ target_link_libraries(test_weight_buffer_manager PRIVATE elastic_runtime)
 target_compile_options(test_weight_buffer_manager PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME test_weight_buffer_manager COMMAND test_weight_buffer_manager)
 
+add_executable(test_elastic_granularity test_elastic_granularity.cpp)
+target_link_libraries(test_elastic_granularity PRIVATE elastic_runtime)
+target_compile_options(test_elastic_granularity PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME test_elastic_granularity COMMAND test_elastic_granularity)
+
 # ── Plan framework 单测(plan_ir / plan_executor / plan_provider)──
 set(_ELASTIC_PLANS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/plan/plans)
 

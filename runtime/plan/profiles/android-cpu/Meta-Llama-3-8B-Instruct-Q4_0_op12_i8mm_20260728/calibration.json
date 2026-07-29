@@ -1,0 +1,13 @@
+{
+  "source": "OP12-Llama3-8B-Q4-CPU-pipeline-budgetfair-I8MM-workerpin-20260728",
+  "stage_fallback_models": {
+    "CPU_Elastic:LOAD": {
+      "fixed_ms": 1.9815323974034338,
+      "ms_per_mib": 0.26401814668127627
+    },
+    "CPU_Elastic:XFORM": {
+      "fixed_ms": 0.0,
+      "ms_per_mib": 0.6072644141227629
+    }
+  }
+}

@@ -107,6 +107,30 @@ struct elastic_online_solver_state {
         double resident_value_cpu = 0.0;
     };
 
+    struct profiled_compute_cost {
+        bool has_mul_mat = false;
+        int mul_mat_samples = 0;
+        size_t mul_mat_ordinal = 0;
+        double mul_mat_ms = 0.0;
+        bool has_other = false;
+        size_t other_ordinal = 0;
+        double other_ms = 0.0;
+    };
+
+    struct cost_record_index {
+        std::unordered_map<std::string, double> exact;
+        std::unordered_map<std::string, double> by_size;
+        std::unordered_map<std::string, profiled_compute_cost> compute;
+        std::unordered_set<std::string> measured_kinds;
+
+        void clear() {
+            exact.clear();
+            by_size.clear();
+            compute.clear();
+            measured_kinds.clear();
+        }
+    };
+
     llama_context * ctx = nullptr;
     nlohmann::json  model_meta;
     std::vector<std::string> weight_names;
@@ -114,6 +138,8 @@ struct elastic_online_solver_state {
     std::vector<item_base> item_bases;
     nlohmann::json stage_costs;
     nlohmann::json op_costs;
+    cost_record_index stage_cost_index;
+    cost_record_index op_cost_index;
     std::string mode;
     std::string python;
     std::string solver;
@@ -133,7 +159,7 @@ struct elastic_online_solver_state {
     bool prewarm_candidate_cache = false;
     std::string last_candidate_file;
     int64_t last_candidate_budget_mib = 0;
-    nlohmann::json last_online_plan_json;
+    std::unordered_set<std::string> last_disk_weights;
     nlohmann::json last_diff_tree_plan;
     int64_t last_diff_tree_budget_mib = 0;
     double keep_current_margin_ms = 0.0;
@@ -158,6 +184,28 @@ struct elastic_online_solver_state {
     double remote_wall_ms_total = 0.0;
     double remote_server_ms_total = 0.0;
     std::vector<llama_plan *> plans;
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> working_set_counters;
+
+    // Joint residency + working-unit planning. Offline plans carry the same
+    // schema; callback modes attach/update it before llama_plan_load_json().
+    std::string granularity_policy = "none";
+    std::string granularity_backend = "gpu";
+    std::string granularity_fixed_mode = "tensor";
+    std::string granularity_profile_path;
+    nlohmann::json granularity_profile;
+    double granularity_switch_cost_ms = 0.0;
+    double granularity_horizon_tokens = 8.0;
+    double granularity_min_gain_ms = 0.0;
+    double granularity_split_wait_ratio = 0.55;
+    double granularity_merge_wait_ratio = 0.20;
+    int granularity_cut_parts = 2;
+    int granularity_multi_tensors = 2;
+    std::string granularity_last_mode;
+    int64_t granularity_last_budget_mib = 0;
+    uint64_t granularity_last_units = 0;
+    uint64_t granularity_last_wait_us = 0;
+    uint64_t granularity_last_reload_bytes = 0;
+    uint64_t granularity_last_prepare_us = 0;
 };
 
 static double elastic_effective_transition_weight(const elastic_online_solver_state * s, int64_t budget_mib) {
@@ -169,18 +217,62 @@ static double elastic_effective_transition_weight(const elastic_online_solver_st
     return s ? s->transition_weight : 1.0;
 }
 
-static double elastic_cost_lookup(const nlohmann::json & records, const std::string & backend,
-                                  const std::string & kind, const std::string & name,
-                                  size_t bytes, double fallback) {
-    const auto & rs = records.value("records", nlohmann::json::array());
-    const nlohmann::json * best_size = nullptr;
-    for (const auto & r : rs) {
-        if (r.value("backend", std::string()) != backend) continue;
-        if (!kind.empty() && r.value("kind", std::string()) != kind) continue;
-        if (r.value("name", std::string()) == name) return r.value("median_ms", fallback);
-        if ((size_t) r.value("bytes", 0) == bytes && best_size == nullptr) best_size = &r;
+static std::string elastic_record_key(const std::string & backend, const std::string & kind,
+                                      const std::string & value) {
+    return backend + "|" + kind + "|" + value;
+}
+
+static std::string elastic_record_size_key(const std::string & backend, const std::string & kind,
+                                           size_t bytes) {
+    return elastic_record_key(backend, kind, std::to_string((unsigned long long) bytes));
+}
+
+static void elastic_build_cost_index(const nlohmann::json & records,
+                                     elastic_online_solver_state::cost_record_index & index) {
+    index.clear();
+    size_t ordinal = 0;
+    for (const auto & r : records.value("records", nlohmann::json::array())) {
+        const std::string backend = r.value("backend", std::string());
+        const std::string kind = r.value("kind", std::string());
+        const std::string name = r.value("name", std::string());
+        const size_t bytes = (size_t) r.value("bytes", 0);
+        const double median_ms = r.value("median_ms", 0.0);
+        if (backend.empty()) {
+            ordinal++;
+            continue;
+        }
+
+        index.measured_kinds.insert(backend + "|" + kind);
+        index.exact.emplace(elastic_record_key(backend, kind, name), median_ms);
+        index.by_size.emplace(elastic_record_size_key(backend, kind, bytes), median_ms);
+
+        if (kind == "COMPUTE") {
+            auto & entry = index.compute[backend + "|" + name];
+            if (r.value("op", std::string()) == "MUL_MAT") {
+                const int samples = r.value("samples", 0);
+                if (!entry.has_mul_mat || samples > entry.mul_mat_samples) {
+                    entry.has_mul_mat = true;
+                    entry.mul_mat_samples = samples;
+                    entry.mul_mat_ordinal = ordinal;
+                    entry.mul_mat_ms = median_ms;
+                }
+            } else if (!entry.has_other) {
+                entry.has_other = true;
+                entry.other_ordinal = ordinal;
+                entry.other_ms = median_ms;
+            }
+        }
+        ordinal++;
     }
-    return best_size ? best_size->value("median_ms", fallback) : fallback;
+}
+
+static double elastic_cost_lookup(const elastic_online_solver_state::cost_record_index & index,
+                                  const std::string & backend, const std::string & kind,
+                                  const std::string & name, size_t bytes, double fallback) {
+    const auto exact = index.exact.find(elastic_record_key(backend, kind, name));
+    if (exact != index.exact.end()) return exact->second;
+    const auto by_size = index.by_size.find(elastic_record_size_key(backend, kind, bytes));
+    return by_size != index.by_size.end() ? by_size->second : fallback;
 }
 
 static bool elastic_state_has(uint32_t flags, const std::string & be);
@@ -221,24 +313,12 @@ static std::vector<std::string> elastic_compute_profile_names(const std::string 
 }
 
 static bool elastic_has_measured_compute(elastic_online_solver_state * s, const std::string & backend) {
-    const auto & rs = s->op_costs.value("records", nlohmann::json::array());
-    for (const auto & r : rs) {
-        if (r.value("backend", std::string()) == backend && r.value("kind", std::string()) == "COMPUTE") {
-            return true;
-        }
-    }
-    return false;
+    return s->op_cost_index.measured_kinds.count(backend + "|COMPUTE") != 0;
 }
 
 static bool elastic_has_measured_stage_kind(elastic_online_solver_state * s,
                                             const std::string & backend, const std::string & kind) {
-    const auto & rs = s->stage_costs.value("records", nlohmann::json::array());
-    for (const auto & r : rs) {
-        if (r.value("backend", std::string()) == backend && r.value("kind", std::string()) == kind) {
-            return true;
-        }
-    }
-    return false;
+    return s->stage_cost_index.measured_kinds.count(backend + "|" + kind) != 0;
 }
 
 static std::string elastic_cost_key(const char * prefix, const std::string & backend, const std::string & kind,
@@ -259,7 +339,7 @@ static double elastic_stage_cost(elastic_online_solver_state * s, const std::str
     else if (kind == "XFORM") fb = 0.10 + mb / 8000.0 * 1000.0;
     else if (kind == "SYNC") fb = 0.03;
     else if (kind == "EVICT") fb = 0.01;
-    const double value = elastic_cost_lookup(s->stage_costs, backend, kind, name, bytes, fb);
+    const double value = elastic_cost_lookup(s->stage_cost_index, backend, kind, name, bytes, fb);
     s->cost_cache.emplace(key, value);
     return value;
 }
@@ -283,36 +363,36 @@ static double elastic_compute_cost(elastic_online_solver_state * s, const std::s
         return value;
     }
     const auto candidates = elastic_compute_profile_names(name);
-    const auto & rs = s->op_costs.value("records", nlohmann::json::array());
-    const nlohmann::json * exact = nullptr;
-    const nlohmann::json * best_mul_mat = nullptr;
-    for (const auto & r : rs) {
-        if (r.value("backend", std::string()) != backend) continue;
-        if (r.value("kind", std::string()) != "COMPUTE") continue;
-        const std::string rname = r.value("name", std::string());
-        if (std::find(candidates.begin(), candidates.end(), rname) == candidates.end()) continue;
-        if (r.value("op", std::string()) == "MUL_MAT") {
-            if (best_mul_mat == nullptr || r.value("samples", 0) > best_mul_mat->value("samples", 0)) {
-                best_mul_mat = &r;
-            }
-            continue;
+    const elastic_online_solver_state::profiled_compute_cost * best_mul_mat = nullptr;
+    const elastic_online_solver_state::profiled_compute_cost * exact = nullptr;
+    for (const std::string & candidate : candidates) {
+        const auto it = s->op_cost_index.compute.find(backend + "|" + candidate);
+        if (it == s->op_cost_index.compute.end()) continue;
+        const auto & entry = it->second;
+        if (entry.has_mul_mat &&
+            (best_mul_mat == nullptr || entry.mul_mat_samples > best_mul_mat->mul_mat_samples ||
+             (entry.mul_mat_samples == best_mul_mat->mul_mat_samples &&
+              entry.mul_mat_ordinal < best_mul_mat->mul_mat_ordinal))) {
+            best_mul_mat = &entry;
         }
-        if (exact == nullptr) exact = &r;
+        if (entry.has_other && (exact == nullptr || entry.other_ordinal < exact->other_ordinal)) {
+            exact = &entry;
+        }
     }
     if (best_mul_mat != nullptr) {
-        const double value = best_mul_mat->value("median_ms", 0.0);
+        const double value = best_mul_mat->mul_mat_ms;
         s->cost_cache.emplace(key, value);
         return value;
     }
     if (exact != nullptr) {
-        const double value = exact->value("median_ms", 0.0);
+        const double value = exact->other_ms;
         s->cost_cache.emplace(key, value);
         return value;
     }
 
     const double mb = bytes / 1024.0 / 1024.0;
     const double fb = backend == "OpenCL" ? 0.03 + mb * 0.020 : 0.05 + mb * 0.045;
-    const double value = elastic_cost_lookup(s->op_costs, backend, "COMPUTE", name, bytes, fb);
+    const double value = elastic_cost_lookup(s->op_cost_index, backend, "COMPUTE", name, bytes, fb);
     s->cost_cache.emplace(key, value);
     return value;
 }
@@ -461,6 +541,147 @@ static nlohmann::json elastic_dynamic_weight_patterns_json() {
         out.push_back(pat);
     }
     return out;
+}
+
+static void elastic_project_dynamic_weights_to_runtime_cache(nlohmann::json & plan) {
+    if (!elastic_dynamic_weight_budget_enabled()) return;
+
+    std::unordered_set<int> dynamic_ids;
+    for (auto & w : plan["weights"]) {
+        if (!w.is_object() || !elastic_is_dynamic_weight_name(w.value("name", std::string()))) continue;
+        const int id = w.value("weight_id", -1);
+        if (id >= 0) dynamic_ids.insert(id);
+        // The packed expert cache materializes only the selected slices. Keep
+        // the full parent disk-backed so WBM does not compete with that cache.
+        w["location"] = "disk";
+        w["xform"] = "none";
+    }
+    if (dynamic_ids.empty()) return;
+
+    for (auto & op : plan["ops"]) {
+        if (!op.is_object() || dynamic_ids.count(op.value("weight_id", -1)) == 0) continue;
+        op["compute_backend"] = "gpu";
+        op["dispatch"] = "static";
+        op["migrate"] = false;
+        op["migrate_from"] = "gpu";
+        op["migrate_xform"] = "none";
+    }
+
+    auto filter_events = [&dynamic_ids](nlohmann::json & events) {
+        if (!events.is_array()) return;
+        nlohmann::json kept = nlohmann::json::array();
+        for (auto & event : events) {
+            if (!event.is_object() || dynamic_ids.count(event.value("weight_id", -1)) == 0) {
+                kept.push_back(std::move(event));
+            }
+        }
+        events = std::move(kept);
+    };
+    if (plan.contains("timeline")) filter_events(plan["timeline"]);
+    if (plan.contains("schedule") && plan["schedule"].is_object() && plan["schedule"].contains("events")) {
+        filter_events(plan["schedule"]["events"]);
+        if (plan["schedule"]["events"].empty()) {
+            plan["schedule"]["kind"] = "none";
+        }
+    }
+    plan["dynamic_runtime_cache"] = {
+        {"enabled", true},
+        {"weight_count", dynamic_ids.size()},
+        {"weight_patterns", elastic_dynamic_weight_patterns_json()},
+        {"active_scale", elastic_dynamic_weight_scale()},
+    };
+    if (!plan.contains("working_sets") || !plan["working_sets"].is_array()) {
+        plan["working_sets"] = nlohmann::json::array();
+    }
+    const bool has_expert_slices = std::any_of(
+        plan["working_sets"].begin(), plan["working_sets"].end(),
+        [](const nlohmann::json & ws) {
+            return ws.is_object() && ws.value("kind", std::string()) == "expert_slices";
+        });
+    if (!has_expert_slices) {
+        const char * active_env = std::getenv("LLAMA_ELASTIC_DYNAMIC_ACTIVE_EXPERTS");
+        const char * total_env = std::getenv("LLAMA_ELASTIC_DYNAMIC_TOTAL_EXPERTS");
+        const int active = std::max(1, active_env && *active_env ? (int) std::ceil(std::atof(active_env)) : 1);
+        const int total = std::max(active, total_env && *total_env ? (int) std::ceil(std::atof(total_env)) : active);
+        plan["working_sets"].push_back({
+            {"name", "dynamic_weights"},
+            {"kind", "expert_slices"},
+            {"target_capacity", -1},
+            {"budget_capacity", -1},
+            {"min_capacity", active},
+            {"max_capacity", total},
+            {"policy", "backend_auto"},
+            {"state_aware", false},
+        });
+    }
+}
+
+static void elastic_adjust_working_sets_from_runtime(
+        elastic_online_solver_state * s, nlohmann::json & plan) {
+    if (!s || !plan.contains("working_sets") || !plan["working_sets"].is_array()) return;
+    static const double grow_miss_rate = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_WORKING_SET_GROW_MISS_RATE");
+        return e && *e ? std::max(0.0, std::atof(e)) : 0.15;
+    }();
+    static const int grow_step = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_WORKING_SET_GROW_STEP");
+        return std::max(1, e && *e ? std::atoi(e) : 4);
+    }();
+
+    for (auto & row : plan["working_sets"]) {
+        if (!row.is_object()) continue;
+        const std::string kind = row.value("kind", std::string());
+        const int ceiling = row.value("budget_capacity", row.value("target_capacity", -1));
+        if (kind.empty() || ceiling < 0) continue;
+        const bool borrow_from_movable = s->mode == "diff-tree-ideal";
+        const int hard_limit = borrow_from_movable ?
+            std::max(ceiling, row.value("max_capacity", ceiling)) : ceiling;
+        llama_working_set_state state{};
+        if (llama_working_set_get_state(s->ctx, kind.c_str(), &state) != 0) continue;
+
+        auto & previous = s->working_set_counters[kind];
+        const uint64_t delta_accesses = state.accesses >= previous.first ? state.accesses - previous.first : 0;
+        const uint64_t delta_misses = state.misses >= previous.second ? state.misses - previous.second : 0;
+        previous = {state.accesses, state.misses};
+        const double miss_rate = delta_accesses ? (double) delta_misses / delta_accesses : 0.0;
+
+        int target = ceiling;
+        const char * reason = "runtime_uninitialized";
+        if (!borrow_from_movable && state.active_capacity >= 0 && state.active_capacity > ceiling) {
+            target = ceiling;
+            reason = "budget_shrink";
+        } else if (state.active_capacity >= 0 &&
+                   state.observed_required_capacity > state.active_capacity &&
+                   state.active_capacity < hard_limit) {
+            target = std::min(hard_limit, std::max(state.observed_required_capacity,
+                                                state.active_capacity + grow_step));
+            reason = "observed_high_water_grow";
+        } else if (state.active_capacity >= 0 && state.active_capacity < ceiling && miss_rate >= grow_miss_rate) {
+            // Cache misses may fill budget-provisioned capacity, but only an
+            // observed workload high-water can borrow bytes from Movable.
+            target = std::min(ceiling, state.active_capacity + grow_step);
+            reason = "miss_pressure_grow";
+        } else if (borrow_from_movable && state.active_capacity > ceiling) {
+            target = std::max(ceiling, state.observed_required_capacity);
+            target = std::min(target, state.active_capacity);
+            reason = "workload_release_restore_movable";
+        } else if (state.active_capacity >= 0) {
+            target = state.active_capacity;
+            reason = "keep_current";
+        }
+        row["target_capacity"] = target;
+        row["budget_capacity"] = ceiling;
+        row["policy"] = "runtime_pressure";
+        row["state_aware"] = true;
+        row["runtime_active_capacity"] = state.active_capacity;
+        row["runtime_observed_required_capacity"] = state.observed_required_capacity;
+        row["runtime_delta_accesses"] = delta_accesses;
+        row["runtime_delta_misses"] = delta_misses;
+        row["runtime_miss_rate"] = miss_rate;
+        row["budget_capacity_ceiling"] = ceiling;
+        row["borrow_from_movable"] = borrow_from_movable;
+        row["adjustment_reason"] = reason;
+    }
 }
 
 static std::unordered_map<std::string, uint32_t> elastic_snapshot_weight_flags(elastic_online_solver_state * s) {
@@ -679,7 +900,65 @@ static size_t elastic_plan_resident_bytes_impl(const nlohmann::json & plan, bool
             total += effective ? elastic_effective_budget_bytes_for_weight(name, bytes) : bytes;
         }
     }
+    if (effective && plan.contains("working_sets") && plan["working_sets"].is_array()) {
+        for (const auto & ws : plan["working_sets"]) {
+            if (!ws.is_object()) continue;
+            const int capacity = ws.value("target_capacity", -1);
+            const size_t bytes_per_capacity = (size_t) ws.value("bytes_per_capacity", 0LL);
+            if (capacity <= 0 || bytes_per_capacity == 0) continue;
+            const size_t count = (size_t) capacity;
+            if (count <= (std::numeric_limits<size_t>::max() - total) / bytes_per_capacity) {
+                total += count * bytes_per_capacity;
+            } else {
+                return std::numeric_limits<size_t>::max();
+            }
+        }
+    }
     return total;
+}
+
+static int elastic_plan_working_set_capacity(const nlohmann::json & plan) {
+    int total = 0;
+    if (!plan.contains("working_sets") || !plan["working_sets"].is_array()) return total;
+    for (const auto & ws : plan["working_sets"]) {
+        if (ws.is_object()) total += std::max(0, ws.value("target_capacity", -1));
+    }
+    return total;
+}
+
+static bool elastic_plan_core_equivalent(
+        const nlohmann::json & a, const nlohmann::json & b) {
+    const auto & aw = a.value("weights", nlohmann::json::array());
+    const auto & bw = b.value("weights", nlohmann::json::array());
+    const auto & ao = a.value("ops", nlohmann::json::array());
+    const auto & bo = b.value("ops", nlohmann::json::array());
+    if (!aw.is_array() || !bw.is_array() || aw.size() != bw.size() ||
+        !ao.is_array() || !bo.is_array() || ao.size() != bo.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < aw.size(); ++i) {
+        const auto & x = aw[i];
+        const auto & y = bw[i];
+        if (x.value("weight_id", -1) != y.value("weight_id", -1) ||
+            x.value("location", std::string("disk")) != y.value("location", std::string("disk")) ||
+            x.value("pinned", false) != y.value("pinned", false) ||
+            x.value("xform", std::string("none")) != y.value("xform", std::string("none"))) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < ao.size(); ++i) {
+        const auto & x = ao[i];
+        const auto & y = bo[i];
+        if (x.value("op_id", -1) != y.value("op_id", -1) ||
+            x.value("compute_backend", std::string("gpu")) != y.value("compute_backend", std::string("gpu")) ||
+            x.value("dispatch", std::string("static")) != y.value("dispatch", std::string("static")) ||
+            x.value("migrate", false) != y.value("migrate", false) ||
+            x.value("migrate_from", std::string("cpu")) != y.value("migrate_from", std::string("cpu")) ||
+            x.value("migrate_xform", std::string("none")) != y.value("migrate_xform", std::string("none"))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static size_t elastic_plan_resident_bytes(const nlohmann::json & plan) {
@@ -1109,6 +1388,156 @@ static nlohmann::json elastic_diff_tree_ideal_plan(elastic_online_solver_state *
     return out;
 }
 
+static nlohmann::json elastic_dynamic_movable_diff_tree(
+        elastic_online_solver_state * s,
+        int64_t budget_mib,
+        const nlohmann::json & base_plan,
+        const nlohmann::json & target_plan,
+        const std::unordered_map<std::string, uint32_t> * state_flags) {
+    struct node {
+        int id = -1;
+        std::string name;
+        std::string group;
+        size_t bytes = 0;
+        double steady_benefit_ms = 0.0;
+        double transition_ms = 0.0;
+        double score_ms = 0.0;
+        double score_per_byte = 0.0;
+    };
+
+    const double horizon = []() {
+        const char * e = std::getenv("LLAMA_ELASTIC_DIFF_HORIZON_TOKENS");
+        const double v = e && *e ? std::atof(e) : 32.0;
+        return v > 1.0 ? v : 1.0;
+    }();
+    const double transition_weight = elastic_effective_transition_weight(s, budget_mib);
+    const int64_t usable_mib = budget_mib - s->kv_mib - s->misc_mib - s->safety_mib;
+    const int64_t budget_bytes = std::max<int64_t>(0, usable_mib) * 1024LL * 1024LL;
+
+    nlohmann::json out = base_plan.is_object() ? base_plan : target_plan;
+    out["budget_mib"] = budget_mib;
+    out["working_sets"] = target_plan.value("working_sets", nlohmann::json::array());
+
+    auto disk_path_cost = [&](const nlohmann::json & w) {
+        const std::string name = w.value("name", std::string());
+        const size_t bytes = (size_t) w.value("byte_size", 0);
+        return elastic_gpu_reload_cost(s, name, bytes) + elastic_compute_cost(s, "OpenCL", name, bytes);
+    };
+
+    std::vector<node> evict_nodes;
+    std::vector<node> promote_nodes;
+    for (const auto & w : out.value("weights", nlohmann::json::array())) {
+        if (!w.is_object() || w.value("pinned", false)) continue;
+        const std::string name = w.value("name", std::string());
+        if (name.empty() || elastic_is_dynamic_weight_name(name)) continue;
+        const int id = w.value("weight_id", -1);
+        const size_t bytes = elastic_effective_budget_bytes_for_weight(
+            name, (size_t) w.value("byte_size", 0));
+        if (id < 0 || bytes == 0) continue;
+
+        const std::string loc = w.value("location", std::string("disk"));
+        const double resident_cost = elastic_compute_cost(s, "OpenCL", name, bytes);
+        const double benefit = std::max(0.0, disk_path_cost(w) - resident_cost);
+        node n;
+        n.id = id;
+        n.name = name;
+        n.group = elastic_diff_group_key(name, w.value("layer", -1));
+        n.bytes = bytes;
+        n.steady_benefit_ms = horizon * benefit;
+        if (loc == "gpu" || loc == "cpu") {
+            const uint32_t flags = elastic_lookup_snapshot_flags(s, state_flags, name);
+            const char * backend = (flags & (LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
+                                             LLAMA_ELASTIC_WEIGHT_GPU_COMPUTE_RESIDENT)) ? "OpenCL" : "CPU_Elastic";
+            n.transition_ms = elastic_stage_cost(s, backend, "EVICT", name, bytes);
+            n.score_ms = n.steady_benefit_ms + transition_weight * n.transition_ms;
+            n.score_per_byte = n.score_ms / (double) bytes;
+            evict_nodes.push_back(std::move(n));
+        } else {
+            const nlohmann::json * tw = elastic_plan_find_weight_const(target_plan, id);
+            n.transition_ms = tw ? elastic_target_transition_cost(s, *tw, state_flags) :
+                                   elastic_gpu_reload_cost(s, name, bytes);
+            n.score_ms = n.steady_benefit_ms - transition_weight * n.transition_ms;
+            n.score_per_byte = n.score_ms / (double) bytes;
+            promote_nodes.push_back(std::move(n));
+        }
+    }
+
+    std::sort(evict_nodes.begin(), evict_nodes.end(), [](const node & a, const node & b) {
+        if (a.score_per_byte != b.score_per_byte) return a.score_per_byte < b.score_per_byte;
+        return a.bytes > b.bytes;
+    });
+    std::sort(promote_nodes.begin(), promote_nodes.end(), [](const node & a, const node & b) {
+        if (a.score_per_byte != b.score_per_byte) return a.score_per_byte > b.score_per_byte;
+        return a.bytes < b.bytes;
+    });
+
+    int64_t used = (int64_t) elastic_plan_effective_resident_bytes(out);
+    const int64_t initial_used = used;
+    nlohmann::json decisions = nlohmann::json::array();
+    int evicted = 0;
+    int promoted = 0;
+
+    for (const node & n : evict_nodes) {
+        if (used <= budget_bytes) break;
+        elastic_plan_set_weight_target(out, n.id, "disk", "gpu", "none");
+        used = std::max<int64_t>(0, used - (int64_t) n.bytes);
+        evicted++;
+        decisions.push_back({
+            {"path", "root/dynamic_increase/" + n.group + "/" + n.name},
+            {"action", "evict"}, {"weight_id", n.id},
+            {"bytes", n.bytes}, {"score_ms", elastic_finite_json_number(n.score_ms)},
+            {"transition_ms", elastic_finite_json_number(n.transition_ms)},
+        });
+    }
+
+    for (const node & n : promote_nodes) {
+        if (n.score_ms <= 0.0 || used + (int64_t) n.bytes > budget_bytes) continue;
+        const nlohmann::json * tw = elastic_plan_find_weight_const(target_plan, n.id);
+        const std::string quant = tw ? tw->value("quant", std::string()) : std::string();
+        elastic_plan_set_weight_target(out, n.id, "gpu", "gpu", elastic_xform_for("GPU", quant));
+        used += (int64_t) n.bytes;
+        promoted++;
+        decisions.push_back({
+            {"path", "root/dynamic_decrease/" + n.group + "/" + n.name},
+            {"action", "promote"}, {"weight_id", n.id},
+            {"bytes", n.bytes}, {"score_ms", elastic_finite_json_number(n.score_ms)},
+            {"transition_ms", elastic_finite_json_number(n.transition_ms)},
+        });
+    }
+
+    const bool core_changed = evicted > 0 || promoted > 0;
+    if (core_changed && out.contains("working_sets") && out["working_sets"].is_array()) {
+        for (auto & ws : out["working_sets"]) {
+            if (ws.is_object()) ws["coupled_to_core"] = true;
+        }
+    }
+
+    // Residency reconciliation applies this patch. Keep the transition
+    // timeline empty so unchanged disk weights are not spuriously reloaded.
+    out["timeline"] = nlohmann::json::array();
+    if (out.contains("schedule") && out["schedule"].is_object()) {
+        out["schedule"]["events"] = nlohmann::json::array();
+        out["schedule"]["kind"] = "none";
+        out["schedule"]["status"] = "dynamic_movable_patch";
+    }
+    out["pred_per_token_ms"] = elastic_finite_json_number(elastic_plan_total_path_cost(s, out));
+    out["diff_tree"] = {
+        {"mode", "dynamic_movable_search"},
+        {"horizon_tokens", horizon},
+        {"transition_weight", transition_weight},
+        {"initial_effective_mb", initial_used / 1024.0 / 1024.0},
+        {"final_effective_mb", used / 1024.0 / 1024.0},
+        {"budget_resident_mb", budget_bytes / 1024.0 / 1024.0},
+        {"evicted_weights", evicted},
+        {"promoted_weights", promoted},
+        {"decisions", decisions},
+    };
+    LOG_INF("[elastic-dynamic-tree] budget=%lld initial=%.1fMB final=%.1fMB limit=%.1fMB evict=%d promote=%d nodes=%zu\n",
+            (long long) budget_mib, initial_used / 1024.0 / 1024.0, used / 1024.0 / 1024.0,
+            budget_bytes / 1024.0 / 1024.0, evicted, promoted, decisions.size());
+    return out;
+}
+
 static void elastic_diff_graph_expand_plan(elastic_online_solver_state * s, int64_t budget_mib, nlohmann::json & plan,
                                            const std::unordered_map<std::string, uint32_t> * state_flags) {
     struct node {
@@ -1349,6 +1778,7 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
     }
 
     double best_score = std::numeric_limits<double>::infinity();
+    int best_working_set_capacity = -1;
     double best_transition = 0.0;
     double best_load_mb = 0.0;
     double best_prepare_mb = 0.0;
@@ -1512,8 +1942,14 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             base_budget = cand_budget;
             base_plan = plan;
         }
-        if (score < best_score) {
+        const int working_set_capacity = elastic_plan_working_set_capacity(plan);
+        const bool dominates_equal_score =
+            std::isfinite(score) && std::isfinite(best_score) &&
+            std::abs(score - best_score) <= 1.0e-9 &&
+            working_set_capacity > best_working_set_capacity;
+        if (score < best_score || dominates_equal_score) {
             best_score = score;
+            best_working_set_capacity = working_set_capacity;
             best_transition = transition;
             best_load_mb = load_mb;
             best_prepare_mb = prepare_mb;
@@ -1526,6 +1962,12 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
         }
     }
     if (best_plan.is_null()) return false;
+    if (dynamic_candidate_scan) {
+        elastic_project_dynamic_weights_to_runtime_cache(best_plan);
+        // Resolve the live workload target before diff-tree expansion so the
+        // tree can trade Dynamic bytes against Movable weight residency.
+        elastic_adjust_working_sets_from_runtime(s, best_plan);
+    }
 
     if (s->mode == "candidate-select" && best_cid != 0 && s->candidate_min_gain_ms > 0.0 &&
         !base_plan.is_null() && std::isfinite(base_score)) {
@@ -1586,6 +2028,31 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
                                                             &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
         best_score = best_plan.value("pred_per_token_ms", 0.0) + transition_weight * best_transition;
     } else if (s->mode == "diff-tree-ideal") {
+        const nlohmann::json * previous_candidate_raw =
+            s->last_candidate_file.empty() ? nullptr :
+            elastic_candidate_get_plan_json(s, s->last_candidate_file);
+        nlohmann::json previous_candidate_projected;
+        const nlohmann::json * previous_candidate = previous_candidate_raw;
+        if (dynamic_candidate_scan && previous_candidate_raw) {
+            previous_candidate_projected = *previous_candidate_raw;
+            elastic_project_dynamic_weights_to_runtime_cache(previous_candidate_projected);
+            previous_candidate = &previous_candidate_projected;
+        }
+        const bool same_core_candidate =
+            previous_candidate && elastic_plan_core_equivalent(best_plan, *previous_candidate);
+        const bool keep_dynamic_candidate =
+            dynamic_candidate_scan &&
+            !s->last_diff_tree_plan.is_null() &&
+            !s->last_candidate_file.empty() &&
+            (best_file == s->last_candidate_file || same_core_candidate);
+        if (keep_dynamic_candidate) {
+            best_plan = elastic_dynamic_movable_diff_tree(
+                s, budget_mib, s->last_diff_tree_plan, best_plan, &state_flags);
+            best_transition = elastic_candidate_transition_cost(
+                s, best_plan, &state_flags,
+                &best_load_mb, &best_prepare_mb, &best_evict_mb, &best_changed);
+            best_score = best_plan.value("pred_per_token_ms", 0.0) + transition_weight * best_transition;
+        } else {
         const nlohmann::json target_plan = best_plan;
         const double target_score = best_score;
         const double target_transition = best_transition;
@@ -1671,6 +2138,10 @@ static bool elastic_online_generate_candidate_select(elastic_online_solver_state
             };
         }
         }
+        }
+    }
+    if (dynamic_candidate_scan) {
+        elastic_project_dynamic_weights_to_runtime_cache(best_plan);
     }
     if (selected_file) *selected_file = best_file;
 
@@ -1827,6 +2298,11 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
     }
     for (const auto & it : items) {
         if (!it.manageable) continue;
+        // Dynamic expert parents are disk-backed owners for the packed expert
+        // cache. The cache accounts and materializes selected expert slices;
+        // charging the full parent here double-counts the same weights and
+        // evicts unrelated static tensors from native/MRU plans.
+        if (elastic_is_dynamic_weight_name(it.name)) continue;
         if (used + it.bytes <= budget_bytes) {
             keep.insert(it.id);
             used += it.bytes;
@@ -1904,6 +2380,8 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
         }
     }
 
+    elastic_project_dynamic_weights_to_runtime_cache(plan);
+
     std::ofstream f(plan_path);
     if (!f) return false;
     f << plan.dump(2) << "\n";
@@ -1911,25 +2389,12 @@ static bool elastic_online_generate_native(elastic_online_solver_state * s, int6
 }
 
 static void elastic_online_state_dump(elastic_online_solver_state * s, const std::string & path) {
-    std::unordered_map<std::string, std::string> last_location_by_name;
-    if (s && s->last_online_plan_json.is_object()) {
-        for (const auto & w : s->last_online_plan_json.value("weights", nlohmann::json::array())) {
-            if (!w.is_object()) continue;
-            const std::string name = w.value("name", std::string());
-            const std::string location = w.value("location", std::string());
-            if (!name.empty() && !location.empty()) {
-                last_location_by_name[name] = location;
-            }
-        }
-    }
-
     nlohmann::json out;
     out["weights"] = nlohmann::json::array();
     for (const auto & name : s->weight_names) {
         llama_elastic_weight_state st{};
         int rc = llama_weight_get_state(s->ctx, name.c_str(), &st);
-        auto lit = last_location_by_name.find(name);
-        if (lit != last_location_by_name.end() && lit->second == "disk") {
+        if (s->last_disk_weights.find(name) != s->last_disk_weights.end()) {
             st.flags &= ~(LLAMA_ELASTIC_WEIGHT_CPU_RAW_RESIDENT |
                           LLAMA_ELASTIC_WEIGHT_CPU_COMPUTE_RESIDENT |
                           LLAMA_ELASTIC_WEIGHT_GPU_RAW_RESIDENT |
@@ -1947,6 +2412,67 @@ static void elastic_online_state_dump(elastic_online_solver_state * s, const std
             {"name", name},
             {"flags", flags},
         });
+    }
+    out["working_sets"] = nlohmann::json::array();
+    llama_working_set_state ws{};
+    if (llama_working_set_get_state(s->ctx, "expert_slices", &ws) == 0) {
+        out["working_sets"].push_back({
+            {"name", "dynamic_weights"},
+            {"kind", "expert_slices"},
+            {"active_capacity", ws.active_capacity},
+            {"pending_capacity", ws.pending_capacity},
+            {"target_capacity", ws.target_capacity},
+            {"observed_required_capacity", ws.observed_required_capacity},
+            {"accesses", ws.accesses},
+            {"hits", ws.hits},
+            {"misses", ws.misses},
+            {"capacity_changes", ws.capacity_changes},
+            {"resident_bytes", ws.resident_bytes},
+        });
+    }
+    llama_granularity_runtime_state granularity{};
+    if (llama_granularity_get_state(s->ctx, &granularity) == 0) {
+        const uint64_t delta_units =
+            granularity.units >= s->granularity_last_units
+                ? granularity.units - s->granularity_last_units : 0;
+        const uint64_t delta_wait_us =
+            granularity.pipeline_wait_us >= s->granularity_last_wait_us
+                ? granularity.pipeline_wait_us -
+                    s->granularity_last_wait_us : 0;
+        const uint64_t delta_reload_bytes =
+            granularity.reload_bytes >=
+                    s->granularity_last_reload_bytes
+                ? granularity.reload_bytes -
+                    s->granularity_last_reload_bytes : 0;
+        const uint64_t delta_prepare_us =
+            granularity.prepare_us >= s->granularity_last_prepare_us
+                ? granularity.prepare_us -
+                    s->granularity_last_prepare_us : 0;
+        out["granularity"] = {
+            {"backend", granularity.backend},
+            {"mode", granularity.mode},
+            {"units", delta_units},
+            {"pipeline_issued", granularity.pipeline_issued},
+            {"pipeline_ready", granularity.pipeline_ready},
+            {"pipeline_waits", granularity.pipeline_waits},
+            {"pipeline_wait_us", delta_wait_us},
+            {"reloads", granularity.reloads},
+            {"reload_bytes", delta_reload_bytes},
+            {"prepare_us", delta_prepare_us},
+            {"resident_bytes", granularity.resident_bytes},
+        };
+        s->granularity_last_units = granularity.units;
+        s->granularity_last_wait_us =
+            granularity.pipeline_wait_us;
+        s->granularity_last_reload_bytes =
+            granularity.reload_bytes;
+        s->granularity_last_prepare_us =
+            granularity.prepare_us;
+    }
+    if (s->last_diff_tree_plan.is_object() &&
+        s->last_diff_tree_plan.contains("working_unit")) {
+        out["working_unit"] =
+            s->last_diff_tree_plan["working_unit"];
     }
     std::ofstream f(path);
     f << out.dump(2) << "\n";
@@ -1971,6 +2497,13 @@ static bool elastic_online_generate_remote(elastic_online_solver_state * s, int6
     req["overlap_model"] = s->overlap_model;
     req["cp_objective"] = s->cp_objective;
     req["allowed_placements"] = s->allowed_placements;
+    req["granularity_policy"] = s->granularity_policy;
+    req["granularity_backend"] = s->granularity_backend;
+    req["granularity_horizon_tokens"] =
+        s->granularity_horizon_tokens;
+    req["granularity_min_gain_ms"] =
+        s->granularity_min_gain_ms;
+    req["run_id"] = s->work_dir;
     {
         std::ifstream sf(state_path);
         if (!sf) return false;
@@ -2031,8 +2564,30 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
             << " --safety-mib " << s->safety_mib
             << " --time-limit-ms " << s->time_limit_ms
             << " --prefetch-distance " << s->prefetch_distance
+            << " --allowed-placements "
+            << shell_quote(s->allowed_placements)
+            << " --transition-weight " << s->transition_weight
+            << " --transition-horizon-tokens "
+            << s->transition_horizon_tokens
             << " --out " << shell_quote(plan_path)
             << " >/dev/null";
+        if (s->allow_cpu_fallback) {
+            cmd << " --allow-cpu-fallback";
+        }
+        if (s->granularity_policy != "none") {
+            cmd << " --granularity-policy "
+                << shell_quote(s->granularity_policy)
+                << " --granularity-backend "
+                << shell_quote(s->granularity_backend)
+                << " --granularity-horizon-tokens "
+                << s->granularity_horizon_tokens
+                << " --granularity-min-gain-ms "
+                << s->granularity_min_gain_ms;
+            if (!s->granularity_profile_path.empty()) {
+                cmd << " --granularity-profile "
+                    << shell_quote(s->granularity_profile_path);
+            }
+        }
         int rc = std::system(cmd.str().c_str());
         if (rc != 0) {
             s->failures++;
@@ -2102,13 +2657,28 @@ static const llama_plan * elastic_online_plan_provider(int64_t budget_mib, void 
         LOG_ERR("[elastic-online] failed to load generated plan %s\n", plan_path.c_str());
         return nullptr;
     }
-    {
+    const bool keep_last_plan_targets =
+        s->mode == "remote" || s->mode == "external" ||
+        s->mode == "candidate-select" ||
+        s->mode == "diff-graph-expand" || s->mode == "diff-tree-ideal";
+    if (keep_last_plan_targets) {
         std::ifstream pf(plan_path);
         if (pf) {
             try {
-                pf >> s->last_online_plan_json;
+                nlohmann::json plan_json;
+                pf >> plan_json;
+                s->last_disk_weights.clear();
+                for (const auto & w : plan_json.value("weights", nlohmann::json::array())) {
+                    if (!w.is_object() || w.value("location", std::string()) != "disk") continue;
+                    const std::string name = w.value("name", std::string());
+                    if (!name.empty()) s->last_disk_weights.insert(name);
+                }
+                if (plan_json.contains("working_unit")) {
+                    s->last_diff_tree_plan = plan_json;
+                    s->last_diff_tree_budget_mib = budget_mib;
+                }
             } catch (const std::exception &) {
-                s->last_online_plan_json = nlohmann::json();
+                s->last_disk_weights.clear();
             }
         }
     }
@@ -2301,6 +2871,11 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("LLAMA_ELASTIC_OVERLAP_MODEL")) online.overlap_model = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_CP_OBJECTIVE")) online.cp_objective = e;
         if (const char * e = std::getenv("LLAMA_ELASTIC_ALLOWED_PLACEMENTS")) online.allowed_placements = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_GRANULARITY_POLICY")) online.granularity_policy = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_GRANULARITY_BACKEND")) online.granularity_backend = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_GRANULARITY_PROFILE")) online.granularity_profile_path = e;
+        if (const char * e = std::getenv("LLAMA_ELASTIC_GRANULARITY_HORIZON_TOKENS")) online.granularity_horizon_tokens = std::atof(e);
+        if (const char * e = std::getenv("LLAMA_ELASTIC_GRANULARITY_MIN_GAIN_MS")) online.granularity_min_gain_ms = std::atof(e);
 
         if (online.model_meta_path.empty() || online.cost_dir.empty()) {
             LOG_ERR("[elastic-online] LLAMA_ELASTIC_MODEL_META and LLAMA_ELASTIC_COST_DIR are required\n");
@@ -2312,38 +2887,91 @@ int main(int argc, char ** argv) {
                 mf >> online.model_meta;
                 online.stage_costs = nlohmann::json::object();
                 online.op_costs = nlohmann::json::object();
-                if (std::ifstream sf(online.cost_dir + "/stage_costs.json"); sf) sf >> online.stage_costs;
-                if (std::ifstream of(online.cost_dir + "/op_costs.json"); of) of >> online.op_costs;
+                online.stage_cost_index.clear();
+                online.op_cost_index.clear();
+                const bool remote_solver_mode = online.mode == "remote";
+                const bool costless_mru_mode =
+                    online.mode == "mru-cache" || online.mode == "true-mru" ||
+                    online.mode == "runtime-mru" || online.mode == "mru" ||
+                    online.mode == "native-mru";
+                // The remote server owns the cost model. Keeping expanded
+                // nlohmann JSON copies on the phone only consumes memory and
+                // competes with host staging during expert reloads. Native MRU
+                // only needs id, size, recency and the allowed backend.
+                if (!remote_solver_mode && !costless_mru_mode) {
+                    if (std::ifstream sf(online.cost_dir + "/stage_costs.json"); sf) sf >> online.stage_costs;
+                    if (std::ifstream of(online.cost_dir + "/op_costs.json"); of) of >> online.op_costs;
+                    elastic_build_cost_index(online.stage_costs, online.stage_cost_index);
+                    elastic_build_cost_index(online.op_costs, online.op_cost_index);
+                }
                 for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
                     std::string name = w.value("name", std::string());
                     if (!name.empty()) {
-                        online.weight_by_name[name] = w;
+                        if (!remote_solver_mode && !costless_mru_mode) online.weight_by_name[name] = w;
                         online.weight_names.push_back(std::move(name));
                     }
                 }
                 online.item_bases.clear();
-                online.item_bases.reserve(online.weight_names.size());
-                for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
-                    elastic_online_solver_state::item_base b;
-                    b.id = w.value("weight_id", (int) online.item_bases.size());
-                    b.name = w.value("name", std::string());
-                    if (b.name.empty()) continue;
-                    b.layer = w.value("layer", -1);
-                    b.bytes = (size_t) w.value("byte_size", 0);
-                    b.quant = w.value("quant", std::string());
-                    // Native MRU is an eviction baseline, not a placement optimizer.
-                    // Pick the target backend from measured compute cost only; otherwise
-                    // cold reload/transform cost biases every weight toward CPU and the
-                    // baseline degenerates into CPU-only execution.
-                    const double gpu = elastic_compute_cost(&online, "OpenCL", b.name, b.bytes);
-                    const double cpu = elastic_compute_cost(&online, "CPU_Elastic", b.name, b.bytes);
-                    b.backend = gpu <= cpu ? "GPU" : "CPU";
-                    b.resident_value_gpu =
-                        elastic_gpu_reload_cost(&online, b.name, b.bytes);
-                    b.resident_value_cpu =
-                        elastic_stage_cost(&online, "CPU_Elastic", "LOAD", b.name, b.bytes) +
-                        elastic_stage_cost(&online, "CPU_Elastic", "XFORM", b.name, b.bytes);
-                    online.item_bases.push_back(std::move(b));
+                if (!remote_solver_mode) {
+                    online.item_bases.reserve(online.weight_names.size());
+                    for (const auto & w : online.model_meta.value("weights", nlohmann::json::array())) {
+                        elastic_online_solver_state::item_base b;
+                        b.id = w.value("weight_id", (int) online.item_bases.size());
+                        b.name = w.value("name", std::string());
+                        if (b.name.empty()) continue;
+                        b.layer = w.value("layer", -1);
+                        b.bytes = (size_t) w.value("byte_size", 0);
+                        b.quant = w.value("quant", std::string());
+                        if (costless_mru_mode) {
+                            const bool allow_gpu = elastic_allowed_placement_has(online.allowed_placements, "gpu") ||
+                                                   elastic_allowed_placement_has(online.allowed_placements, "disk_gpu");
+                            b.backend = allow_gpu ? "GPU" : "CPU";
+                        } else {
+                            // Native greedy is a placement heuristic. Pick the target backend
+                            // from measured compute cost so reload cost cannot force CPU-only.
+                            const double gpu = elastic_compute_cost(&online, "OpenCL", b.name, b.bytes);
+                            const double cpu = elastic_compute_cost(&online, "CPU_Elastic", b.name, b.bytes);
+                            b.backend = gpu <= cpu ? "GPU" : "CPU";
+                            b.resident_value_gpu = elastic_gpu_reload_cost(&online, b.name, b.bytes);
+                            b.resident_value_cpu =
+                                elastic_stage_cost(&online, "CPU_Elastic", "LOAD", b.name, b.bytes) +
+                                elastic_stage_cost(&online, "CPU_Elastic", "XFORM", b.name, b.bytes);
+                        }
+                        online.item_bases.push_back(std::move(b));
+                    }
+
+                    // Candidate and native planners repeatedly query the same
+                    // per-weight costs. Materialize those compact scalar
+                    // entries once, then release the expanded JSON records so
+                    // they do not compete with runtime host staging.
+                    if (!costless_mru_mode) {
+                        for (const auto & b : online.item_bases) {
+                            (void) elastic_compute_cost(&online, "OpenCL", b.name, b.bytes);
+                            (void) elastic_compute_cost(&online, "CPU_Elastic", b.name, b.bytes);
+                            for (const char * kind : {"LOAD", "TRANSFER", "XFORM", "SYNC", "EVICT", "RELOAD_ENSURE"}) {
+                                (void) elastic_stage_cost(&online, "OpenCL", kind, b.name, b.bytes);
+                                (void) elastic_stage_cost(&online, "CPU_Elastic", kind, b.name, b.bytes);
+                            }
+                        }
+                    }
+                }
+                online.model_meta = nlohmann::json::object();
+                online.stage_costs = nlohmann::json::object();
+                online.op_costs = nlohmann::json::object();
+                online.stage_cost_index.clear();
+                online.op_cost_index.clear();
+                online.weight_by_name.clear();
+                const bool candidate_mode =
+                    online.mode == "candidate-select" ||
+                    online.mode == "diff-graph-expand" ||
+                    online.mode == "diff-tree-ideal";
+                const bool native_mode =
+                    !remote_solver_mode && online.mode != "external" && !candidate_mode;
+                if (native_mode) {
+                    // Native/MRU generation uses the compact item_base values
+                    // and queries live residency directly.
+                    online.cost_cache.clear();
+                    online.weight_names.clear();
                 }
                 if (!mkdir_p_local(online.work_dir)) {
                     LOG_ERR("[elastic-online] failed to create work_dir %s\n", online.work_dir.c_str());
@@ -2360,8 +2988,9 @@ int main(int argc, char ** argv) {
 #endif
                 int rc = llama_elastic_enable(ctx, "callback", nullptr);
                 llama_elastic_set_plan_provider(ctx, elastic_online_plan_provider, &online);
+                const size_t planner_weight_count = remote_solver_mode ? online.weight_names.size() : online.item_bases.size();
                 LOG_INF("[elastic-online] enable(callback) rc=%d mode=%s weights=%zu solver=%s cost_dir=%s work_dir=%s\n",
-                        rc, online.mode.c_str(), online.item_bases.size(), online.solver.c_str(),
+                        rc, online.mode.c_str(), planner_weight_count, online.solver.c_str(),
                         online.cost_dir.c_str(), online.work_dir.c_str());
                 const bool preapply_initial = []() {
                     const char * e = std::getenv("LLAMA_ELASTIC_ONLINE_PREAPPLY_INITIAL");
@@ -2379,7 +3008,18 @@ int main(int argc, char ** argv) {
                         const llama_plan * init_plan = elastic_online_plan_provider(init_budget, &online);
                         if (init_plan) {
                             const int arc = llama_elastic_apply_plan(ctx, init_plan);
-                            llama_budget_reset_clock();
+                            static const bool reset_budget_after_initial_apply = []() {
+                                const char * e = std::getenv(
+                                    "LLAMA_ELASTIC_RESET_BUDGET_AFTER_INITIAL_APPLY");
+                                // The measured replay is aligned once at the
+                                // first decode boundary below. Rewinding here
+                                // is redundant and makes reset lineage differ
+                                // between table and callback baselines.
+                                return e && *e && *e != '0';
+                            }();
+                            if (reset_budget_after_initial_apply) {
+                                llama_budget_reset_clock();
+                            }
                             LOG_INF("[elastic-online] preapply initial budget=%lld rc=%d plan_budget=%lld\n",
                                     (long long) init_budget, arc, (long long) llama_plan_budget_mib(init_plan));
                         } else {
@@ -3533,6 +4173,10 @@ int main(int argc, char ** argv) {
     bool elastic_bench_time_done = false;
     int  elastic_bench_generated = 0;
     std::string elastic_bench_exit_reason = "loop_condition";
+    bool elastic_decode_budget_started = false;
+    llama_granularity_runtime_state elastic_decode_phase_begin{};
+    bool elastic_decode_phase_begin_valid = false;
+    uint64_t elastic_decode_phase_runs = 0;
     if (elastic_bench_seconds > 0.0) {
         LOG_INF("[elastic-bench] duration limit enabled: %.3f seconds\n", elastic_bench_seconds);
     }
@@ -3688,6 +4332,9 @@ int main(int argc, char ** argv) {
                     common_perf_print(ctx, smpl);
                     return 1;
                 }
+                if (elastic_decode_phase_begin_valid && n_eval == 1) {
+                    elastic_decode_phase_runs++;
+                }
 
                 n_past += n_eval;
 
@@ -3726,7 +4373,57 @@ int main(int argc, char ** argv) {
                 LOG_DBG("[elastic-bench] replaced EOG with continuation token %d\n", id);
             }
 
+            static const bool elastic_token_trace = []() {
+                const char * e = std::getenv("LLAMA_ELASTIC_TOKEN_TRACE");
+                return e && *e && *e != '0';
+            }();
+            if (elastic_token_trace) {
+                LOG_INF("[elastic-token] index=%d id=%d\n", elastic_bench_generated, id);
+            }
+
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+
+            if (!elastic_decode_budget_started) {
+                elastic_decode_budget_started = true;
+                // Sampling the prompt logits has already synchronized the
+                // prompt graph.  Synchronize explicitly before taking the
+                // cumulative backend snapshot so the delta below contains
+                // decode work only, including asynchronous pipeline waits.
+                llama_synchronize(ctx);
+                const int quiesce_rc =
+                    llama_granularity_synchronize_pipeline(ctx);
+                LOG_INF(
+                    "[elastic-bench] decode phase quiesce "
+                    "boundary=begin rc=%d\n",
+                    quiesce_rc);
+                elastic_decode_phase_begin_valid =
+                    quiesce_rc == 0 &&
+                    llama_granularity_get_state(
+                        ctx, &elastic_decode_phase_begin) == 0;
+                if (elastic_decode_phase_begin_valid) {
+                    LOG_INF(
+                        "[elastic-bench] decode phase origin generated=%d "
+                        "backend=%s\n",
+                        elastic_bench_generated,
+                        elastic_decode_phase_begin.backend == 0
+                            ? "cpu" : "gpu");
+                }
+                const bool reset_budget_on_decode = []() {
+                    const char * e = std::getenv("LLAMA_ELASTIC_RESET_BUDGET_ON_DECODE");
+                    return !e || !*e || *e != '0';
+                }();
+                if (reset_budget_on_decode) {
+                    // The reported eval timer covers generated-token decode,
+                    // not model load or prompt ingestion. Align the replayed
+                    // memory trace with that same boundary so prompt latency
+                    // cannot silently consume the beginning of B(t).
+                    llama_budget_reset_clock();
+                    LOG_INF(
+                        "[elastic-bench] budget replay reset "
+                        "boundary=first_decode generated=%d\n",
+                        elastic_bench_generated);
+                }
+            }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
@@ -4029,6 +4726,105 @@ int main(int argc, char ** argv) {
         LOG_INF("\n[elastic-bench] final exit reason=%s generated=%d n_past=%d n_remain=%d time_done=%d\n",
                 elastic_bench_exit_reason.c_str(), elastic_bench_generated, n_past, n_remain,
                 elastic_bench_time_done ? 1 : 0);
+    }
+    if (elastic_decode_phase_begin_valid) {
+        llama_synchronize(ctx);
+        const int quiesce_rc =
+            llama_granularity_synchronize_pipeline(ctx);
+        LOG_INF(
+            "[elastic-bench] decode phase quiesce boundary=end rc=%d\n",
+            quiesce_rc);
+        llama_granularity_runtime_state end{};
+        if (quiesce_rc == 0 &&
+            llama_granularity_get_state(ctx, &end) == 0 &&
+            end.backend == elastic_decode_phase_begin.backend) {
+            const auto delta = [](uint64_t after, uint64_t before) {
+                return after >= before ? after - before : uint64_t(0);
+            };
+            LOG_INF(
+                "[elastic decode phase summary] "
+                "backend=%s runs=%llu units=%llu nonresident_units=%llu "
+                "reloads=%llu reload_bytes=%llu "
+                "direct_read_calls=%llu direct_read_us=%llu "
+                "direct_read_bytes=%llu "
+                "load_calls=%llu load_us=%llu load_bytes=%llu "
+                "prepare_calls=%llu prepare_us=%llu prepare_bytes=%llu "
+                "compute_available=%d compute_calls=%llu compute_us=%llu "
+                "pipeline_waits=%llu pipeline_wait_us=%llu "
+                "pipeline_residency_us=%llu pipeline_unissued_us=%llu "
+                "pipeline_stage_us=%llu pipeline_retire_us=%llu "
+                "evict_us=%llu resident_bytes=%zu\n",
+                end.backend == 0 ? "cpu" : "gpu",
+                (unsigned long long) elastic_decode_phase_runs,
+                (unsigned long long) delta(
+                    end.units, elastic_decode_phase_begin.units),
+                (unsigned long long) delta(
+                    end.nonresident_units,
+                    elastic_decode_phase_begin.nonresident_units),
+                (unsigned long long) delta(
+                    end.reloads, elastic_decode_phase_begin.reloads),
+                (unsigned long long) delta(
+                    end.reload_bytes,
+                    elastic_decode_phase_begin.reload_bytes),
+                (unsigned long long) delta(
+                    end.direct_read_calls,
+                    elastic_decode_phase_begin.direct_read_calls),
+                (unsigned long long) delta(
+                    end.direct_read_us,
+                    elastic_decode_phase_begin.direct_read_us),
+                (unsigned long long) delta(
+                    end.direct_read_bytes,
+                    elastic_decode_phase_begin.direct_read_bytes),
+                (unsigned long long) delta(
+                    end.load_calls, elastic_decode_phase_begin.load_calls),
+                (unsigned long long) delta(
+                    end.load_us, elastic_decode_phase_begin.load_us),
+                (unsigned long long) delta(
+                    end.load_bytes, elastic_decode_phase_begin.load_bytes),
+                (unsigned long long) delta(
+                    end.prepare_calls,
+                    elastic_decode_phase_begin.prepare_calls),
+                (unsigned long long) delta(
+                    end.prepare_us,
+                    elastic_decode_phase_begin.prepare_us),
+                (unsigned long long) delta(
+                    end.prepare_bytes,
+                    elastic_decode_phase_begin.prepare_bytes),
+                end.compute_timing_available &&
+                        elastic_decode_phase_begin.compute_timing_available
+                    ? 1 : 0,
+                (unsigned long long) delta(
+                    end.compute_calls,
+                    elastic_decode_phase_begin.compute_calls),
+                (unsigned long long) delta(
+                    end.compute_us,
+                    elastic_decode_phase_begin.compute_us),
+                (unsigned long long) delta(
+                    end.pipeline_waits,
+                    elastic_decode_phase_begin.pipeline_waits),
+                (unsigned long long) delta(
+                    end.pipeline_wait_us,
+                    elastic_decode_phase_begin.pipeline_wait_us),
+                (unsigned long long) delta(
+                    end.pipeline_residency_us,
+                    elastic_decode_phase_begin.pipeline_residency_us),
+                (unsigned long long) delta(
+                    end.pipeline_unissued_us,
+                    elastic_decode_phase_begin.pipeline_unissued_us),
+                (unsigned long long) delta(
+                    end.pipeline_stage_us,
+                    elastic_decode_phase_begin.pipeline_stage_us),
+                (unsigned long long) delta(
+                    end.pipeline_retire_us,
+                    elastic_decode_phase_begin.pipeline_retire_us),
+                (unsigned long long) delta(
+                    end.evict_us, elastic_decode_phase_begin.evict_us),
+                end.resident_bytes);
+        } else {
+            LOG_ERR(
+                "[elastic decode phase summary] unavailable "
+                "reason=backend-state-changed\n");
+        }
     }
 
     LOG("\n\n");

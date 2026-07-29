@@ -111,6 +111,9 @@ struct llama_context {
     void elastic_disable();
     void elastic_set_provider_fn(llama_plan_provider_fn fn, void * user_data);
     const struct llama_plan * elastic_get_plan_view(int64_t budget_mib);
+    int granularity_get_state(
+        struct llama_granularity_runtime_state * out_state) const;
+    int granularity_synchronize_pipeline();
 
     void set_adapter_lora(
             llama_adapter_lora * adapter,
@@ -340,6 +343,16 @@ private:
     int      elastic_pending_budget_hits = 0;                  // consecutive decode ticks at candidate budget
     int64_t  elastic_effective_budget_mib = -1;                // optional slew-limited budget for online planning
     uint64_t elastic_last_switch_decode_step = 0;              // last real apply tick
+    uint64_t elastic_provider_get_calls = 0;                   // decode-critical provider invocations
+    double   elastic_provider_get_ms_total = 0.0;
+    uint64_t elastic_runtime_apply_calls = 0;                  // online plan transitions only
+    double   elastic_runtime_apply_ms_total = 0.0;
+    // End-to-end single-token decode wall time.  Unlike the standard eval
+    // timer, this starts before the scheduler/provider hooks and ends at the
+    // backend synchronization required to consume logits.
+    int64_t  elastic_decode_wall_start_us = 0;
+    uint64_t elastic_decode_wall_runs = 0;
+    int64_t  elastic_decode_wall_us_total = 0;
     std::unordered_map<std::string, int> elastic_route;        // weight 名 → backend_id (STATIC routing)
     std::unordered_map<std::string, int> elastic_runtime_route;// weight 名 → backend_id (RUNTIME dispatch, M5)
     std::unordered_map<std::string, int> elastic_anchor_op;    // anchor weight/op 名 → op_id
@@ -391,6 +404,9 @@ private:
     void elastic_mru_cache_reset();
     void elastic_mru_cache_flush_pending_evict();
     size_t elastic_mru_cache_budget_bytes() const;
+    int  apply_working_set_patch(const elastic::ExecPlan * plan);
+    bool working_set_replan_needed(const elastic::ExecPlan * plan);
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> elastic_working_set_replan_counters;
     void maybe_apply_plan();                                   // online loop:档变换 plan
     int64_t elastic_budget_mib() const;                        // 当前预算(BudgetWatcher/meminfo)
 
@@ -428,6 +444,7 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+    mutable std::vector<llama_token> elastic_queued_token_ids;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

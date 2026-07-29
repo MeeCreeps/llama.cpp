@@ -96,9 +96,11 @@ struct params {
     int pipeline_items = 24;
     int pipeline_slots = 4;
     int prefetch_slots = 4;
+    int max_weight_parts = 8;
     std::string pipeline_gpu_mode = "full";
     bool pipeline = false;
     bool pipeline_only = false;
+    bool granularity_only = false;
 };
 
 static void usage(const char * argv0) {
@@ -120,6 +122,8 @@ static void usage(const char * argv0) {
         "  --cpu-rounds <int>     CPU compute loop rounds, default 16\n"
         "  --gpu-rounds <int>     GPU compute kernel rounds, default 256\n"
         "  --prefetch-slots <int> ring slots for async disk prefetch, default 4\n"
+        "  --granularity-only    compare one packed weight with multiple equal-size weights\n"
+        "  --max-weight-parts <int> largest power-of-two split, default 8\n"
         "  --pipeline             also run disk->CPU-xform->GPU-xform->GPU-compute pipeline\n"
         "  --pipeline-only        skip pairwise contention tests and only run the pipeline\n"
         "  --pipeline-items <int> number of items through the pipeline, default 24\n"
@@ -168,6 +172,10 @@ static params parse(int argc, char ** argv) {
             p.gpu_rounds = std::atoi(need("--gpu-rounds"));
         } else if (a == "--prefetch-slots") {
             p.prefetch_slots = std::atoi(need("--prefetch-slots"));
+        } else if (a == "--granularity-only") {
+            p.granularity_only = true;
+        } else if (a == "--max-weight-parts") {
+            p.max_weight_parts = std::atoi(need("--max-weight-parts"));
         } else if (a == "--pipeline") {
             p.pipeline = true;
         } else if (a == "--pipeline-only") {
@@ -198,7 +206,8 @@ static params parse(int argc, char ** argv) {
         p.gpu_compute_mb <= 0 || p.cpu_rounds <= 0 || p.gpu_rounds <= 0) {
         throw std::runtime_error("invalid non-positive benchmark parameter");
     }
-    if (p.pipeline_items <= 0 || p.pipeline_slots < 1 || p.prefetch_slots < 1) {
+    if (p.pipeline_items <= 0 || p.pipeline_slots < 1 || p.prefetch_slots < 1 ||
+        p.max_weight_parts < 1 || (p.max_weight_parts & (p.max_weight_parts - 1)) != 0) {
         throw std::runtime_error("invalid pipeline item/slot/prefetch count");
     }
     if (p.pipeline_gpu_mode != "full" && p.pipeline_gpu_mode != "kernels-only") {
@@ -428,6 +437,28 @@ struct disk_load_stage {
             throw std::runtime_error("pread O_DIRECT short read/error");
         }
         volatile uint8_t sink = static_cast<uint8_t *>(dst)[0];
+        (void) sink;
+    }
+    void run_contiguous_parts(int parts) {
+        if (parts <= 0 || bytes % size_t(parts) != 0) {
+            throw std::runtime_error("disk bytes must divide evenly across weight parts");
+        }
+        const size_t chunk = bytes / size_t(parts);
+        if (chunk % align != 0) {
+            throw std::runtime_error("each disk weight part must preserve O_DIRECT alignment");
+        }
+        const size_t max_off = file_size - bytes;
+        const size_t slots = max_off / align;
+        const off_t base = off_t((rng() % std::max<size_t>(slots, 1)) * align);
+        auto * out = static_cast<uint8_t *>(dst);
+        for (int i = 0; i < parts; ++i) {
+            const off_t off = base + off_t(size_t(i) * chunk);
+            ssize_t got = pread(fd, out + size_t(i) * chunk, chunk, off);
+            if (got != ssize_t(chunk)) {
+                throw std::runtime_error("split pread O_DIRECT short read/error");
+            }
+        }
+        volatile uint8_t sink = out[0];
         (void) sink;
     }
     void read_into(void * out, size_t nbytes) {
@@ -825,7 +856,7 @@ struct gpu_xform_stage {
         set_scalar(tr_d.k, 2, d_stride);
         set_scalar(tr_d.k, 3, m_dim);
     }
-    void operator()() {
+    void enqueue() {
         CL_CHECK(clEnqueueWriteBuffer(q, src.mem, CL_FALSE, 0, host.size(), host.data(), 0, nullptr, nullptr));
         const size_t conv_lws[3] = { 64, 1, 1 };
         const size_t conv_gws[3] = { align_up(blocks, conv_lws[0]), 1, 1 };
@@ -838,6 +869,9 @@ struct gpu_xform_stage {
         CL_CHECK(clEnqueueCopyBuffer(q, tmp_q.mem, qbuf.mem, 0, 0, qbuf.size, 0, nullptr, nullptr));
         CL_CHECK(clEnqueueNDRangeKernel(q, tr_d.k, 3, nullptr, d_gws, tr_lws, 0, nullptr, nullptr));
         CL_CHECK(clEnqueueCopyBuffer(q, tmp_d.mem, dbuf.mem, 0, 0, dbuf.size, 0, nullptr, nullptr));
+    }
+    void operator()() {
+        enqueue();
         CL_CHECK(clFinish(q));
     }
 };
@@ -890,7 +924,7 @@ struct gpu_xform_kernels_stage {
         set_scalar(tr_d.k, 3, m_dim);
     }
 
-    void operator()() {
+    void enqueue() {
         const size_t conv_lws[3] = { 64, 1, 1 };
         const size_t conv_gws[3] = { align_up(blocks, conv_lws[0]), 1, 1 };
         CL_CHECK(clEnqueueNDRangeKernel(q, convert.k, 1, nullptr, conv_gws, conv_lws, 0, nullptr, nullptr));
@@ -900,6 +934,10 @@ struct gpu_xform_kernels_stage {
         const size_t d_gws[3] = { size_t(align_up(k_dim / 32, 16)), size_t(align_up(m_dim, 16)), 1 };
         CL_CHECK(clEnqueueNDRangeKernel(q, tr_q.k, 3, nullptr, q_gws, tr_lws, 0, nullptr, nullptr));
         CL_CHECK(clEnqueueNDRangeKernel(q, tr_d.k, 3, nullptr, d_gws, tr_lws, 0, nullptr, nullptr));
+    }
+
+    void operator()() {
+        enqueue();
         CL_CHECK(clFinish(q));
     }
 };
@@ -1223,6 +1261,219 @@ static void print_overlap(const std::vector<bench_stage *> & stages, const stats
         name.c_str(), st.med, ideal, sum, ideal > 0.0 ? st.med / ideal : 0.0, st.med > 0.0 ? sum / st.med : 0.0);
 }
 
+struct gpu_write_parts_stage {
+    cl_command_queue q = nullptr;
+    std::vector<uint8_t> host;
+    std::vector<cl_buffer> dst;
+    size_t chunk = 0;
+
+    gpu_write_parts_stage(cl_env & e, size_t total_bytes, int parts) :
+        q(e.xform_q),
+        host(std::max<size_t>(total_bytes, 4096)),
+        chunk(host.size() / size_t(parts)) {
+        if (parts <= 0 || host.size() % size_t(parts) != 0) {
+            throw std::runtime_error("GPU upload bytes must divide evenly across weight parts");
+        }
+        for (size_t i = 0; i < host.size(); ++i) {
+            host[i] = uint8_t(i * 17u + 3u);
+        }
+        dst.reserve(size_t(parts));
+        for (int i = 0; i < parts; ++i) {
+            dst.emplace_back(e.context, chunk, CL_MEM_READ_WRITE);
+        }
+    }
+
+    void queued() {
+        for (size_t i = 0; i < dst.size(); ++i) {
+            CL_CHECK(clEnqueueWriteBuffer(q, dst[i].mem, CL_FALSE, 0, chunk,
+                                          host.data() + i * chunk, 0, nullptr, nullptr));
+        }
+        CL_CHECK(clFinish(q));
+    }
+
+    void serial() {
+        for (size_t i = 0; i < dst.size(); ++i) {
+            CL_CHECK(clEnqueueWriteBuffer(q, dst[i].mem, CL_FALSE, 0, chunk,
+                                          host.data() + i * chunk, 0, nullptr, nullptr));
+            CL_CHECK(clFinish(q));
+        }
+    }
+};
+
+static void print_granularity(
+        const char * stage,
+        const char * mode,
+        int parts,
+        double mib,
+        const stats & st,
+        double packed_med) {
+    std::printf("granularity stage=%-14s mode=%-16s parts=%2d med=%8.3f ms avg=%8.3f ms min=%8.3f max=%8.3f size=%7.2f MiB ratio_vs_packed=%6.3f\n",
+        stage, mode, parts, st.med, st.avg, st.min, st.max, mib,
+        packed_med > 0.0 ? st.med / packed_med : 0.0);
+}
+
+static void run_weight_granularity_bench(const params & p, cl_env & cl) {
+    std::printf("granularity_config iters=%d warmup=%d max_parts=%d load=%dMiB cpu_xform=%dMiB gpu_upload=%dMiB gpu_xform=q4_0 K=%d M=%d\n",
+        p.iters, p.warmup, p.max_weight_parts, p.load_mb, p.cpu_xform_mb,
+        p.gpu_compute_mb, p.k, p.m);
+
+    if (!p.file.empty()) {
+        disk_load_stage disk(p.file, size_t(p.load_mb) * MiB);
+        const stats packed = bench_single([&] { disk(); }, p.warmup, p.iters);
+        print_granularity("disk_load", "one_pread", 1, double(disk.bytes) / double(MiB), packed, packed.med);
+        for (int parts = 2; parts <= p.max_weight_parts; parts *= 2) {
+            const stats split = bench_single([&] { disk.run_contiguous_parts(parts); }, p.warmup, p.iters);
+            print_granularity("disk_load", "separate_preads", parts,
+                              double(disk.bytes) / double(MiB), split, packed.med);
+        }
+    }
+
+    const size_t cpu_block_bytes = sizeof(cpu_xform_stage::q4blk);
+    const size_t cpu_quantum = cpu_block_bytes * size_t(p.max_weight_parts);
+    const size_t cpu_bytes = (size_t(p.cpu_xform_mb) * MiB / cpu_quantum) * cpu_quantum;
+    {
+        cpu_xform_stage packed_stage(cpu_bytes);
+        const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+        print_granularity("cpu_transform", "one_loop", 1,
+                          double(cpu_bytes) / double(MiB), packed, packed.med);
+        for (int parts = 2; parts <= p.max_weight_parts; parts *= 2) {
+            std::vector<std::unique_ptr<cpu_xform_stage>> split;
+            split.reserve(size_t(parts));
+            for (int i = 0; i < parts; ++i) {
+                split.emplace_back(new cpu_xform_stage(cpu_bytes / size_t(parts)));
+            }
+            const stats separate = bench_single([&] {
+                for (const auto & stage : split) {
+                    (*stage)();
+                }
+            }, p.warmup, p.iters);
+            print_granularity("cpu_transform", "separate_loops", parts,
+                              double(cpu_bytes) / double(MiB), separate, packed.med);
+        }
+    }
+
+    const size_t upload_bytes = size_t(p.gpu_compute_mb) * MiB;
+    {
+        gpu_write_stage packed_stage(cl, upload_bytes);
+        const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+        print_granularity("gpu_upload", "one_enqueue", 1,
+                          double(upload_bytes) / double(MiB), packed, packed.med);
+        for (int parts = 2; parts <= p.max_weight_parts; parts *= 2) {
+            gpu_write_parts_stage split_stage(cl, upload_bytes, parts);
+            const stats queued = bench_single([&] { split_stage.queued(); }, p.warmup, p.iters);
+            const stats serial = bench_single([&] { split_stage.serial(); }, p.warmup, p.iters);
+            print_granularity("gpu_upload", "enqueue_then_wait", parts,
+                              double(upload_bytes) / double(MiB), queued, packed.med);
+            print_granularity("gpu_upload", "wait_each_weight", parts,
+                              double(upload_bytes) / double(MiB), serial, packed.med);
+        }
+    }
+
+    if (p.m % p.max_weight_parts != 0) {
+        throw std::runtime_error("--m must divide evenly by --max-weight-parts in granularity mode");
+    }
+    const double gpu_raw_mib = double(size_t(p.k) * size_t(p.m) / 32 * 18) / double(MiB);
+    {
+        gpu_xform_stage packed_stage(cl, p.k, p.m);
+        const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+        print_granularity("gpu_transform", "one_command_group", 1,
+                          gpu_raw_mib, packed, packed.med);
+        for (int parts = 2; parts <= p.max_weight_parts; parts *= 2) {
+            std::vector<std::unique_ptr<gpu_xform_stage>> split;
+            split.reserve(size_t(parts));
+            for (int i = 0; i < parts; ++i) {
+                split.emplace_back(new gpu_xform_stage(cl, p.k, p.m / parts));
+            }
+            const stats queued = bench_single([&] {
+                for (const auto & stage : split) {
+                    stage->enqueue();
+                }
+                CL_CHECK(clFinish(cl.xform_q));
+            }, p.warmup, p.iters);
+            const stats serial = bench_single([&] {
+                for (const auto & stage : split) {
+                    (*stage)();
+                }
+            }, p.warmup, p.iters);
+            print_granularity("gpu_transform", "enqueue_then_wait", parts,
+                              gpu_raw_mib, queued, packed.med);
+            print_granularity("gpu_transform", "wait_each_weight", parts,
+                              gpu_raw_mib, serial, packed.med);
+        }
+    }
+    {
+        gpu_xform_kernels_stage packed_stage(cl, p.k, p.m);
+        const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+        print_granularity("gpu_xform_kernel", "one_command_group", 1,
+                          gpu_raw_mib, packed, packed.med);
+        for (int parts = 2; parts <= p.max_weight_parts; parts *= 2) {
+            std::vector<std::unique_ptr<gpu_xform_kernels_stage>> split;
+            split.reserve(size_t(parts));
+            for (int i = 0; i < parts; ++i) {
+                split.emplace_back(new gpu_xform_kernels_stage(cl, p.k, p.m / parts));
+            }
+            const stats queued = bench_single([&] {
+                for (const auto & stage : split) {
+                    stage->enqueue();
+                }
+                CL_CHECK(clFinish(cl.xform_q));
+            }, p.warmup, p.iters);
+            const stats serial = bench_single([&] {
+                for (const auto & stage : split) {
+                    (*stage)();
+                }
+            }, p.warmup, p.iters);
+            print_granularity("gpu_xform_kernel", "enqueue_then_wait", parts,
+                              gpu_raw_mib, queued, packed.med);
+            print_granularity("gpu_xform_kernel", "wait_each_weight", parts,
+                              gpu_raw_mib, serial, packed.med);
+        }
+    }
+
+    // Llama-style grouped Q/K/V projections share K but have a 4:1:1 output ratio.
+    // Concatenating them along M is mathematically equivalent to one larger transform,
+    // while the separate path preserves three independent weight buffers.
+    if (p.m % 6 == 0) {
+        const std::vector<int> qkv_m = { p.m * 4 / 6, p.m / 6, p.m / 6 };
+        {
+            gpu_xform_stage packed_stage(cl, p.k, p.m);
+            std::vector<std::unique_ptr<gpu_xform_stage>> separate;
+            for (int m : qkv_m) {
+                separate.emplace_back(new gpu_xform_stage(cl, p.k, m));
+            }
+            const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+            const stats queued = bench_single([&] {
+                for (const auto & stage : separate) stage->enqueue();
+                CL_CHECK(clFinish(cl.xform_q));
+            }, p.warmup, p.iters);
+            const stats serial = bench_single([&] {
+                for (const auto & stage : separate) (*stage)();
+            }, p.warmup, p.iters);
+            print_granularity("gpu_transform_qkv", "one_command_group", 1, gpu_raw_mib, packed, packed.med);
+            print_granularity("gpu_transform_qkv", "enqueue_then_wait", 3, gpu_raw_mib, queued, packed.med);
+            print_granularity("gpu_transform_qkv", "wait_each_weight", 3, gpu_raw_mib, serial, packed.med);
+        }
+        {
+            gpu_xform_kernels_stage packed_stage(cl, p.k, p.m);
+            std::vector<std::unique_ptr<gpu_xform_kernels_stage>> separate;
+            for (int m : qkv_m) {
+                separate.emplace_back(new gpu_xform_kernels_stage(cl, p.k, m));
+            }
+            const stats packed = bench_single([&] { packed_stage(); }, p.warmup, p.iters);
+            const stats queued = bench_single([&] {
+                for (const auto & stage : separate) stage->enqueue();
+                CL_CHECK(clFinish(cl.xform_q));
+            }, p.warmup, p.iters);
+            const stats serial = bench_single([&] {
+                for (const auto & stage : separate) (*stage)();
+            }, p.warmup, p.iters);
+            print_granularity("gpu_xform_qkv_k", "one_command_group", 1, gpu_raw_mib, packed, packed.med);
+            print_granularity("gpu_xform_qkv_k", "enqueue_then_wait", 3, gpu_raw_mib, queued, packed.med);
+            print_granularity("gpu_xform_qkv_k", "wait_each_weight", 3, gpu_raw_mib, serial, packed.med);
+        }
+    }
+}
+
 enum class pipe_state {
     empty,
     loading,
@@ -1411,6 +1662,11 @@ int main(int argc, char ** argv) {
     try {
         const params p = parse(argc, argv);
         cl_env cl = init_opencl(p);
+
+        if (p.granularity_only) {
+            run_weight_granularity_bench(p, cl);
+            return 0;
+        }
 
         std::unique_ptr<disk_load_stage> disk;
         std::unique_ptr<disk_async_prefetch_stage> disk_async;

@@ -1008,12 +1008,69 @@ extern "C" {
         void *   host_ptr;
     };
 
+    struct llama_working_set_state {
+        int      active_capacity;
+        int      pending_capacity;
+        int      target_capacity;
+        int      observed_required_capacity;
+        uint64_t accesses;
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t capacity_changes;
+        size_t   resident_bytes;
+    };
+
+    struct llama_granularity_runtime_state {
+        int      backend; // 0=CPU Elastic, 1=OpenCL, -1=unavailable
+        int      mode;    // elastic::granularity_mode ordinal
+        uint64_t units;
+        uint64_t nonresident_units;
+        uint64_t pipeline_issued;
+        uint64_t pipeline_ready;
+        uint64_t pipeline_waits;
+        uint64_t pipeline_wait_us;
+        uint64_t reloads;
+        uint64_t reload_bytes;
+        uint64_t prepare_us;
+        uint64_t direct_read_calls;
+        uint64_t direct_read_us;
+        uint64_t direct_read_bytes;
+        uint64_t load_calls;
+        uint64_t load_us;
+        uint64_t load_bytes;
+        uint64_t prepare_calls;
+        uint64_t prepare_bytes;
+        uint64_t compute_calls;
+        uint64_t compute_us;
+        int      compute_timing_available;
+        uint64_t pipeline_residency_us;
+        uint64_t pipeline_unissued_us;
+        uint64_t pipeline_stage_us;
+        uint64_t pipeline_retire_us;
+        uint64_t evict_us;
+        size_t   resident_bytes;
+    };
+
     // Finer-grained elastic residency query for online planners. The result is
     // a merged view from all registered elastic backends.
     LLAMA_API int llama_weight_get_state(
             struct llama_context *             ctx,
             const char *                       tensor_name,
             struct llama_elastic_weight_state * out_state);
+
+    LLAMA_API int llama_working_set_get_state(
+            struct llama_context *          ctx,
+            const char *                    kind,
+            struct llama_working_set_state * out_state);
+
+    LLAMA_API int llama_granularity_get_state(
+            struct llama_context *                 ctx,
+            struct llama_granularity_runtime_state * out_state);
+    // Drain only the Elastic LOAD/PREPARE workers and their backend commands.
+    // This is a measurement-boundary operation; calling it per token disables
+    // the pipeline overlap the granularity experiment is designed to measure.
+    LLAMA_API int llama_granularity_synchronize_pipeline(
+            struct llama_context * ctx);
 
     // Async request: 把 tensor_name 在下次 ensure_phase 之前预 load 进 backend 缓冲.
     // 返 0 成功入队, <0 失败 (e.g. weight 不存在 / backend 不支持).

@@ -45,6 +45,7 @@
 // Elastic baseline 集成：runtime/ 模块的头文件由 ggml-opencl CMakeLists.txt 的
 // target_include_directories 把 runtime/ 加入搜索路径。
 #include "budget_watcher.h"
+#include "elastic_granularity.h"
 #include "elastic_profile_writer.h"
 #include "metrics_logger.h"
 #include "weight_buffer_manager.h"
@@ -636,6 +637,7 @@ struct ggml_backend_opencl_context {
     cl_program program_gemv_noshuffle_q8_0_f32;
     cl_kernel CL_mul_mat_Ab_Bi_8x4;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_dual;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
@@ -1922,6 +1924,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_dual = clCreateKernel(backend_ctx->program_gemv_noshuffle_q4_0_f32, "kernel_gemv_noshuffle_q4_0_f32_dual", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -2587,6 +2590,10 @@ struct ggml_tensor_extra_cl_q4_0 {
     cl_mem q = nullptr;
     // Quantized values in image1d_buffer_t.
     cl_mem q_img = nullptr;
+    // Elastic Cut fused GEMV creates an image view over q once per resident
+    // lifetime.  It must be released with q on eviction so the image cannot
+    // retain an otherwise evicted parent buffer.
+    bool owns_q_img = false;
     // Scales.
     cl_mem d = nullptr;
     // Scales in image1d_buffer_t.
@@ -2609,7 +2616,18 @@ struct ggml_tensor_extra_cl_q4_0 {
         reset();
     }
 
+    bool reset_owned_images() {
+        const bool released = owns_q_img && q_img != nullptr;
+        if (released) {
+            CL_CHECK(clReleaseMemObject(q_img));
+        }
+        q_img = nullptr;
+        owns_q_img = false;
+        return released;
+    }
+
     void reset() {
+        reset_owned_images();
         // q and d are subbuffers into the bigger buffer allocated in ggml_backend_buffer.
         // They must be properly released so that the original buffer can be
         // properly released to avoid memory leak.
@@ -2621,11 +2639,8 @@ struct ggml_tensor_extra_cl_q4_0 {
             CL_CHECK(clReleaseMemObject(d));
             d = nullptr;
         }
-        // Currently, q_img and d_img are only initialized when SMALL_ALLOC is
-        // enabled. They point to the images in ggml_backend_opencl_buffer_context.
-        // So, there is no need to release them here.
-        // TODO: initialize them for non SMALL_PATH path, or remove them.
-        q_img = nullptr;
+        // Non-owned image handles (for example SMALL_ALLOC aliases) remain
+        // owned by the buffer context.
         d_img = nullptr;
         size_q = 0;
         size_d = 0;
@@ -2929,6 +2944,7 @@ struct elastic_moe_q4_cache {
     cl_mem route_slots = nullptr;
     cl_event route_upload_event = nullptr;
     int capacity = 0;
+    int budget_capacity = 0;
     size_t raw_slice_bytes = 0;
     size_t q_slice_bytes = 0;
     size_t d_slice_bytes = 0;
@@ -2952,6 +2968,25 @@ struct elastic_moe_prefetch_task {
     uint64_t io_us = 0;
 };
 
+struct elastic_q4_cut_part {
+    int64_t row_start = 0;
+    int64_t row_count = 0;
+    size_t byte_offset = 0;
+    size_t byte_size = 0;
+    ggml_tensor_extra_cl_q4_0 * extra = nullptr;
+    int wbm_idx = -1;
+};
+
+struct opencl_pipeline_successor {
+    uint64_t signature = 0;
+    std::vector<std::vector<int>> units;
+};
+
+struct opencl_pipeline_pin_state {
+    size_t refs = 0;
+    bool original = false;
+};
+
 static constexpr size_t ELASTIC_MOE_DIRECT_ALIGNMENT = 4096;
 static constexpr size_t ELASTIC_MOE_DIRECT_PADDING = 2 * ELASTIC_MOE_DIRECT_ALIGNMENT;
 
@@ -2971,6 +3006,69 @@ struct ggml_opencl_elastic_state {
     bool   wbm_inited     = false;
     bool   bw_inited      = false;
     bool   metrics_inited = false;
+
+    elastic::granularity_config granularity;
+    uint64_t eviction_group_generation = UINT64_MAX;
+    std::unordered_map<const ggml_tensor *, std::vector<elastic_q4_cut_part>> q4_cut_parts;
+    cl_mem cut_output_scratch = nullptr;
+    size_t cut_output_scratch_bytes = 0;
+    cl_command_queue cut_compute_queue = nullptr;
+    uint64_t cut_dual_candidates = 0;
+    uint64_t cut_dual_calls = 0;
+    uint64_t cut_dual_budget_fallbacks = 0;
+    uint64_t cut_dual_shape_fallbacks = 0;
+    uint64_t cut_dual_queue_errors = 0;
+    uint64_t cut_dual_image_creates = 0;
+    uint64_t cut_dual_image_cache_hits = 0;
+    uint64_t cut_dual_image_releases = 0;
+    uint64_t cut_dual_image_errors = 0;
+    uint64_t granularity_units = 0;
+    uint64_t granularity_cut_ops = 0;
+    uint64_t granularity_fallback_ops = 0;
+    size_t granularity_peak_unit_bytes = 0;
+    size_t granularity_cut_tensors = 0;
+    size_t granularity_cut_parts = 0;
+    // A logical working-unit boundary must not imply a host-blocking drain of
+    // the entire OpenCL queue.  FLUSH submits queued work without waiting;
+    // FINISH is retained only as an explicit diagnostic baseline.
+    enum class unit_sync_mode {
+        NONE,
+        FLUSH,
+        FINISH,
+    };
+    unit_sync_mode granularity_unit_sync = unit_sync_mode::FLUSH;
+    uint64_t granularity_unit_boundaries = 0;
+    uint64_t granularity_unit_flushes = 0;
+    uint64_t granularity_unit_finishes = 0;
+    uint64_t granularity_unit_sync_errors = 0;
+    uint64_t unit_pipeline_current_missing_units = 0;
+    uint64_t unit_pipeline_issued = 0;
+    uint64_t unit_pipeline_ready = 0;
+    uint64_t unit_pipeline_waits = 0;
+    uint64_t unit_pipeline_wait_us = 0;
+    uint64_t unit_pipeline_window_samples = 0;
+    uint64_t unit_pipeline_window_units_total = 0;
+    size_t unit_pipeline_window_units_max = 0;
+    size_t unit_pipeline_window_bytes_total = 0;
+    size_t unit_pipeline_window_bytes_max = 0;
+    uint64_t unit_pipeline_oversize_windows = 0;
+    // Keep the byte-bounded unit pipeline alive across backend-graph calls.
+    std::unordered_map<uint64_t, opencl_pipeline_successor> unit_pipeline_successors;
+    uint64_t unit_pipeline_previous_graph_signature = 0;
+    bool unit_pipeline_previous_graph_valid = false;
+    std::deque<opencl_pipeline_successor> unit_pipeline_cross_graphs;
+    std::unordered_map<int, opencl_pipeline_pin_state> unit_pipeline_cross_pins;
+    uint64_t unit_pipeline_cross_issued = 0;
+    uint64_t unit_pipeline_cross_ready = 0;
+    uint64_t unit_pipeline_cross_waits = 0;
+    size_t unit_pipeline_cross_bytes = 0;
+    uint64_t unit_pipeline_budget_samples = 0;
+    uint64_t unit_pipeline_budget_violations = 0;
+    uint64_t unit_pipeline_plan_protection_relaxations = 0;
+    size_t unit_pipeline_plan_protection_relaxed_bytes = 0;
+    size_t unit_pipeline_resident_bytes_peak = 0;
+    size_t unit_pipeline_pinned_bytes_peak = 0;
+    size_t unit_pipeline_over_budget_bytes_peak = 0;
 
     size_t kv_bytes       = static_cast<size_t>(128) * 1024 * 1024;
     size_t misc_overhead  = static_cast<size_t>(256) * 1024 * 1024;
@@ -3024,6 +3122,7 @@ struct ggml_opencl_elastic_state {
     // === Runtime scheduler 集成: tensor name → wbm_idx ===
     std::mutex                              sched_mtx;
     std::unordered_map<std::string, int>    name_to_wbm;
+    std::unordered_map<std::string, std::vector<int>> name_to_wbms;
     std::unordered_map<int, std::string>    wbm_to_name;
     bool                                    sched_registered = false;
 
@@ -3049,12 +3148,18 @@ struct ggml_opencl_elastic_state {
     uint64_t                                         moe_cache_grow_resizes = 0;
     size_t                                           moe_cache_grow_copy_bytes = 0;
     int                                              moe_cache_active_capacity = -1;
+    int                                              moe_cache_plan_capacity = -1;
+    int                                              moe_cache_required_high_water = 0;
     int                                              moe_cache_pending_capacity = -1;
     int                                              moe_cache_pending_hits = 0;
     uint64_t                                         moe_cache_capacity_decision_token = 0;
     uint64_t                                         moe_cache_last_capacity_change_token = 0;
     int                                              moe_cache_resize_target = -1;
     uint64_t                                         moe_cache_resize_syncs = 0;
+    std::unordered_set<int>                          moe_q4_packed_indices;
+    uint64_t                                         moe_packed_stage_skips = 0;
+    uint64_t                                         moe_packed_parent_evictions = 0;
+    size_t                                           moe_packed_parent_evicted_bytes = 0;
     FILE *                                           moe_route_trace_file = nullptr;
     uint64_t                                         moe_route_trace_seq = 0;
     std::mutex                                       moe_prefetch_mtx;
@@ -3290,6 +3395,10 @@ static bool ggml_opencl_prepare_moe_q4_cache(
         const ggml_tensor * src0,
         const ggml_tensor * src2,
         cl_ulong offset2,
+        const ggml_tensor * id_mask,
+        cl_mem id_mask_buffer,
+        cl_ulong id_mask_offset,
+        cl_ulong mask_nb1,
         elastic_moe_q4_cache_view * out) {
     const auto prepare_t0 = std::chrono::steady_clock::now();
     if (!backend_ctx || !src0 || !src2 || !out || !ggml_opencl_moe_expert_cache_enabled()) {
@@ -3312,6 +3421,39 @@ static bool ggml_opencl_prepare_moe_q4_cache(
         return false;
     }
 
+    // LLAMA_MOE_DYNAMIC_ALL_EXPERTS keeps all expert IDs in src2 and masks
+    // inactive routes through src3.  Materializing all IDs here defeats the
+    // dynamic routing memory saving and can allocate several GiB unnecessarily.
+    std::vector<uint8_t> active_routes((size_t) n_selected, 1);
+    int n_active = n_selected;
+    if (id_mask && id_mask_buffer && id_mask->type == GGML_TYPE_F32) {
+        std::vector<float> mask_values((size_t) n_selected, 0.0f);
+        cl_int mask_err = CL_SUCCESS;
+        if (mask_nb1 == sizeof(float)) {
+            mask_err = clEnqueueReadBuffer(backend_ctx->queue, id_mask_buffer, CL_TRUE,
+                                           id_mask_offset, sizeof(float) * (size_t) n_selected,
+                                           mask_values.data(), 0, nullptr, nullptr);
+        } else {
+            for (int i = 0; i < n_selected && mask_err == CL_SUCCESS; ++i) {
+                mask_err = clEnqueueReadBuffer(backend_ctx->queue, id_mask_buffer, CL_TRUE,
+                                               id_mask_offset + (cl_ulong) i * mask_nb1,
+                                               sizeof(float), &mask_values[(size_t) i],
+                                               0, nullptr, nullptr);
+            }
+        }
+        if (mask_err != CL_SUCCESS) {
+            GGML_LOG_ERROR("ggml_opencl moe cache: read active mask failed tensor=%s err=%d\n",
+                           src0->name, mask_err);
+            return false;
+        }
+        n_active = 0;
+        for (int i = 0; i < n_selected; ++i) {
+            active_routes[(size_t) i] = mask_values[(size_t) i] != 0.0f;
+            n_active += active_routes[(size_t) i] ? 1 : 0;
+        }
+    }
+    const int n_required = std::max(1, n_active);
+
     static const int requested_capacity = []() {
         const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_SLOTS");
         const int v = e && *e ? std::atoi(e) : 8;
@@ -3326,7 +3468,8 @@ static bool ggml_opencl_prepare_moe_q4_cache(
     const size_t n_blocks = raw_slice_bytes / block_bytes;
     const size_t q_slice_bytes = n_blocks * (qk / 2);
     const size_t d_slice_bytes = n_blocks * sizeof(ggml_fp16_t);
-    int capacity = std::min(n_experts, std::max(n_selected, requested_capacity));
+    int budget_capacity = std::min(n_experts, requested_capacity);
+    int capacity = std::min(n_experts, std::max(n_required, budget_capacity));
     static const bool adaptive_capacity = []() {
         const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_ADAPTIVE");
         return e && *e && *e != '0';
@@ -3348,7 +3491,15 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_BASE_BUDGET_MIB");
             return e && *e ? (size_t) std::max<long long>(0, std::atoll(e)) : 0;
         }();
-        const size_t budget_mib = elastic::budget_watcher_get(&state->bw);
+        size_t budget_mib = elastic::budget_watcher_get(&state->bw);
+        static const size_t budget_bucket_mib = []() {
+            const char * e = std::getenv("GGML_ELASTIC_BUDGET_BUCKET_MB");
+            return (size_t) std::max<long long>(1, e && *e ? std::atoll(e) : 1);
+        }();
+        // The planner changes residency only at bucket boundaries. Using raw
+        // trace samples here made tiny fluctuations repeatedly resize every
+        // expert tensor even while the active plan stayed unchanged.
+        budget_mib = (budget_mib / budget_bucket_mib) * budget_bucket_mib;
         const size_t floor_mib = configured_base_budget_mib > 0 ?
             configured_base_budget_mib : state->bw.m_floor_mb;
         const size_t extra_bytes = budget_mib > floor_mib ?
@@ -3356,7 +3507,12 @@ static bool ggml_opencl_prepare_moe_q4_cache(
         const size_t global_slot_bytes = (q_slice_bytes + d_slice_bytes) * (size_t) tensor_count;
         int extra_slots = global_slot_bytes > 0 ? (int) (extra_bytes / global_slot_bytes) : 0;
         extra_slots = (extra_slots / slot_step) * slot_step;
-        capacity = std::min({n_experts, std::max(n_selected, max_slots), requested_capacity + extra_slots});
+        // The budget controls optional retained experts; active experts are a
+        // correctness requirement and may temporarily raise a tensor above the
+        // retained-cache tier. Keeping these quantities separate also avoids
+        // sizing every layer from the first layer observed for this token.
+        budget_capacity = std::min({n_experts, max_slots, requested_capacity + extra_slots});
+        capacity = std::max(n_required, budget_capacity);
     }
 
     if (adaptive_capacity) {
@@ -3368,8 +3524,13 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_RESIZE_MIN_GAP_GRAPHS");
             return (uint64_t) std::max(0, e && *e ? std::atoi(e) : 16);
         }();
-        const int desired_capacity = capacity;
+        int desired_capacity = budget_capacity;
         std::lock_guard<std::mutex> capacity_lock(state->moe_cache_mtx);
+        state->moe_cache_required_high_water = std::max(state->moe_cache_required_high_water, n_required);
+        const bool plan_controlled = state->moe_cache_plan_capacity >= 0;
+        if (state->moe_cache_plan_capacity >= 0) {
+            desired_capacity = std::min(n_experts, state->moe_cache_plan_capacity);
+        }
         if (state->moe_cache_active_capacity < 0) {
             state->moe_cache_active_capacity = desired_capacity;
             state->moe_cache_capacity_decision_token = state->current_token;
@@ -3384,7 +3545,12 @@ static bool ggml_opencl_prepare_moe_q4_cache(
                 state->moe_cache_pending_hits = 0;
                 reason = "budget_shrink";
             } else if (desired_capacity > old_capacity) {
-                if (state->moe_cache_pending_capacity == desired_capacity) {
+                if (plan_controlled) {
+                    state->moe_cache_active_capacity = desired_capacity;
+                    state->moe_cache_pending_capacity = -1;
+                    state->moe_cache_pending_hits = 0;
+                    reason = "plan_grow";
+                } else if (state->moe_cache_pending_capacity == desired_capacity) {
                     state->moe_cache_pending_hits++;
                 } else {
                     state->moe_cache_pending_capacity = desired_capacity;
@@ -3411,10 +3577,8 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             }
             state->moe_cache_capacity_decision_token = state->current_token;
         }
-        capacity = state->moe_cache_active_capacity;
+        capacity = std::max(n_required, state->moe_cache_active_capacity);
     }
-    const int aggregate_capacity = capacity;
-
     // Gate misses are on the decode critical path, while gate routing gives
     // up/down loads a short overlap window. Shift slots toward gate without
     // increasing the aggregate gate+up+down cache footprint.
@@ -3428,7 +3592,7 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             capacity += actual_shift;
         } else if (std::strstr(src0->name, "ffn_up_exps.weight") != nullptr ||
                    std::strstr(src0->name, "ffn_down_exps.weight") != nullptr) {
-            capacity = std::max(n_selected, capacity - (actual_shift + 1) / 2);
+            capacity = std::max(n_required, capacity - (actual_shift + 1) / 2);
         }
     }
 
@@ -3522,18 +3686,51 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             }
         }
     }
-    ggml_opencl_enqueue_moe_companion_prefetch(state, src0, expert_ids, raw_slice_bytes, n_experts);
+    std::vector<int32_t> active_expert_ids;
+    active_expert_ids.reserve((size_t) n_active);
+    for (int i = 0; i < n_selected; ++i) {
+        if (active_routes[(size_t) i]) {
+            active_expert_ids.push_back(expert_ids[(size_t) i]);
+        }
+    }
+    ggml_opencl_enqueue_moe_companion_prefetch(state, src0, active_expert_ids, raw_slice_bytes, n_experts);
 
     std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
     elastic_moe_q4_cache & cache = state->moe_q4_cache[wbm_idx];
+    if (!adaptive_capacity && cache.parent) {
+        // Active expert counts vary by layer and token. Keep the high-water
+        // capacity instead of reallocating the cache on every downward change.
+        capacity = std::max(capacity, cache.capacity);
+    }
+    static const bool retain_workload_high_water = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_RETAIN_WORKLOAD_HIGH_WATER");
+        return e && *e && *e != '0';
+    }();
+    const bool budget_tier_shrank = cache.parent && budget_capacity < cache.budget_capacity;
+    if (adaptive_capacity && retain_workload_high_water && cache.parent &&
+        !budget_tier_shrank && capacity < cache.capacity) {
+        // n_required can vary from layer to layer even while the memory budget
+        // is unchanged. Keep the workload high-water mark for that budget tier
+        // instead of rebuilding and repopulating the cache on every dip. A real
+        // budget decrease still takes the shrink path below.
+        capacity = cache.capacity;
+    }
+    const int aggregate_capacity = capacity;
     if (state->moe_cache_resize_target < 0) {
         state->moe_cache_resize_target = aggregate_capacity;
     }
     static const bool preserve_grow = []() {
         const char * e = std::getenv("GGML_ELASTIC_MOE_PRESERVE_GROW");
-        return e && *e && *e != '0';
+        // Growing a packed expert cache does not invalidate the experts that
+        // already occupy its prefix. Preserve them by default so workload or
+        // budget growth pays only for newly admitted experts. The switch stays
+        // available for driver diagnostics and memory-pressure experiments.
+        return !e || !*e || *e != '0';
     }();
-    if (cache.parent && cache.capacity != capacity && std::abs(cache.capacity - capacity) >= 4) {
+    const bool capacity_must_grow = cache.parent && capacity > cache.capacity;
+    const bool capacity_can_shrink = cache.parent && capacity < cache.capacity &&
+                                     cache.capacity - capacity >= 4;
+    if (capacity_must_grow || capacity_can_shrink) {
         // A route-upload event does not cover kernels that subsequently read the
         // cache parent. Synchronize once when the aggregate slot tier changes so
         // every old cache buffer is idle before the batch of per-tensor resizes.
@@ -3575,6 +3772,7 @@ static bool ggml_opencl_prepare_moe_q4_cache(
                 cache.parent = grown_parent;
                 cache.route_slots = grown_route;
                 cache.capacity = capacity;
+                cache.budget_capacity = std::max(cache.budget_capacity, budget_capacity);
                 cache.expert_for_slot.resize((size_t) capacity, -1);
                 cache.last_used.resize((size_t) capacity, 0);
                 state->moe_cache_bytes += new_bytes - old_bytes;
@@ -3596,6 +3794,7 @@ static bool ggml_opencl_prepare_moe_q4_cache(
     }
     if (!cache.parent) {
         cache.capacity = capacity;
+        cache.budget_capacity = budget_capacity;
         cache.raw_slice_bytes = raw_slice_bytes;
         cache.q_slice_bytes = q_slice_bytes;
         cache.d_slice_bytes = d_slice_bytes;
@@ -3623,16 +3822,33 @@ static bool ggml_opencl_prepare_moe_q4_cache(
                       raw_slice_bytes / 1024.0 / 1024.0,
                       (q_slice_bytes + d_slice_bytes) * capacity / 1024.0 / 1024.0);
     }
+    if (budget_capacity > cache.budget_capacity) {
+        cache.budget_capacity = budget_capacity;
+    }
 
     static thread_local std::vector<unsigned char> raw_storage;
     raw_storage.resize(raw_slice_bytes + ELASTIC_MOE_DIRECT_PADDING);
     std::vector<int32_t> route_slots((size_t) n_selected, -1);
-    static const bool use_lfu = []() {
+    enum class moe_cache_policy {
+        lru,
+        mru,
+        lfu,
+    };
+    static const moe_cache_policy cache_policy = []() {
         const char * e = std::getenv("GGML_ELASTIC_MOE_EXPERT_CACHE_POLICY");
-        return e && std::strcmp(e, "lfu") == 0;
+        if (e && std::strcmp(e, "mru") == 0) return moe_cache_policy::mru;
+        if (e && std::strcmp(e, "lfu") == 0) return moe_cache_policy::lfu;
+        return moe_cache_policy::lru;
     }();
-
+    static const uint64_t lfu_decay_accesses = []() {
+        const char * e = std::getenv("GGML_ELASTIC_MOE_LFU_DECAY_ACCESSES");
+        const long long v = e && *e ? std::atoll(e) : 1024;
+        return (uint64_t) std::max<long long>(1, v);
+    }();
     for (int i = 0; i < n_selected; ++i) {
+        if (!active_routes[(size_t) i]) {
+            continue;
+        }
         const int expert_id = expert_ids[(size_t) i];
         if (expert_id < 0 || expert_id >= n_experts) {
             GGML_LOG_ERROR("ggml_opencl moe cache: invalid expert id=%d tensor=%s\n", expert_id, src0->name);
@@ -3640,7 +3856,8 @@ static bool ggml_opencl_prepare_moe_q4_cache(
         }
         cache.accesses++;
         cache.frequency[(size_t) expert_id]++;
-        if ((cache.accesses % 1024) == 0) {
+        if (cache_policy == moe_cache_policy::lfu &&
+            (cache.accesses % lfu_decay_accesses) == 0) {
             for (uint32_t & f : cache.frequency) {
                 f = (f + 1) / 2;
             }
@@ -3668,19 +3885,30 @@ static bool ggml_opencl_prepare_moe_q4_cache(
                            route_slots.begin() + i;
                 };
                 uint32_t best_freq = std::numeric_limits<uint32_t>::max();
-                uint64_t best_age = std::numeric_limits<uint64_t>::max();
+                uint64_t best_age = cache_policy == moe_cache_policy::mru
+                    ? 0
+                    : std::numeric_limits<uint64_t>::max();
                 for (int s = 0; s < cache.capacity; ++s) {
                     if (protected_this_token(s)) continue;
                     const int resident_expert = cache.expert_for_slot[(size_t) s];
                     const uint32_t freq = resident_expert >= 0 ? cache.frequency[(size_t) resident_expert] : 0;
                     const uint64_t age = cache.last_used[(size_t) s];
-                    if ((!use_lfu && age < best_age) ||
-                        (use_lfu && (freq < best_freq || (freq == best_freq && age < best_age)))) {
+                    const bool better =
+                        (cache_policy == moe_cache_policy::mru && (slot < 0 || age > best_age)) ||
+                        (cache_policy == moe_cache_policy::lru && age < best_age) ||
+                        (cache_policy == moe_cache_policy::lfu &&
+                         (freq < best_freq || (freq == best_freq && age < best_age)));
+                    if (better) {
                         slot = s;
                         best_freq = freq;
                         best_age = age;
                     }
                 }
+            }
+            if (slot < 0) {
+                GGML_LOG_ERROR("ggml_opencl moe cache: no replaceable slot tensor=%s expert=%d capacity=%d\n",
+                               src0->name, expert_id, cache.capacity);
+                return false;
             }
 
             const unsigned char * mmap_src = (const unsigned char *) bm->host_ptr +
@@ -3707,7 +3935,6 @@ static bool ggml_opencl_prepare_moe_q4_cache(
             if (!loaded) {
                 std::memcpy(raw, mmap_src, raw_slice_bytes);
             }
-
             const auto upload_t0 = std::chrono::steady_clock::now();
             err = clEnqueueWriteBuffer(backend_ctx->queue, cache.parent, CL_TRUE,
                                        (size_t) slot * raw_slice_bytes, raw_slice_bytes,
@@ -3769,6 +3996,66 @@ static std::string opencl_name_for_idx(ggml_opencl_elastic_state *s, int idx) {
     std::lock_guard<std::mutex> lk(s->sched_mtx);
     auto it = s->wbm_to_name.find(idx);
     return it == s->wbm_to_name.end() ? std::string{} : it->second;
+}
+
+static void opencl_wait_async_xform(ggml_opencl_elastic_state *s, int idx);
+
+static bool ggml_opencl_moe_q4_cache_manages_idx(ggml_opencl_elastic_state * s, int idx) {
+    if (!s || idx < 0 || !ggml_opencl_moe_expert_cache_enabled()) return false;
+    std::lock_guard<std::mutex> lock(s->sched_mtx);
+    return s->moe_q4_packed_indices.find(idx) != s->moe_q4_packed_indices.end();
+}
+
+static int ggml_opencl_release_moe_q4_packed_idx(ggml_opencl_elastic_state * s, int idx) {
+    if (!ggml_opencl_moe_q4_cache_manages_idx(s, idx)) return -2;
+    opencl_wait_async_xform(s, idx);
+    const elastic::block_meta * bm = elastic::wbm_get(&s->wbm, idx);
+    if (!bm || !bm->resident) return 0;
+    const size_t bytes = bm->byte_size;
+    const int released = elastic::wbmcl_evict_batch(&s->octx, &idx, 1);
+    if (released <= 0) return -3;
+    const std::string name = opencl_name_for_idx(s, idx);
+    if (!name.empty()) {
+        llama_weight_runtime_mark_evicted(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+    }
+    s->n_evicts_total += 1;
+    s->moe_packed_parent_evictions += 1;
+    s->moe_packed_parent_evicted_bytes += bytes;
+    return 0;
+}
+
+static void ggml_opencl_release_all_moe_q4_packed(ggml_opencl_elastic_state * s) {
+    if (!s || !ggml_opencl_moe_expert_cache_enabled()) return;
+    std::vector<int> resident;
+    size_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(s->sched_mtx);
+        resident.reserve(s->moe_q4_packed_indices.size());
+        for (int idx : s->moe_q4_packed_indices) {
+            const elastic::block_meta * bm = elastic::wbm_get(&s->wbm, idx);
+            if (bm && bm->resident) {
+                resident.push_back(idx);
+                bytes += bm->byte_size;
+            }
+        }
+    }
+    if (resident.empty()) return;
+    for (int idx : resident) {
+        opencl_wait_async_xform(s, idx);
+    }
+    const int released = elastic::wbmcl_evict_batch(&s->octx, resident.data(), (int) resident.size());
+    if (released <= 0) return;
+    for (int i = 0; i < released && i < (int) resident.size(); ++i) {
+        const std::string name = opencl_name_for_idx(s, resident[(size_t) i]);
+        if (!name.empty()) {
+            llama_weight_runtime_mark_evicted(name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+        }
+    }
+    s->n_evicts_total += (uint64_t) released;
+    s->moe_packed_parent_evictions += (uint64_t) released;
+    s->moe_packed_parent_evicted_bytes += bytes;
+    GGML_LOG_INFO("ggml_opencl moe cache: released %d packed parents (%.1f MiB) before slice-cache execution\n",
+                  released, bytes / 1024.0 / 1024.0);
 }
 
 static void opencl_wait_async_xform(ggml_opencl_elastic_state *s, int idx) {
@@ -3872,60 +4159,78 @@ static int opencl_plan_aware_victim(const elastic::weight_buffer_manager *wbm,
 }
 
 // === Runtime scheduler handlers (registered with llama-mmap registry) ===
+static std::vector<int> opencl_sched_indices_for_name(
+        ggml_opencl_elastic_state *s, const char *name) {
+    if (!s || !name) return {};
+    std::lock_guard<std::mutex> lk(s->sched_mtx);
+    auto many = s->name_to_wbms.find(name);
+    if (many != s->name_to_wbms.end() && !many->second.empty()) {
+        return many->second;
+    }
+    auto one = s->name_to_wbm.find(name);
+    return one == s->name_to_wbm.end() ? std::vector<int>{}
+                                       : std::vector<int>{one->second};
+}
+
 static bool opencl_sched_residency_query(const char *name, void * /*ud*/) {
     if (!name) return false;
     auto *s = ggml_opencl_elastic();
-    std::lock_guard<std::mutex> lk(s->sched_mtx);
-    auto it = s->name_to_wbm.find(name);
-    if (it == s->name_to_wbm.end()) return false;
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, it->second);
-    if (bm && bm->resident) return true;
-    if (ggml_opencl_moe_expert_cache_enabled()) {
-        std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
-        auto cache = s->moe_q4_cache.find(it->second);
-        return cache != s->moe_q4_cache.end() && cache->second.parent != nullptr;
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return false;
+    for (int idx : indices) {
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+        if (bm && bm->resident) continue;
+        bool cached = false;
+        if (ggml_opencl_moe_expert_cache_enabled()) {
+            std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
+            auto cache = s->moe_q4_cache.find(idx);
+            cached = cache != s->moe_q4_cache.end() && cache->second.parent != nullptr;
+        }
+        if (!cached) return false;
     }
-    return false;
+    return true;
 }
 
 static uint32_t opencl_sched_state_query(const char *name, void * /*ud*/) {
     if (!name) return 0;
     auto *s = ggml_opencl_elastic();
-    std::lock_guard<std::mutex> lk(s->sched_mtx);
-    auto it = s->name_to_wbm.find(name);
-    if (it == s->name_to_wbm.end()) return 0;
-    const int idx = it->second;
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return 0;
     uint32_t flags = 0;
-    if (bm && bm->host_ptr) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
-    if (bm && bm->resident) flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
-    if (ggml_opencl_moe_expert_cache_enabled()) {
-        std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
-        auto cache = s->moe_q4_cache.find(idx);
-        if (cache != s->moe_q4_cache.end() && cache->second.parent) {
-            flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+    bool all_disk = true;
+    bool all_gpu = true;
+    bool all_cpu_raw = true;
+    for (int idx : indices) {
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+        all_disk = all_disk && bm && bm->host_ptr;
+        bool gpu = bm && bm->resident;
+        if (!gpu && ggml_opencl_moe_expert_cache_enabled()) {
+            std::lock_guard<std::mutex> cache_lock(s->moe_cache_mtx);
+            auto cache = s->moe_q4_cache.find(idx);
+            gpu = cache != s->moe_q4_cache.end() && cache->second.parent;
         }
-    }
-    if (bm) {
-        std::lock_guard<std::mutex> staging_lock(s->octx.host_staging_mtx);
-        auto staged = s->octx.host_staging_by_idx.find(idx);
-        if (staged != s->octx.host_staging_by_idx.end() && staged->second.size() >= bm->byte_size) {
-            flags |= LLAMA_WEIGHT_STATE_CPU_RAW_RESIDENT;
+        all_gpu = all_gpu && gpu;
+        bool cpu_raw = false;
+        if (bm) {
+            std::lock_guard<std::mutex> staging_lock(s->octx.host_staging_mtx);
+            auto staged = s->octx.host_staging_by_idx.find(idx);
+            cpu_raw = staged != s->octx.host_staging_by_idx.end() &&
+                      staged->second.size() >= bm->byte_size;
         }
+        all_cpu_raw = all_cpu_raw && cpu_raw;
     }
+    if (all_disk) flags |= LLAMA_WEIGHT_STATE_DISK_AVAILABLE;
+    if (all_gpu) flags |= LLAMA_WEIGHT_STATE_GPU_COMPUTE_RESIDENT;
+    if (all_cpu_raw) flags |= LLAMA_WEIGHT_STATE_CPU_RAW_RESIDENT;
     return flags;
 }
 
 static void * opencl_sched_host_ptr_query(const char *name, void * /*ud*/) {
     if (!name) return nullptr;
     auto *s = ggml_opencl_elastic();
-    int idx = -1;
-    {
-        std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return nullptr;
-        idx = it->second;
-    }
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return nullptr;
+    const int idx = indices.front();
     const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
     return bm ? bm->host_ptr : nullptr;
 }
@@ -3933,57 +4238,87 @@ static void * opencl_sched_host_ptr_query(const char *name, void * /*ud*/) {
 static int opencl_sched_movement_request(const char *name, bool evict, void * /*ud*/) {
     if (!name) return -1;
     auto *s = ggml_opencl_elastic();
-    int idx = -1;
-    {
-        std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;  // 让 chain 试下一个 provider
-        idx = it->second;
-    }
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-    if (!bm) return -3;
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return -2;
     if (evict) {
         static const bool runtime_mru_cache = []() {
             const char * e = std::getenv("LLAMA_ELASTIC_RUNTIME_MRU_CACHE");
             return e && *e && *e != '0';
         }();
-        if (!runtime_mru_cache && llama_weight_runtime_desired_query(name) == LLAMA_WEIGHT_RUNTIME_GPU) return 0;
-        if (!bm->resident) return 0;
-        opencl_wait_async_xform(s, idx);
-        bm = elastic::wbm_get(&s->wbm, idx);
-        if (!bm || !bm->resident) return 0;
-        int rc = elastic::wbmcl_evict_batch(&s->octx, &idx, 1);
-        s->n_evicts_total += rc > 0 ? 1 : 0;
-        if (rc > 0) llama_weight_runtime_mark_evicted(name, LLAMA_WEIGHT_RUNTIME_GPU);
+        if (!runtime_mru_cache &&
+            llama_weight_runtime_desired_query(name) ==
+                LLAMA_WEIGHT_RUNTIME_GPU) {
+            return 0;
+        }
+        std::vector<int> resident;
+        for (int idx : indices) {
+            if (ggml_opencl_moe_q4_cache_manages_idx(s, idx)) {
+                ggml_opencl_release_moe_q4_packed_idx(s, idx);
+                continue;
+            }
+            opencl_wait_async_xform(s, idx);
+            const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+            if (bm && bm->resident) resident.push_back(idx);
+        }
+        if (!resident.empty()) {
+            const int released = elastic::wbmcl_evict_batch(
+                &s->octx, resident.data(), (int) resident.size());
+            s->n_evicts_total += released > 0 ? released : 0;
+            if (released > 0) llama_weight_runtime_mark_evicted(name, LLAMA_WEIGHT_RUNTIME_GPU);
+        }
         return 0;
     }
-    if (bm->resident) return 0;
-    int rc = elastic::wbmcl_ensure_resident(&s->octx, idx);
-    if (rc == 0) llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_GPU);
-    return rc == 0 ? 0 : -4;
+    for (int idx : indices) {
+        if (ggml_opencl_moe_q4_cache_manages_idx(s, idx) &&
+            llama_weight_runtime_desired_query(name) != LLAMA_WEIGHT_RUNTIME_CPU) {
+            ggml_opencl_release_moe_q4_packed_idx(s, idx);
+            continue;
+        }
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
+        if (bm && bm->resident) continue;
+        const int rc = elastic::wbmcl_ensure_resident(&s->octx, idx);
+        if (rc != 0) return -4;
+    }
+    llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_GPU);
+    return 0;
 }
 
 static int opencl_sched_stage_request(const char *name, const char *stage, void * /*ud*/) {
     if (!name || !stage) return -1;
     auto *s = ggml_opencl_elastic();
-    int idx = -1;
-    {
-        std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;  // 让 chain 试下一个 provider
-        idx = it->second;
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return -2;
+    const int idx = indices.front();
+    if (strcmp(stage, "load_cpu") == 0 || strcmp(stage, "prepare_cpu") == 0) {
+        return -2;
     }
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-    const size_t bytes = bm ? bm->byte_size : 0;
+    const bool gpu_materialization_stage =
+        strcmp(stage, "load") == 0 || strcmp(stage, "load_gpu") == 0 ||
+        strcmp(stage, "transfer") == 0 || strcmp(stage, "dma") == 0 ||
+        strcmp(stage, "prepare") == 0 || strcmp(stage, "prepare_gpu") == 0 ||
+        strcmp(stage, "materialize") == 0;
+    if (gpu_materialization_stage && indices.size() == 1 &&
+        ggml_opencl_moe_q4_cache_manages_idx(s, idx)) {
+        // A plan may place a dynamic expert tensor on GPU for compute routing,
+        // but loading its full packed parent duplicates the slice cache and can
+        // add multiple GiB during a budget transition.
+        s->moe_packed_stage_skips++;
+        return ggml_opencl_release_moe_q4_packed_idx(s, idx);
+    }
+    size_t bytes = 0;
+    for (int part_idx : indices) {
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, part_idx);
+        if (bm) bytes += bm->byte_size;
+    }
     const auto t0 = s->profile_csv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
     int rc = -3;
-    if (strcmp(stage, "load_cpu") == 0) {
-        return -2;
-    }
     if (strcmp(stage, "load") == 0 || strcmp(stage, "load_gpu") == 0) {
-        rc = elastic::wbmcl_load_host_async(&s->octx, idx);
+        rc = 0;
+        for (int part_idx : indices) {
+            if (elastic::wbmcl_load_host_async(&s->octx, part_idx) != 0) rc = -3;
+        }
         if (s->profile_csv) {
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3992,16 +4327,16 @@ static int opencl_sched_stage_request(const char *name, const char *stage, void 
         return rc;
     }
     if (strcmp(stage, "transfer") == 0 || strcmp(stage, "dma") == 0) {
-        rc = elastic::wbmcl_dma_to_backend(&s->octx, idx);
+        rc = 0;
+        for (int part_idx : indices) {
+            if (elastic::wbmcl_dma_to_backend(&s->octx, part_idx) != 0) rc = -3;
+        }
         if (s->profile_csv) {
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             opencl_profile_stage("TRANSFER", name, idx, bytes, ms, rc == 0, "plan_stage");
         }
         return rc;
-    }
-    if (strcmp(stage, "prepare_cpu") == 0) {
-        return -2;
     }
     if (strcmp(stage, "prepare") == 0 || strcmp(stage, "prepare_gpu") == 0 ||
         strcmp(stage, "materialize") == 0) {
@@ -4027,15 +4362,18 @@ static int opencl_sched_transform_request(const char *name, llama_weight_transfo
     if (kind == LLAMA_WEIGHT_TRANSFORM_NONE) return 0;
     if (kind != LLAMA_WEIGHT_TRANSFORM_GPU_CONVERT) return -2;
     auto *s = ggml_opencl_elastic();
-    int idx = -1;
-    {
-        std::lock_guard<std::mutex> lk(s->sched_mtx);
-        auto it = s->name_to_wbm.find(name);
-        if (it == s->name_to_wbm.end()) return -2;
-        idx = it->second;
+    const auto indices = opencl_sched_indices_for_name(s, name);
+    if (indices.empty()) return -2;
+    const int idx = indices.front();
+    if (indices.size() == 1 && ggml_opencl_moe_q4_cache_manages_idx(s, idx)) {
+        s->moe_packed_stage_skips++;
+        return ggml_opencl_release_moe_q4_packed_idx(s, idx);
     }
-    const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, idx);
-    const size_t bytes = bm ? bm->byte_size : 0;
+    size_t bytes = 0;
+    for (int part_idx : indices) {
+        const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, part_idx);
+        if (bm) bytes += bm->byte_size;
+    }
     static const bool s_async_xform_stage = []() {
         const char *e = std::getenv("GGML_ELASTIC_ASYNC_STAGE_PREPARE");
         if (e && *e) return *e != '0';
@@ -4043,22 +4381,26 @@ static int opencl_sched_transform_request(const char *name, llama_weight_transfo
         return e && *e && *e != '0';
     }();
     if (s_async_xform_stage) {
-        if (bm && bm->resident) return 0;
         opencl_start_async_xform_worker(s);
         {
             std::lock_guard<std::mutex> lk(s->async_xform_mtx);
-            if (s->async_xform_inflight.find(idx) != s->async_xform_inflight.end()) return 0;
             static const size_t s_max_pending = []() {
                 const char *e = std::getenv("GGML_ELASTIC_ASYNC_XFORM_MAX_PENDING");
                 long long v = e && *e ? atoll(e) : 0;
                 return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(0);
             }();
-            if (s_max_pending > 0 && s->async_xform_inflight.size() >= s_max_pending) {
-                return 0;
+            for (int part_idx : indices) {
+                const elastic::block_meta *bm = elastic::wbm_get(&s->wbm, part_idx);
+                if ((bm && bm->resident) ||
+                    s->async_xform_inflight.find(part_idx) != s->async_xform_inflight.end()) {
+                    continue;
+                }
+                if (s_max_pending > 0 &&
+                    s->async_xform_inflight.size() >= s_max_pending) break;
+                s->async_xform_inflight.insert(part_idx);
+                s->async_xform_queue.push_back(part_idx);
+                s->async_xform_enqueued++;
             }
-            s->async_xform_inflight.insert(idx);
-            s->async_xform_queue.push_back(idx);
-            s->async_xform_enqueued++;
             s->async_xform_max_pending_seen = std::max(s->async_xform_max_pending_seen,
                                                        s->async_xform_inflight.size());
         }
@@ -4071,7 +4413,10 @@ static int opencl_sched_transform_request(const char *name, llama_weight_transfo
     const auto t0 = s->profile_csv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-    const int rc = elastic::wbmcl_transform_backend(&s->octx, idx);
+    int rc = 0;
+    for (int part_idx : indices) {
+        if (elastic::wbmcl_transform_backend(&s->octx, part_idx) != 0) rc = -3;
+    }
     if (rc == 0) llama_weight_runtime_mark_resident(name, LLAMA_WEIGHT_RUNTIME_GPU);
     if (s->profile_csv) {
         const auto t1 = std::chrono::steady_clock::now();
@@ -4108,6 +4453,53 @@ static void opencl_sched_register_once() {
     llama_weight_stage_register    (opencl_sched_stage_request,    nullptr);
     llama_weight_transform_register(opencl_sched_transform_request, nullptr);
     llama_weight_host_ptr_register (opencl_sched_host_ptr_query, nullptr);
+    llama_working_set_register(
+        [](const char * kind, llama_working_set_runtime_state * out, void *) -> bool {
+            if (!kind || !out) return false;
+            auto * state = ggml_opencl_elastic();
+            if (std::strcmp(kind, "weights") == 0) {
+                size_t target = state->dynamic_target
+                    ? (([&] {
+                          const size_t budget = elastic::budget_watcher_get(&state->bw) * size_t(1024 * 1024);
+                          const size_t reserved = state->kv_bytes + state->misc_overhead;
+                          return (budget > reserved ? budget - reserved : 0) + state->extra_target_bytes;
+                      })())
+                    : state->static_target_bytes;
+                if (ggml_opencl_moe_expert_cache_enabled()) {
+                    target = target > state->moe_cache_bytes ? target - state->moe_cache_bytes : 0;
+                }
+                out->active_capacity = state->wbm.n_resident;
+                out->target_capacity = (int) (target / 1024 / 1024);
+                out->misses = state->n_reloads_total;
+                out->capacity_changes = state->n_evicts_total;
+                out->resident_bytes = state->wbm.resident_bytes;
+                return true;
+            }
+            if (std::strcmp(kind, "expert_slices") != 0) return false;
+            std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+            out->active_capacity = state->moe_cache_active_capacity;
+            out->pending_capacity = state->moe_cache_pending_capacity;
+            out->target_capacity = state->moe_cache_plan_capacity;
+            out->observed_required_capacity = state->moe_cache_required_high_water;
+            out->hits = state->moe_cache_hits;
+            out->misses = state->moe_cache_misses;
+            out->accesses = out->hits + out->misses;
+            out->capacity_changes = state->moe_cache_grow_resizes;
+            out->resident_bytes = state->moe_cache_bytes;
+            return true;
+        },
+        [](const char * kind, int target_capacity, void *) -> int {
+            if (!kind || std::strcmp(kind, "expert_slices") != 0) return -2;
+            if (target_capacity < -1) return -1;
+            auto * state = ggml_opencl_elastic();
+            std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+            state->moe_cache_plan_capacity = target_capacity;
+            state->moe_cache_required_high_water = 0;
+            state->moe_cache_pending_capacity = -1;
+            state->moe_cache_pending_hits = 0;
+            return 0;
+        },
+        nullptr);
     llama_budget_register          (opencl_sched_budget_query,    nullptr);
     llama_budget_reset_register    (opencl_sched_budget_reset,    nullptr);
 }
@@ -4255,6 +4647,19 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         GGML_LOG_ERROR("ggml_opencl elastic: wbmcl_init 失败\n");
         return;
     }
+    // The OpenCL elastic state is process-global while the stage workers are
+    // joinable. Register worker shutdown before the later timing/granularity
+    // dump handlers so those reports run first and static mutexes are never
+    // destroyed under a live worker at process exit.
+    std::atexit([]() {
+        auto * state = ggml_opencl_elastic();
+        elastic::wbmcl_stop_async_workers(&state->octx);
+        if (state->cut_compute_queue) {
+            clFinish(state->cut_compute_queue);
+            clReleaseCommandQueue(state->cut_compute_queue);
+            state->cut_compute_queue = nullptr;
+        }
+    });
     s->octx.device_timing = device_timing_env;
     if (device_timing_env) {
         GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_DEVICE_TIMING=1 (staged OpenCL event profiling)\n");
@@ -4386,6 +4791,145 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
         }
     }
     s->wbm_inited = true;
+    s->granularity = elastic::granularity_from_env();
+    if (const char * unit_sync = std::getenv("GGML_ELASTIC_GPU_UNIT_SYNC")) {
+        if (std::strcmp(unit_sync, "none") == 0) {
+            s->granularity_unit_sync =
+                ggml_opencl_elastic_state::unit_sync_mode::NONE;
+        } else if (std::strcmp(unit_sync, "flush") == 0) {
+            s->granularity_unit_sync =
+                ggml_opencl_elastic_state::unit_sync_mode::FLUSH;
+        } else if (std::strcmp(unit_sync, "finish") == 0) {
+            s->granularity_unit_sync =
+                ggml_opencl_elastic_state::unit_sync_mode::FINISH;
+        } else {
+            GGML_LOG_WARN(
+                "ggml_opencl elastic: invalid GGML_ELASTIC_GPU_UNIT_SYNC=%s; "
+                "using flush\n", unit_sync);
+        }
+    }
+    if (s->granularity.mode == elastic::granularity_mode::MULTI_FUSED) {
+        GGML_LOG_WARN(
+            "ggml_opencl elastic: multi_fused is not implemented for OpenCL; "
+            "falling back explicitly to multi (no fused layout/kernel)\n");
+        s->granularity.mode = elastic::granularity_mode::MULTI;
+    }
+    if (s->granularity.explicitly_enabled) {
+        GGML_LOG_INFO("ggml_opencl elastic: working-unit granularity=%s cut_parts=%d multi_tensors=%d\n",
+                      elastic::granularity_mode_name(s->granularity.mode),
+                      s->granularity.cut_parts, s->granularity.multi_tensors);
+        const char * unit_sync_name =
+            s->granularity_unit_sync ==
+                    ggml_opencl_elastic_state::unit_sync_mode::FINISH
+                ? "finish"
+                : s->granularity_unit_sync ==
+                          ggml_opencl_elastic_state::unit_sync_mode::FLUSH
+                      ? "flush"
+                      : "none";
+        GGML_LOG_INFO(
+            "ggml_opencl elastic: nonblocking unit completion mode=%s\n",
+            unit_sync_name);
+        std::atexit([]() {
+            auto *st = ggml_opencl_elastic();
+            std::fprintf(stderr,
+                         "[elastic granularity] backend=opencl mode=%s units=%llu cut_ops=%llu "
+                         "fallback=%llu peak_unit=%.2f MiB cut_tensors=%zu cut_parts=%zu wbm_total=%.2f MiB\n",
+                         elastic::granularity_mode_name(st->granularity.mode),
+                         (unsigned long long) st->granularity_units,
+                         (unsigned long long) st->granularity_cut_ops,
+                         (unsigned long long) st->granularity_fallback_ops,
+                         st->granularity_peak_unit_bytes / 1024.0 / 1024.0,
+                         st->granularity_cut_tensors, st->granularity_cut_parts,
+                         elastic::wbm_total_bytes(&st->wbm) / 1024.0 / 1024.0);
+            const char * unit_sync_name =
+                st->granularity_unit_sync ==
+                        ggml_opencl_elastic_state::unit_sync_mode::FINISH
+                    ? "finish"
+                    : st->granularity_unit_sync ==
+                              ggml_opencl_elastic_state::unit_sync_mode::FLUSH
+                          ? "flush"
+                          : "none";
+            std::fprintf(
+                stderr,
+                "[elastic granularity sync] backend=opencl mode=%s "
+                "boundaries=%llu flushes=%llu finishes=%llu errors=%llu\n",
+                unit_sync_name,
+                (unsigned long long) st->granularity_unit_boundaries,
+                (unsigned long long) st->granularity_unit_flushes,
+                (unsigned long long) st->granularity_unit_finishes,
+                (unsigned long long) st->granularity_unit_sync_errors);
+            std::fprintf(
+                stderr,
+                "[elastic cut dual] enabled=%d candidates=%llu calls=%llu "
+                "budget_fallbacks=%llu shape_fallbacks=%llu queue_errors=%llu "
+                "image_creates=%llu image_cache_hits=%llu "
+                "image_releases=%llu image_errors=%llu\n",
+                []() {
+                    const char * e =
+                        std::getenv("GGML_ELASTIC_CUT_DUAL_COMPUTE");
+                    return e && *e && *e != '0';
+                }() ? 1 : 0,
+                (unsigned long long) st->cut_dual_candidates,
+                (unsigned long long) st->cut_dual_calls,
+                (unsigned long long) st->cut_dual_budget_fallbacks,
+                (unsigned long long) st->cut_dual_shape_fallbacks,
+                (unsigned long long) st->cut_dual_queue_errors,
+                (unsigned long long) st->cut_dual_image_creates,
+                (unsigned long long) st->cut_dual_image_cache_hits,
+                (unsigned long long) st->cut_dual_image_releases,
+                (unsigned long long) st->cut_dual_image_errors);
+        });
+        static const bool unit_pipeline_enabled = []() {
+            const char * e = std::getenv("GGML_ELASTIC_UNIT_PIPELINE");
+            return e && *e && *e != '0';
+        }();
+        if (unit_pipeline_enabled) {
+            GGML_LOG_INFO("ggml_opencl elastic: granularity-aware unit pipeline enabled\n");
+            std::atexit([]() {
+                auto * st = ggml_opencl_elastic();
+                std::fprintf(stderr,
+                    "[elastic unit pipeline] backend=opencl issued=%llu ready=%llu waits=%llu wait_ms=%.3f\n",
+                    (unsigned long long) st->unit_pipeline_issued,
+                    (unsigned long long) st->unit_pipeline_ready,
+                    (unsigned long long) st->unit_pipeline_waits,
+                    st->unit_pipeline_wait_us / 1000.0);
+                std::fprintf(stderr,
+                    "[elastic unit pipeline window] samples=%llu avg_units=%.2f max_units=%zu "
+                    "avg_mib=%.2f max_mib=%.2f oversize=%llu\n",
+                    (unsigned long long) st->unit_pipeline_window_samples,
+                    st->unit_pipeline_window_samples
+                        ? (double) st->unit_pipeline_window_units_total /
+                            st->unit_pipeline_window_samples : 0.0,
+                    st->unit_pipeline_window_units_max,
+                    st->unit_pipeline_window_samples
+                        ? (double) st->unit_pipeline_window_bytes_total /
+                            st->unit_pipeline_window_samples / 1024.0 / 1024.0 : 0.0,
+                    st->unit_pipeline_window_bytes_max / 1024.0 / 1024.0,
+                    (unsigned long long) st->unit_pipeline_oversize_windows);
+                std::fprintf(stderr,
+                    "[elastic unit pipeline cross-graph] issued=%llu ready=%llu waits=%llu "
+                    "staged_mib=%.2f transitions=%zu\n",
+                    (unsigned long long) st->unit_pipeline_cross_issued,
+                    (unsigned long long) st->unit_pipeline_cross_ready,
+                    (unsigned long long) st->unit_pipeline_cross_waits,
+                    st->unit_pipeline_cross_bytes / 1024.0 / 1024.0,
+                    st->unit_pipeline_successors.size());
+                std::fprintf(stderr,
+                    "[elastic unit pipeline budget] samples=%llu violations=%llu "
+                    "plan_protection_relaxations=%llu relaxed_mib=%.2f "
+                    "resident_peak_mib=%.2f pinned_peak_mib=%.2f over_peak_mib=%.2f\n",
+                    (unsigned long long) st->unit_pipeline_budget_samples,
+                    (unsigned long long) st->unit_pipeline_budget_violations,
+                    (unsigned long long)
+                        st->unit_pipeline_plan_protection_relaxations,
+                    st->unit_pipeline_plan_protection_relaxed_bytes /
+                        1024.0 / 1024.0,
+                    st->unit_pipeline_resident_bytes_peak / 1024.0 / 1024.0,
+                    st->unit_pipeline_pinned_bytes_peak / 1024.0 / 1024.0,
+                    st->unit_pipeline_over_budget_bytes_peak / 1024.0 / 1024.0);
+            });
+        }
+    }
     s->profile_csv = elastic::profile_enabled();
     if (s->profile_csv) {
         GGML_LOG_INFO("ggml_opencl elastic: GGML_ELASTIC_PROFILE_CSV enabled\n");
@@ -4515,6 +5059,11 @@ static void ggml_opencl_elastic_lazy_init(cl_context cl_ctx, cl_command_queue qu
                              (unsigned long long) st->moe_cache_grow_resizes,
                              st->moe_cache_grow_copy_bytes / 1024.0 / 1024.0);
                 std::fprintf(stderr,
+                             "moe packed bypass: stage_skips=%llu parent_evictions=%llu evicted=%.1fMB\n",
+                             (unsigned long long) st->moe_packed_stage_skips,
+                             (unsigned long long) st->moe_packed_parent_evictions,
+                             st->moe_packed_parent_evicted_bytes / 1024.0 / 1024.0);
+                std::fprintf(stderr,
                              "moe prefetch: issued=%llu completed=%llu used=%llu skipped_hit=%llu skipped_cap=%llu wait=%.2fms pending=%zu buffers=%zu alloc=%llu reuse=%llu\n",
                              (unsigned long long) st->moe_prefetch_issued,
                              (unsigned long long) st->moe_prefetch_completed,
@@ -4627,7 +5176,37 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     auto *est = ggml_opencl_elastic();
     const bool elastic_active = est->wbm_inited;
     if (elastic_active) {
+        elastic::granularity_config planned_granularity =
+            elastic::granularity_from_env();
+        if (planned_granularity.mode ==
+            elastic::granularity_mode::MULTI_FUSED) {
+            // The GPU implementation currently exposes ordinary Multi as its
+            // coarsest unit; CPU-only fused layout/kernel is not mislabeled.
+            planned_granularity.mode =
+                elastic::granularity_mode::MULTI;
+        }
+        if (planned_granularity.explicitly_enabled &&
+            (planned_granularity.mode != est->granularity.mode ||
+             planned_granularity.cut_parts !=
+                 est->granularity.cut_parts ||
+             planned_granularity.multi_tensors !=
+                 est->granularity.multi_tensors)) {
+            GGML_LOG_INFO(
+                "ggml_opencl elastic: working-unit plan switch %s -> %s "
+                "cut_parts=%d multi_tensors=%d\n",
+                elastic::granularity_mode_name(est->granularity.mode),
+                elastic::granularity_mode_name(
+                    planned_granularity.mode),
+                planned_granularity.cut_parts,
+                planned_granularity.multi_tensors);
+            est->granularity = planned_granularity;
+        }
         est->current_token += 1;
+        // Replace packed Q4 MoE parents with the bounded expert-slice cache as
+        // one batch. Releasing them one layer at a time would overlap the full
+        // packed model with newly allocated slice caches for most of the first
+        // graph and recreate the transition memory spike this path avoids.
+        ggml_opencl_release_all_moe_q4_packed(est);
         // Auto cap：首次 graph_compute 时 wbm 已全部注册，按非 pinned tensor
         // 的最大 size × 2 算 pool cap（pool by size 设计下足够 1-2 个 in-flight
         // 同 size cl_mem）。
@@ -4760,7 +5339,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                     if (rc == 0 && bm && bm->resident) {
                         rc = 0;
                     } else {
-                        rc = cit->second.reload_fn();
+                        rc = elastic::wbmcl_reload_soa_sync(&est->octx, src_wbm_idx);
                     }
                 } else {
                     rc = elastic::wbmcl_ensure_resident(&est->octx, src_wbm_idx);
@@ -4816,38 +5395,1959 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         return true;
     };
 
+    const bool granularity_active = elastic_active &&
+        est->granularity.explicitly_enabled;
+    auto is_weight_matmul = [&](const ggml_tensor *n) -> bool {
+        return n && n->op == GGML_OP_MUL_MAT && n->src[0] &&
+               ggml_opencl_get_wbm_idx(n->src[0]) >= 0;
+    };
+    auto weight_bytes = [&](const ggml_tensor *n) -> size_t {
+        if (!is_weight_matmul(n)) return 0;
+        auto cut = est->q4_cut_parts.find(n->src[0]);
+        if (cut != est->q4_cut_parts.end()) {
+            size_t bytes = 0;
+            for (const auto & part : cut->second) {
+                bytes += part.byte_size;
+            }
+            return bytes;
+        }
+        const elastic::block_meta *bm = elastic::wbm_get(
+            &est->wbm, ggml_opencl_get_wbm_idx(n->src[0]));
+        return bm ? bm->byte_size : 0;
+    };
+    // Plan budgets are expressed in whole MiB while Q4 blocks and aligned
+    // OpenCL sub-buffers are discrete.  Permit only the sub-MiB rounding tail;
+    // this is deliberately far smaller than even one ordinary Tensor unit.
+    constexpr size_t weight_budget_alignment_slack = 64 * 1024;
+    auto force_evict_to_target = [&](size_t target) -> bool {
+        if (!est->bw_inited || est->wbm.resident_bytes <= target) return true;
+        // Preserve the logical plan whenever ordinary streaming blocks can
+        // satisfy the physical target. Only a second, explicitly audited pass
+        // may bypass the plan-aware victim selector. Pin and atomic
+        // eviction-group constraints remain authoritative in both passes.
+        int total_victims = 0;
+        auto evict_pass = [&](bool relax_plan_protection) -> int {
+            std::vector<int> victims;
+            auto * saved_victim_fn = est->wbm.victim_fn;
+            void * saved_victim_ud = est->wbm.victim_ud;
+            if (relax_plan_protection) {
+                est->wbm.victim_fn = nullptr;
+                est->wbm.victim_ud = nullptr;
+            }
+            const int count = elastic::wbm_evict_to_byte_budget(
+                &est->wbm, target, -1, &victims);
+            est->wbm.victim_fn = saved_victim_fn;
+            est->wbm.victim_ud = saved_victim_ud;
+            if (count <= 0) return 0;
+            total_victims += count;
+            const int released = elastic::wbmcl_evict_batch(
+                &est->octx, victims.data(), count);
+            size_t relaxed_plan_bytes = 0;
+            for (int v = 0; v < released && v < count; ++v) {
+                const std::string name =
+                    opencl_name_for_idx(est, victims[v]);
+                if (relax_plan_protection && !name.empty() &&
+                    llama_weight_runtime_desired_query(name.c_str()) ==
+                        LLAMA_WEIGHT_RUNTIME_GPU) {
+                    const elastic::block_meta * block =
+                        elastic::wbm_get(&est->wbm, victims[v]);
+                    if (block) {
+                        relaxed_plan_bytes += block->byte_size;
+                    }
+                }
+                if (!name.empty()) {
+                    llama_weight_runtime_mark_evicted(
+                        name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                }
+            }
+            if (relaxed_plan_bytes > 0) {
+                est->unit_pipeline_plan_protection_relaxations++;
+                est->unit_pipeline_plan_protection_relaxed_bytes +=
+                    relaxed_plan_bytes;
+            }
+            est->n_evicts_total += released > 0 ? released : 0;
+            return released;
+        };
+
+        // One plan-aware pass can select every movable streaming victim. If it
+        // is insufficient, the hard budget wins, but the fallback is visible
+        // to the experiment audit instead of silently changing residency.
+        evict_pass(false);
+        for (int attempt = 0;
+             attempt < 4 && est->wbm.resident_bytes > target;
+             ++attempt) {
+            if (evict_pass(true) <= 0) break;
+        }
+        if (est->wbm.resident_bytes > target) {
+            size_t pinned_bytes = 0;
+            for (const auto & block : est->wbm.blocks) {
+                if (block.resident && block.is_pinned) {
+                    pinned_bytes += block.byte_size;
+                }
+            }
+            std::fprintf(
+                stderr,
+                "[elastic mandatory reserve failed] target_mib=%.2f "
+                "resident_mib=%.2f pinned_mib=%.2f victims=%d\n",
+                target / 1024.0 / 1024.0,
+                est->wbm.resident_bytes / 1024.0 / 1024.0,
+                pinned_bytes / 1024.0 / 1024.0,
+                total_victims);
+            return false;
+        }
+        return true;
+    };
+    auto evict_to_current_budget = [&]() {
+        if (!est->bw_inited) return;
+        static const bool no_auto_evict = []() {
+            const char *e = std::getenv("GGML_ELASTIC_NO_AUTO_EVICT");
+            return e && *e && *e != '0';
+        }();
+        if (no_auto_evict) return;
+        size_t target = est->dynamic_target
+            ? (([&] {
+                  const size_t bt = elastic::budget_watcher_get(&est->bw) * size_t(1024 * 1024);
+                  const size_t km = est->kv_bytes + est->misc_overhead;
+                  return (bt > km ? bt - km : 0) + est->extra_target_bytes;
+              })())
+            : est->static_target_bytes;
+        if (ggml_opencl_moe_expert_cache_enabled()) {
+            target = target > est->moe_cache_bytes ? target - est->moe_cache_bytes : 0;
+        }
+        static const bool pool_counts_budget = []() {
+            const char *e = std::getenv("GGML_ELASTIC_CL_RETAIN_COUNTS_BUDGET");
+            return e && *e && *e != '0';
+        }();
+        if (pool_counts_budget && est->octx.cache_byte_limit > 0 &&
+            target > est->octx.cache_byte_limit) {
+            target -= est->octx.cache_byte_limit;
+        }
+        force_evict_to_target(target);
+    };
+    auto sample_pipeline_budget = [&]() {
+        if (!est->bw_inited) return;
+        size_t target = est->dynamic_target
+            ? (([&] {
+                  const size_t bt =
+                      elastic::budget_watcher_get(&est->bw) *
+                      size_t(1024 * 1024);
+                  const size_t km = est->kv_bytes + est->misc_overhead;
+                  return (bt > km ? bt - km : 0) +
+                      est->extra_target_bytes;
+              })())
+            : est->static_target_bytes;
+        if (ggml_opencl_moe_expert_cache_enabled()) {
+            target =
+                target > est->moe_cache_bytes
+                    ? target - est->moe_cache_bytes
+                    : 0;
+        }
+        const size_t aligned_target =
+            target <= SIZE_MAX - weight_budget_alignment_slack
+                ? target + weight_budget_alignment_slack
+                : SIZE_MAX;
+        // BudgetWatcher may cross a bucket while layout or a kernel is being
+        // queued.  Enforce against the same freshly sampled target immediately
+        // before recording the invariant, including plan-driven NO_AUTO mode.
+        if (aligned_target != SIZE_MAX) {
+            force_evict_to_target(aligned_target);
+        }
+        size_t pinned_resident_bytes = 0;
+        for (const auto & block : est->wbm.blocks) {
+            if (block.resident && block.is_pinned) {
+                pinned_resident_bytes += block.byte_size;
+            }
+        }
+        est->unit_pipeline_budget_samples++;
+        est->unit_pipeline_resident_bytes_peak = std::max(
+            est->unit_pipeline_resident_bytes_peak,
+            est->wbm.resident_bytes);
+        est->unit_pipeline_pinned_bytes_peak = std::max(
+            est->unit_pipeline_pinned_bytes_peak,
+            pinned_resident_bytes);
+        if (est->wbm.resident_bytes > aligned_target) {
+            est->unit_pipeline_budget_violations++;
+            est->unit_pipeline_over_budget_bytes_peak = std::max(
+                est->unit_pipeline_over_budget_bytes_peak,
+                est->wbm.resident_bytes - target);
+            if (est->unit_pipeline_budget_violations <= 4) {
+                std::fprintf(
+                    stderr,
+                    "[elastic unit pipeline budget debug] violation=%llu "
+                    "target_mib=%.2f resident_mib=%.2f pinned_mib=%.2f\n",
+                    (unsigned long long)
+                        est->unit_pipeline_budget_violations,
+                    target / 1024.0 / 1024.0,
+                    est->wbm.resident_bytes / 1024.0 / 1024.0,
+                    pinned_resident_bytes / 1024.0 / 1024.0);
+                for (const auto & block : est->wbm.blocks) {
+                    if (!block.resident || !block.is_pinned) continue;
+                    const std::string name =
+                        opencl_name_for_idx(est, block.block_idx);
+                    std::fprintf(
+                        stderr,
+                        "[elastic unit pipeline budget debug] pinned "
+                        "idx=%d mib=%.2f name=%s\n",
+                        block.block_idx,
+                        block.byte_size / 1024.0 / 1024.0,
+                        name.empty() ? "(unknown)" : name.c_str());
+                }
+            }
+        }
+    };
+
+    // Build the same real working units used by execution, then pipeline the
+    // next unit's LOAD/PREPARE while the current unit computes.  This is kept
+    // separate from the legacy node-distance prefetch: one lookahead means one
+    // Multi, Tensor, or Cut unit rather than one graph node.
+    static const bool unit_pipeline_enabled = []() {
+        const char * e = std::getenv("GGML_ELASTIC_UNIT_PIPELINE");
+        return e && *e && *e != '0';
+    }();
+    static const int unit_pipeline_lookahead = []() {
+        const char * e = std::getenv("GGML_ELASTIC_UNIT_PIPELINE_LOOKAHEAD");
+        return e && *e ? std::max(1, std::atoi(e)) : 1;
+    }();
+    static const size_t unit_pipeline_lookahead_bytes = []() {
+        const char * e = std::getenv("GGML_ELASTIC_UNIT_PIPELINE_LOOKAHEAD_MB");
+        const long long mib = e && *e ? std::atoll(e) : 0;
+        return mib > 0 ? static_cast<size_t>(mib) * 1024ULL * 1024ULL : 0;
+    }();
+    static const size_t unit_pipeline_graph_lookahead = []() {
+        const char * e = std::getenv("GGML_ELASTIC_UNIT_PIPELINE_GRAPH_LOOKAHEAD");
+            const long long graphs = e && *e ? std::atoll(e) : 1;
+        // Zero retains the current-graph unit pipeline while disabling
+        // speculative successor-graph staging.  Fine-grained Cut units can
+        // use this to avoid cross-graph budget churn.
+        return static_cast<size_t>(std::max<long long>(0, graphs));
+    }();
+    struct opencl_mixed_weight_binding {
+        bool planned = false;
+        bool fine_cut = false;
+        std::vector<int> part_unit_ids;
+        uint32_t flags = 0;
+    };
+    std::unordered_map<const ggml_tensor *, opencl_mixed_weight_binding>
+        mixed_weight_bindings;
+    auto mixed_binding_for_weight =
+        [&](const ggml_tensor * weight)
+            -> const opencl_mixed_weight_binding & {
+        auto cached = mixed_weight_bindings.find(weight);
+        if (cached != mixed_weight_bindings.end()) {
+            return cached->second;
+        }
+        opencl_mixed_weight_binding binding;
+        if (!weight || !weight->name[0]) {
+            return mixed_weight_bindings.emplace(
+                weight, std::move(binding)).first->second;
+        }
+        const int count =
+            llama_weight_unit_plan_query(weight->name, nullptr, 0);
+        std::vector<llama_weight_unit_slice> slices;
+        if (count > 0) {
+            slices.resize(static_cast<size_t>(count));
+            const int copied = llama_weight_unit_plan_query(
+                weight->name, slices.data(), count);
+            if (copied < count) {
+                slices.resize(static_cast<size_t>(
+                    std::max(0, copied)));
+            }
+        }
+        auto cuts = est->q4_cut_parts.find(weight);
+        if (!slices.empty() && cuts != est->q4_cut_parts.end()) {
+            for (const auto & part : cuts->second) {
+                const llama_weight_unit_slice * selected = nullptr;
+                for (const auto & slice : slices) {
+                    if (slice.row_start == part.row_start &&
+                        slice.row_count == part.row_count) {
+                        selected = &slice;
+                        break;
+                    }
+                }
+                if (!selected) {
+                    for (const auto & slice : slices) {
+                        if (slice.row_start == 0 &&
+                            slice.row_count < 0) {
+                            selected = &slice;
+                            break;
+                        }
+                    }
+                }
+                if (!selected) {
+                    binding.part_unit_ids.clear();
+                    break;
+                }
+                binding.part_unit_ids.push_back(selected->unit_id);
+                binding.flags |= selected->flags;
+            }
+        } else if (!slices.empty()) {
+            const llama_weight_unit_slice * selected = nullptr;
+            for (const auto & slice : slices) {
+                if (slice.row_start == 0 &&
+                    slice.row_count < 0) {
+                    selected = &slice;
+                    break;
+                }
+            }
+            if (!selected && slices.size() == 1) {
+                selected = &slices.front();
+            }
+            if (selected) {
+                binding.part_unit_ids.push_back(selected->unit_id);
+                binding.flags = selected->flags;
+            }
+        }
+        binding.planned = !binding.part_unit_ids.empty();
+        if (binding.planned && binding.part_unit_ids.size() > 1) {
+            binding.fine_cut = std::any_of(
+                binding.part_unit_ids.begin() + 1,
+                binding.part_unit_ids.end(),
+                [&](int unit_id) {
+                    return unit_id != binding.part_unit_ids.front();
+                });
+        }
+        return mixed_weight_bindings.emplace(
+            weight, std::move(binding)).first->second;
+    };
+
+    std::vector<std::vector<int>> pipeline_units;
+    std::vector<int64_t> pipeline_group_ids;
+    std::unordered_map<int, size_t> pipeline_pos_by_wbm;
+    std::unordered_map<const ggml_tensor *, size_t>
+        mixed_pipeline_pos_by_weight;
+    std::vector<std::vector<ggml_tensor *>>
+        mixed_nodes_by_pipeline_pos;
+    if (granularity_active) {
+        std::vector<int> building;
+        std::unordered_set<int> building_seen;
+        auto append_pipeline_unit = [&](
+                std::vector<int> indices,
+                int64_t planned_group_id = -1) {
+            std::vector<int> unique;
+            std::unordered_set<int> seen;
+            for (int idx : indices) {
+                if (idx >= 0 && seen.insert(idx).second) unique.push_back(idx);
+            }
+            if (unique.empty()) return;
+            const size_t pos = pipeline_units.size();
+            const int fallback_idx = *std::min_element(
+                unique.begin(), unique.end());
+            pipeline_units.push_back(std::move(unique));
+            pipeline_group_ids.push_back(
+                planned_group_id >= 0
+                    ? planned_group_id
+                    : ((INT64_C(1) << 50) +
+                       static_cast<int64_t>(
+                           std::max(0, fallback_idx))));
+            for (int idx : pipeline_units.back()) pipeline_pos_by_wbm[idx] = pos;
+        };
+        auto flush_multi = [&]() {
+            if (!building.empty()) append_pipeline_unit(std::move(building));
+            building.clear();
+            building_seen.clear();
+        };
+
+        std::unordered_map<int, size_t> mixed_pos_by_unit_id;
+        auto append_mixed_index = [&](int unit_id, int idx) {
+            if (idx < 0 || unit_id < 0) return SIZE_MAX;
+            auto found = mixed_pos_by_unit_id.find(unit_id);
+            if (found == mixed_pos_by_unit_id.end()) {
+                const size_t pos = pipeline_units.size();
+                pipeline_units.push_back({});
+                pipeline_group_ids.push_back(
+                    static_cast<int64_t>(unit_id));
+                mixed_nodes_by_pipeline_pos.resize(
+                    pipeline_units.size());
+                mixed_pos_by_unit_id[unit_id] = pos;
+                found = mixed_pos_by_unit_id.find(unit_id);
+            }
+            const size_t pos = found->second;
+            auto & indices = pipeline_units[pos];
+            if (std::find(indices.begin(), indices.end(), idx) ==
+                indices.end()) {
+                indices.push_back(idx);
+            }
+            pipeline_pos_by_wbm[idx] = pos;
+            return pos;
+        };
+
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (!node || node->op != GGML_OP_MUL_MAT || !node->src[0]) continue;
+            auto cut = est->q4_cut_parts.find(node->src[0]);
+            const auto & mixed =
+                mixed_binding_for_weight(node->src[0]);
+            if (mixed.planned) {
+                flush_multi();
+                size_t coarse_pos = SIZE_MAX;
+                if (cut != est->q4_cut_parts.end()) {
+                    for (size_t part = 0;
+                         part < cut->second.size() &&
+                         part < mixed.part_unit_ids.size(); ++part) {
+                        const size_t pos = append_mixed_index(
+                            mixed.part_unit_ids[part],
+                            cut->second[part].wbm_idx);
+                        if (!mixed.fine_cut) coarse_pos = pos;
+                    }
+                } else {
+                    coarse_pos = append_mixed_index(
+                        mixed.part_unit_ids.front(),
+                        ggml_opencl_get_wbm_idx(node->src[0]));
+                }
+                if (!mixed.fine_cut && coarse_pos != SIZE_MAX) {
+                    mixed_pipeline_pos_by_weight[node->src[0]] =
+                        coarse_pos;
+                    auto & nodes =
+                        mixed_nodes_by_pipeline_pos[coarse_pos];
+                    if (std::find(nodes.begin(), nodes.end(), node) ==
+                        nodes.end()) {
+                        nodes.push_back(node);
+                    }
+                }
+                continue;
+            }
+            if (!unit_pipeline_enabled) continue;
+            if (cut != est->q4_cut_parts.end()) {
+                if (est->granularity.mode ==
+                    elastic::granularity_mode::CUT) {
+                    for (const auto & part : cut->second) {
+                        append_pipeline_unit({part.wbm_idx});
+                    }
+                    continue;
+                }
+            }
+            std::vector<int> logical_indices;
+            if (cut != est->q4_cut_parts.end()) {
+                for (const auto & part : cut->second) {
+                    logical_indices.push_back(part.wbm_idx);
+                }
+            } else {
+                const int idx =
+                    ggml_opencl_get_wbm_idx(node->src[0]);
+                if (idx >= 0) logical_indices.push_back(idx);
+            }
+            if (logical_indices.empty()) continue;
+            if (est->granularity.mode == elastic::granularity_mode::MULTI ||
+                est->granularity.mode == elastic::granularity_mode::MULTI_FUSED) {
+                const int logical_key = logical_indices.front();
+                if (building_seen.insert(logical_key).second) {
+                    building.insert(
+                        building.end(), logical_indices.begin(),
+                        logical_indices.end());
+                }
+                if ((int) building_seen.size() >=
+                    est->granularity.multi_tensors) {
+                    flush_multi();
+                }
+            } else {
+                append_pipeline_unit(std::move(logical_indices));
+            }
+        }
+        flush_multi();
+        if (mixed_nodes_by_pipeline_pos.size() <
+            pipeline_units.size()) {
+            mixed_nodes_by_pipeline_pos.resize(
+                pipeline_units.size());
+        }
+
+        // Physical row tiles are provisioned once so an online plan can
+        // split/merge without reallocating OpenCL objects.  Make residency
+        // follow the current logical units: WBM evicts every non-pinned tile
+        // in a Tensor/Multi unit atomically, whereas Cut's one-tile units can
+        // be evicted independently.
+        const uint64_t grouping_generation =
+            llama_weight_unit_plan_generation();
+        if (est->eviction_group_generation != grouping_generation) {
+            elastic::wbm_clear_eviction_groups(&est->wbm);
+            est->eviction_group_generation = grouping_generation;
+        }
+        for (size_t unit = 0; unit < pipeline_units.size(); ++unit) {
+            const int64_t group_id =
+                unit < pipeline_group_ids.size()
+                    ? pipeline_group_ids[unit]
+                    : ((INT64_C(1) << 50) +
+                       static_cast<int64_t>(unit));
+            for (int idx : pipeline_units[unit]) {
+                const elastic::block_meta * block =
+                    elastic::wbm_get(&est->wbm, idx);
+                if (block && !block->is_pinned) {
+                    elastic::wbm_set_eviction_group(
+                        &est->wbm, idx, group_id);
+                }
+            }
+        }
+    }
+
+    std::vector<bool> pipeline_issued(pipeline_units.size(), false);
+    std::vector<bool> pipeline_begun(pipeline_units.size(), false);
+    uint64_t pipeline_graph_signature = 1469598103934665603ULL;
+    auto pipeline_signature_mix = [&](uint64_t value) {
+        pipeline_graph_signature ^= value;
+        pipeline_graph_signature *= 1099511628211ULL;
+    };
+    pipeline_signature_mix(static_cast<uint64_t>(cgraph->n_nodes));
+    pipeline_signature_mix(static_cast<uint64_t>(pipeline_units.size()));
+    for (const auto & unit : pipeline_units) {
+        pipeline_signature_mix(static_cast<uint64_t>(unit.size()));
+        for (int idx : unit) {
+            pipeline_signature_mix(static_cast<uint64_t>(idx + 1));
+        }
+    }
+    if (granularity_active && unit_pipeline_enabled && !pipeline_units.empty()) {
+        if (est->unit_pipeline_previous_graph_valid) {
+            opencl_pipeline_successor successor;
+            successor.signature = pipeline_graph_signature;
+            successor.units = pipeline_units;
+            est->unit_pipeline_successors[
+                est->unit_pipeline_previous_graph_signature] =
+                    std::move(successor);
+        }
+        est->unit_pipeline_previous_graph_signature =
+            pipeline_graph_signature;
+        est->unit_pipeline_previous_graph_valid = true;
+    }
+
+    // A future unit remains protected until its consumer has made it resident.
+    // Otherwise periodic budget enforcement can evict a just-prepared unit and
+    // turn pipeline work into extra reload churn.
+    std::unordered_map<int, opencl_pipeline_pin_state> pipeline_pins;
+    auto acquire_pipeline_pins = [&](const std::vector<int> & indices) {
+        for (int idx : indices) {
+            const elastic::block_meta * bm =
+                elastic::wbm_get(&est->wbm, idx);
+            if (!bm) continue;
+            auto & pin = pipeline_pins[idx];
+            if (pin.refs == 0) pin.original = bm->is_pinned;
+            pin.refs++;
+            elastic::wbm_set_pinned(&est->wbm, idx, true);
+        }
+    };
+    auto release_pipeline_pins = [&](const std::vector<int> & indices) {
+        for (int idx : indices) {
+            auto pin = pipeline_pins.find(idx);
+            if (pin == pipeline_pins.end() || pin->second.refs == 0) continue;
+            if (--pin->second.refs == 0) {
+                elastic::wbm_set_pinned(
+                    &est->wbm, idx, pin->second.original);
+                pipeline_pins.erase(pin);
+            }
+        }
+    };
+
+    // Adopt the exact prefix prepared by the preceding backend graph.
+    bool incoming_cross_match =
+        !pipeline_units.empty() &&
+        !est->unit_pipeline_cross_graphs.empty() &&
+        est->unit_pipeline_cross_graphs.front().signature ==
+            pipeline_graph_signature &&
+        est->unit_pipeline_cross_graphs.front().units.size() <=
+            pipeline_units.size();
+    if (incoming_cross_match) {
+        const auto & incoming = est->unit_pipeline_cross_graphs.front();
+        for (size_t i = 0; i < incoming.units.size(); ++i) {
+            if (incoming.units[i] != pipeline_units[i]) {
+                incoming_cross_match = false;
+                break;
+            }
+        }
+    }
+    if (incoming_cross_match) {
+        opencl_pipeline_successor incoming =
+            std::move(est->unit_pipeline_cross_graphs.front());
+        est->unit_pipeline_cross_graphs.pop_front();
+        std::unordered_map<int, size_t> transferred_refs;
+        for (const auto & unit : incoming.units) {
+            for (int idx : unit) transferred_refs[idx]++;
+        }
+        std::unordered_map<int, bool> local_original;
+        for (const auto & transfer : transferred_refs) {
+            auto cross =
+                est->unit_pipeline_cross_pins.find(transfer.first);
+            if (cross == est->unit_pipeline_cross_pins.end()) {
+                local_original[transfer.first] = false;
+                continue;
+            }
+            const size_t moved =
+                std::min(cross->second.refs, transfer.second);
+            cross->second.refs -= moved;
+            if (cross->second.refs > 0) {
+                // A later prefetched graph still owns the WBM pin.
+                local_original[transfer.first] = true;
+            } else {
+                local_original[transfer.first] = cross->second.original;
+                est->unit_pipeline_cross_pins.erase(cross);
+            }
+        }
+        bool all_ready = true;
+        for (size_t i = 0; i < incoming.units.size(); ++i) {
+            pipeline_issued[i] = true;
+            for (int idx : pipeline_units[i]) {
+                const elastic::block_meta * bm =
+                    elastic::wbm_get(&est->wbm, idx);
+                if (bm && !bm->resident) all_ready = false;
+                auto & pin = pipeline_pins[idx];
+                if (pin.refs == 0) {
+                    auto original = local_original.find(idx);
+                    pin.original =
+                        original != local_original.end()
+                            ? original->second
+                            : false;
+                }
+                pin.refs++;
+                elastic::wbm_set_pinned(&est->wbm, idx, true);
+            }
+        }
+        if (all_ready) est->unit_pipeline_cross_ready++;
+        else est->unit_pipeline_cross_waits++;
+    } else if (!est->unit_pipeline_cross_graphs.empty() ||
+               !est->unit_pipeline_cross_pins.empty()) {
+        for (const auto & pin : est->unit_pipeline_cross_pins) {
+            elastic::wbm_set_pinned(
+                &est->wbm, pin.first, pin.second.original);
+        }
+        est->unit_pipeline_cross_graphs.clear();
+        est->unit_pipeline_cross_pins.clear();
+    }
+
+    auto pipeline_now_us = []() -> uint64_t {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    struct pipeline_observation {
+        size_t pos = 0;
+        bool valid = false;
+        bool missing_before = false;
+        uint64_t t0_us = 0;
+    };
+    auto pipeline_begin = [&](int wbm_idx) {
+        pipeline_observation obs;
+        auto found = pipeline_pos_by_wbm.find(wbm_idx);
+        if (found == pipeline_pos_by_wbm.end()) return obs;
+        obs.pos = found->second;
+        if (pipeline_begun[obs.pos]) return obs;
+        pipeline_begun[obs.pos] = true;
+        obs.valid = true;
+        for (int idx : pipeline_units[obs.pos]) {
+            const elastic::block_meta * bm =
+                elastic::wbm_get(&est->wbm, idx);
+            if (bm && !bm->resident) {
+                obs.missing_before = true;
+                break;
+            }
+        }
+        if (obs.missing_before) {
+            est->unit_pipeline_current_missing_units++;
+        }
+        if (pipeline_issued[obs.pos]) {
+            obs.t0_us = pipeline_now_us();
+        }
+        return obs;
+    };
+    auto pipeline_finish_observation = [&](const pipeline_observation & obs) {
+        if (!obs.valid || !pipeline_issued[obs.pos]) return;
+        if (obs.missing_before) {
+            est->unit_pipeline_waits++;
+            est->unit_pipeline_wait_us += pipeline_now_us() - obs.t0_us;
+        } else {
+            est->unit_pipeline_ready++;
+        }
+    };
+    std::deque<opencl_pipeline_successor> pending_cross_graphs;
+    std::unordered_map<int, size_t> pending_cross_pin_refs;
+    auto stage_pipeline_after = [&](size_t current_pos,
+                                    const std::vector<int> & current_indices) {
+        if (current_pos >= pipeline_units.size()) return;
+        std::vector<int> future_indices;
+        std::vector<size_t> selected_unit_positions;
+        std::unordered_set<int> future_seen;
+        size_t missing_bytes = 0;
+        size_t window_bytes = 0;
+        size_t selected_units = 0;
+        const size_t future_end = unit_pipeline_lookahead_bytes > 0
+            ? pipeline_units.size()
+            : std::min(pipeline_units.size(),
+                       current_pos + 1 + (size_t) unit_pipeline_lookahead);
+        for (size_t future = current_pos + 1; future < future_end; ++future) {
+            size_t added_window_bytes = 0;
+            for (int idx : pipeline_units[future]) {
+                if (future_seen.find(idx) != future_seen.end()) continue;
+                const elastic::block_meta * bm = elastic::wbm_get(&est->wbm, idx);
+                // The window bounds protected working-set bytes, not only
+                // incremental allocation.  Counting an already-resident
+                // future tensor as zero while pinning it can protect far more
+                // than the advertised cap and block budget enforcement.
+                if (bm) added_window_bytes += bm->byte_size;
+            }
+            if (unit_pipeline_lookahead_bytes > 0 &&
+                window_bytes + added_window_bytes > unit_pipeline_lookahead_bytes) {
+                if (selected_units == 0) est->unit_pipeline_oversize_windows++;
+                break;
+            }
+            if (!pipeline_issued[future]) {
+                pipeline_issued[future] = true;
+                est->unit_pipeline_issued++;
+                acquire_pipeline_pins(pipeline_units[future]);
+            }
+            selected_units++;
+            selected_unit_positions.push_back(future);
+            for (int idx : pipeline_units[future]) {
+                if (!future_seen.insert(idx).second) continue;
+                future_indices.push_back(idx);
+                const elastic::block_meta * bm = elastic::wbm_get(&est->wbm, idx);
+                if (bm) {
+                    window_bytes += bm->byte_size;
+                    if (!bm->resident) {
+                        missing_bytes += bm->byte_size;
+                    }
+                }
+            }
+        }
+        est->unit_pipeline_window_samples++;
+        est->unit_pipeline_window_units_total += selected_units;
+        est->unit_pipeline_window_units_max = std::max(
+            est->unit_pipeline_window_units_max, selected_units);
+        est->unit_pipeline_window_bytes_total += window_bytes;
+        est->unit_pipeline_window_bytes_max = std::max(
+            est->unit_pipeline_window_bytes_max, window_bytes);
+        bool can_prepare = true;
+        if (!future_indices.empty() && est->bw_inited && missing_bytes > 0) {
+            size_t target = est->dynamic_target
+                ? (([&] {
+                      const size_t bt = elastic::budget_watcher_get(&est->bw) * size_t(1024 * 1024);
+                      const size_t km = est->kv_bytes + est->misc_overhead;
+                      return (bt > km ? bt - km : 0) + est->extra_target_bytes;
+                  })())
+                : est->static_target_bytes;
+            if (ggml_opencl_moe_expert_cache_enabled()) {
+                target = target > est->moe_cache_bytes ? target - est->moe_cache_bytes : 0;
+            }
+            const size_t reserve_target = target > missing_bytes ? target - missing_bytes : 0;
+            std::vector<std::pair<int, bool>> pins;
+            std::unordered_set<int> protected_seen;
+            for (int idx : current_indices) protected_seen.insert(idx);
+            for (int idx : future_indices) protected_seen.insert(idx);
+            pins.reserve(protected_seen.size());
+            for (int idx : protected_seen) {
+                const elastic::block_meta * bm = elastic::wbm_get(&est->wbm, idx);
+                if (!bm) continue;
+                pins.push_back({idx, bm->is_pinned});
+                elastic::wbm_set_pinned(&est->wbm, idx, true);
+            }
+            if (est->wbm.resident_bytes > reserve_target) {
+                std::vector<int> victims;
+                const int count = elastic::wbm_evict_to_byte_budget(
+                    &est->wbm, reserve_target, -1, &victims);
+                if (count > 0) {
+                    const int released = elastic::wbmcl_evict_batch(
+                        &est->octx, victims.data(), count);
+                    for (int v = 0; v < released && v < count; ++v) {
+                        const std::string name = opencl_name_for_idx(est, victims[v]);
+                        if (!name.empty()) {
+                            llama_weight_runtime_mark_evicted(
+                                name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                        }
+                    }
+                    est->n_evicts_total += released > 0 ? released : 0;
+                }
+            }
+            can_prepare = est->wbm.resident_bytes <= reserve_target;
+            for (const auto & pin : pins) {
+                elastic::wbm_set_pinned(&est->wbm, pin.first, pin.second);
+            }
+        }
+
+        for (size_t future : selected_unit_positions) {
+            const auto & unit = pipeline_units[future];
+            elastic::wbmcl_load_host_async_unit(
+                &est->octx, unit.data(), unit.size());
+            if (can_prepare) {
+                elastic::wbmcl_prepare_backend_unit(
+                    &est->octx, unit.data(), unit.size());
+            }
+        }
+
+        // Fill the remainder of the same byte window with a learned successor
+        // graph prefix.  The first observation only learns the transition;
+        // later decode iterations can overlap the next graph's first unit.
+        if (!pending_cross_graphs.empty() ||
+            !est->unit_pipeline_cross_graphs.empty()) {
+            return;
+        }
+        std::unordered_set<int> cross_seen = future_seen;
+        std::unordered_set<uint64_t> seen_graphs;
+        size_t cross_missing_bytes = 0;
+        size_t cross_window_bytes = 0;
+        size_t cross_selected_units = 0;
+        uint64_t cursor = pipeline_graph_signature;
+        bool window_full = false;
+        for (size_t hop = 0;
+             hop < unit_pipeline_graph_lookahead && !window_full; ++hop) {
+            if (!seen_graphs.insert(cursor).second) break;
+            auto successor_it = est->unit_pipeline_successors.find(cursor);
+            if (successor_it == est->unit_pipeline_successors.end()) break;
+            const opencl_pipeline_successor & successor =
+                successor_it->second;
+            opencl_pipeline_successor staged_graph;
+            staged_graph.signature = successor.signature;
+            size_t graph_new_indices = 0;
+            size_t graph_selected_units = 0;
+            std::unordered_map<int, size_t> graph_pin_refs;
+            for (const auto & unit : successor.units) {
+                if (unit_pipeline_lookahead_bytes == 0 &&
+                    selected_units + cross_selected_units +
+                            graph_selected_units >=
+                        static_cast<size_t>(unit_pipeline_lookahead)) {
+                    window_full = true;
+                    break;
+                }
+                size_t added_window_bytes = 0;
+                for (int idx : unit) {
+                    if (cross_seen.find(idx) != cross_seen.end()) continue;
+                    const elastic::block_meta * bm =
+                        elastic::wbm_get(&est->wbm, idx);
+                    if (bm) added_window_bytes += bm->byte_size;
+                }
+                if (unit_pipeline_lookahead_bytes > 0 &&
+                    window_bytes + cross_window_bytes +
+                            added_window_bytes >
+                        unit_pipeline_lookahead_bytes) {
+                    window_full = true;
+                    break;
+                }
+                staged_graph.units.push_back(unit);
+                graph_selected_units++;
+                for (int idx : unit) {
+                    graph_pin_refs[idx]++;
+                    if (!cross_seen.insert(idx).second) continue;
+                    graph_new_indices++;
+                    const elastic::block_meta * bm =
+                        elastic::wbm_get(&est->wbm, idx);
+                    if (bm) cross_window_bytes += bm->byte_size;
+                    const bool already_local =
+                        pipeline_pins.find(idx) != pipeline_pins.end();
+                    if (bm && !bm->resident && !already_local) {
+                        cross_missing_bytes += bm->byte_size;
+                    }
+                }
+            }
+            // Different backend graph signatures can form a short cycle while
+            // referring to the same model weights.  Once one successor has
+            // covered every WBM index in the byte window, later signatures
+            // add zero bytes.  Previously those zero-byte graphs were still
+            // appended and every unit was prepared again (hundreds of
+            // redundant stages per token, plus pins for the whole model).
+            // A cross-graph lookahead must advance the materialized working
+            // set, not merely traverse a distinct graph signature.
+            if (staged_graph.units.empty() || graph_new_indices == 0) break;
+            for (const auto & pin_ref : graph_pin_refs) {
+                pending_cross_pin_refs[pin_ref.first] +=
+                    pin_ref.second;
+            }
+            cross_selected_units += graph_selected_units;
+            pending_cross_graphs.push_back(std::move(staged_graph));
+            if (window_full) break;
+            cursor = successor.signature;
+        }
+        if (pending_cross_graphs.empty()) return;
+
+        for (const auto & pin_ref : pending_cross_pin_refs) {
+            const elastic::block_meta * bm =
+                elastic::wbm_get(&est->wbm, pin_ref.first);
+            if (!bm) continue;
+            auto & pin = pipeline_pins[pin_ref.first];
+            if (pin.refs == 0) pin.original = bm->is_pinned;
+            pin.refs += pin_ref.second;
+            elastic::wbm_set_pinned(&est->wbm, pin_ref.first, true);
+        }
+
+        bool can_prepare_cross = true;
+        if (est->bw_inited && cross_missing_bytes > 0) {
+            size_t target = est->dynamic_target
+                ? (([&] {
+                      const size_t bt =
+                          elastic::budget_watcher_get(&est->bw) *
+                          size_t(1024 * 1024);
+                      const size_t km =
+                          est->kv_bytes + est->misc_overhead;
+                      return (bt > km ? bt - km : 0) +
+                          est->extra_target_bytes;
+                  })())
+                : est->static_target_bytes;
+            if (ggml_opencl_moe_expert_cache_enabled()) {
+                target =
+                    target > est->moe_cache_bytes
+                        ? target - est->moe_cache_bytes
+                        : 0;
+            }
+            const size_t total_missing =
+                missing_bytes + cross_missing_bytes;
+            const size_t reserve_target =
+                target > total_missing ? target - total_missing : 0;
+            std::vector<std::pair<int, bool>> temporary_pins;
+            temporary_pins.reserve(current_indices.size());
+            for (int idx : current_indices) {
+                const elastic::block_meta * bm =
+                    elastic::wbm_get(&est->wbm, idx);
+                if (!bm) continue;
+                temporary_pins.push_back({idx, bm->is_pinned});
+                elastic::wbm_set_pinned(&est->wbm, idx, true);
+            }
+            if (est->wbm.resident_bytes > reserve_target) {
+                std::vector<int> victims;
+                const int count = elastic::wbm_evict_to_byte_budget(
+                    &est->wbm, reserve_target, -1, &victims);
+                if (count > 0) {
+                    const int released = elastic::wbmcl_evict_batch(
+                        &est->octx, victims.data(), count);
+                    for (int v = 0; v < released && v < count; ++v) {
+                        const std::string name =
+                            opencl_name_for_idx(est, victims[v]);
+                        if (!name.empty()) {
+                            llama_weight_runtime_mark_evicted(
+                                name.c_str(), LLAMA_WEIGHT_RUNTIME_GPU);
+                        }
+                    }
+                    est->n_evicts_total += released > 0 ? released : 0;
+                }
+            }
+            can_prepare_cross =
+                est->wbm.resident_bytes <= reserve_target;
+            for (const auto & pin : temporary_pins) {
+                elastic::wbm_set_pinned(
+                    &est->wbm, pin.first, pin.second);
+            }
+        }
+        for (const auto & graph : pending_cross_graphs) {
+            for (const auto & unit : graph.units) {
+                elastic::wbmcl_load_host_async_unit(
+                    &est->octx, unit.data(), unit.size());
+                if (can_prepare_cross) {
+                    elastic::wbmcl_prepare_backend_unit(
+                        &est->octx, unit.data(), unit.size());
+                }
+                est->unit_pipeline_issued++;
+                est->unit_pipeline_cross_issued++;
+            }
+        }
+        est->unit_pipeline_cross_bytes += cross_missing_bytes;
+    };
+
+    auto complete_granularity_unit = [&]() -> bool {
+        est->granularity_unit_boundaries++;
+        cl_int err = CL_SUCCESS;
+        switch (est->granularity_unit_sync) {
+            case ggml_opencl_elastic_state::unit_sync_mode::NONE:
+                return true;
+            case ggml_opencl_elastic_state::unit_sync_mode::FLUSH:
+                est->granularity_unit_flushes++;
+                err = clFlush(backend_ctx->queue);
+                break;
+            case ggml_opencl_elastic_state::unit_sync_mode::FINISH:
+                est->granularity_unit_finishes++;
+                err = clFinish(backend_ctx->queue);
+                break;
+        }
+        if (err != CL_SUCCESS) {
+            est->granularity_unit_sync_errors++;
+            GGML_LOG_ERROR(
+                "ggml_opencl elastic: working-unit completion failed: %d\n",
+                err);
+            return false;
+        }
+        return true;
+    };
+
+    // 0=off, 1=two queues, 2=one fused two-cut GEMV dispatch.
+    static const int cut_dual_compute_mode = []() {
+        const char * e = std::getenv("GGML_ELASTIC_CUT_DUAL_COMPUTE");
+        if (!e || !*e || *e == '0' || std::strcmp(e, "off") == 0) {
+            return 0;
+        }
+        return std::strcmp(e, "fused") == 0 ? 2 : 1;
+    }();
+    auto current_weight_target = [&]() -> size_t {
+        if (!est->bw_inited) return SIZE_MAX;
+        size_t target = est->dynamic_target
+            ? (([&] {
+                  const size_t bt =
+                      elastic::budget_watcher_get(&est->bw) *
+                      size_t(1024 * 1024);
+                  const size_t km = est->kv_bytes + est->misc_overhead;
+                  return (bt > km ? bt - km : 0) +
+                      est->extra_target_bytes;
+              })())
+            : est->static_target_bytes;
+        if (ggml_opencl_moe_expert_cache_enabled()) {
+            target =
+                target > est->moe_cache_bytes
+                    ? target - est->moe_cache_bytes
+                    : 0;
+        }
+        return target;
+    };
+    auto evict_to_explicit_target = [&](size_t target) -> bool {
+        return force_evict_to_target(target);
+    };
+    auto ensure_cut_compute_queue = [&]() -> bool {
+        if (est->cut_compute_queue) return true;
+        cl_int err = CL_SUCCESS;
+        static const bool device_timing = []() {
+            const char * e = std::getenv("GGML_ELASTIC_DEVICE_TIMING");
+            return e && *e && *e != '0';
+        }();
+        const cl_queue_properties props[] = {
+            CL_QUEUE_PROPERTIES,
+            device_timing
+                ? static_cast<cl_queue_properties>(
+                      CL_QUEUE_PROFILING_ENABLE)
+                : 0,
+            0,
+        };
+        est->cut_compute_queue = clCreateCommandQueueWithProperties(
+            backend_ctx->context, backend_ctx->device,
+            device_timing ? props : nullptr, &err);
+        if (err != CL_SUCCESS || !est->cut_compute_queue) {
+            est->cut_compute_queue = nullptr;
+            est->cut_dual_queue_errors++;
+            GGML_LOG_WARN(
+                "ggml_opencl elastic: Cut auxiliary compute queue "
+                "unavailable (%d); using sequential Cut\n",
+                err);
+            return false;
+        }
+        GGML_LOG_INFO(
+            "ggml_opencl elastic: Cut dual-compute auxiliary queue enabled\n");
+        return true;
+    };
+    auto compute_cut_fused = [&](ggml_tensor &cut0,
+                                 ggml_tensor &cut1) -> bool {
+#if defined(GGML_OPENCL_USE_ADRENO_KERNELS) && defined(GGML_OPENCL_SOA_Q)
+        if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_dual ||
+            backend_ctx->gpu_family != ADRENO ||
+            cut0.src[0]->type != GGML_TYPE_Q4_0 ||
+            cut1.src[0]->type != GGML_TYPE_Q4_0 ||
+            cut0.src[1] != cut1.src[1] ||
+            cut0.ne[0] != cut1.ne[0] ||
+            cut0.src[0]->ne[0] != cut1.src[0]->ne[0] ||
+            cut0.ne[1] * cut0.ne[2] * cut0.ne[3] != 1 ||
+            cut1.ne[1] * cut1.ne[2] * cut1.ne[3] != 1) {
+            return false;
+        }
+        auto * q0 =
+            (ggml_tensor_extra_cl_q4_0 *) cut0.src[0]->extra;
+        auto * q1 =
+            (ggml_tensor_extra_cl_q4_0 *) cut1.src[0]->extra;
+        auto * activation =
+            (ggml_tensor_extra_cl *) cut0.src[1]->extra;
+        auto * output =
+            (ggml_tensor_extra_cl *) cut0.extra;
+        if (!q0 || !q1 || !activation || !output ||
+            !q0->q || !q0->d || !q1->q || !q1->d) {
+            return false;
+        }
+
+        const int K = (int) cut0.src[0]->ne[0];
+        const int M = (int) cut0.src[0]->ne[1];
+        if (K <= 0 || M <= 0 || (K % 32) != 0 ||
+            (M % 2) != 0) {
+            return false;
+        }
+        auto q_image = [&](ggml_tensor_extra_cl_q4_0 * extra) -> cl_mem {
+            if (extra->q_img) {
+                est->cut_dual_image_cache_hits++;
+                return extra->q_img;
+            }
+            cl_image_format format = {CL_R, CL_UNSIGNED_INT32};
+            cl_image_desc desc{};
+            desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            desc.image_width =
+                (size_t) M * (size_t) K / 2 / sizeof(cl_uint);
+            desc.buffer = extra->q;
+            cl_int image_err = CL_SUCCESS;
+            cl_mem image = clCreateImage(
+                backend_ctx->context, CL_MEM_READ_ONLY, &format, &desc,
+                nullptr, &image_err);
+            if (image_err != CL_SUCCESS || !image) {
+                est->cut_dual_image_errors++;
+                return nullptr;
+            }
+            extra->q_img = image;
+            extra->owns_q_img = true;
+            est->cut_dual_image_creates++;
+            return image;
+        };
+        cl_mem image0 = q_image(q0);
+        cl_mem image1 = q_image(q1);
+        if (!image0 || !image1) return false;
+
+        const cl_ulong offset1 =
+            activation->offset + cut0.src[1]->view_offs;
+        const cl_ulong offsetd0 =
+            output->offset + cut0.view_offs;
+        const cl_ulong offsetd1 =
+            output->offset + cut1.view_offs;
+        cl_kernel kernel =
+            backend_ctx->kernel_gemv_noshuffle_q4_0_f32_dual;
+        cl_int err = CL_SUCCESS;
+        cl_uint arg = 0;
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &image0);
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &q0->d);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &image1);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &q1->d);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(
+                kernel, arg++, sizeof(cl_mem),
+                &activation->data_device);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(
+                kernel, arg++, sizeof(cl_ulong), &offset1);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(
+                kernel, arg++, sizeof(cl_mem), &output->data_device);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(
+                kernel, arg++, sizeof(cl_ulong), &offsetd0);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(
+                kernel, arg++, sizeof(cl_ulong), &offsetd1);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(kernel, arg++, sizeof(int), &K);
+        }
+        if (err == CL_SUCCESS) {
+            err = clSetKernelArg(kernel, arg++, sizeof(int), &M);
+        }
+        const size_t wavesize = backend_ctx->adreno_wave_size;
+        constexpr size_t n_simgroup = 4;
+        const size_t global[] = {
+            (((size_t) M / 2 + wavesize - 1) / wavesize) *
+                wavesize,
+            n_simgroup,
+            2,
+        };
+        const size_t local[] = {wavesize, n_simgroup, 1};
+        if (err == CL_SUCCESS) {
+            err = clEnqueueNDRangeKernel(
+                backend_ctx->queue, kernel, 3, nullptr, global, local,
+                0, nullptr, nullptr);
+        }
+        return err == CL_SUCCESS;
+#else
+        GGML_UNUSED(cut0);
+        GGML_UNUSED(cut1);
+        return false;
+#endif
+    };
+
+    auto run_cut_matmul = [&](
+            ggml_tensor *node,
+            const std::vector<elastic_q4_cut_part> &parts,
+            bool fine_grained_cut) -> bool {
+        if (!node || !node->src[0] || node->op != GGML_OP_MUL_MAT || parts.empty()) {
+            return false;
+        }
+        // Activation/bias inputs remain ordinary dependencies.  src0 is
+        // supplied one independently resident part at a time below.
+        ggml_tensor deps = *node;
+        deps.src[0] = nullptr;
+        if (!ensure_node_srcs_resident(&deps)) return false;
+
+        const ggml_tensor *original_weight = node->src[0];
+        auto *original_dst_extra = (ggml_tensor_extra_cl *) node->extra;
+        if (!original_dst_extra || node->type != GGML_TYPE_F32) return false;
+        const int64_t output_columns = node->ne[1] * node->ne[2] * node->ne[3];
+        auto build_cut_node = [&](const elastic_q4_cut_part &part,
+                                  ggml_tensor &weight_part,
+                                  ggml_tensor &cut_node) {
+            weight_part = *original_weight;
+            weight_part.ne[1] = part.row_count;
+            weight_part.ne[2] = 1;
+            weight_part.ne[3] = 1;
+            weight_part.nb[2] =
+                weight_part.nb[1] * (size_t) weight_part.ne[1];
+            weight_part.nb[3] = weight_part.nb[2];
+            weight_part.view_src = nullptr;
+            weight_part.view_offs = 0;
+            weight_part.data =
+                static_cast<unsigned char *>(original_weight->data) +
+                part.byte_offset;
+            weight_part.extra = part.extra;
+
+            cut_node = *node;
+            cut_node.src[0] = &weight_part;
+            cut_node.ne[0] = part.row_count;
+            cut_node.nb[1] =
+                (size_t) part.row_count * sizeof(float);
+            cut_node.nb[2] =
+                cut_node.nb[1] * (size_t) cut_node.ne[1];
+            cut_node.nb[3] =
+                cut_node.nb[2] * (size_t) cut_node.ne[2];
+            cut_node.view_offs = node->view_offs +
+                (size_t) part.row_start * sizeof(float);
+        };
+        auto prepare_cut_part = [&](const elastic_q4_cut_part &part,
+                                    ggml_tensor &cut_node,
+                                    bool defer_pipeline_release,
+                                    std::vector<size_t> *deferred_positions) -> bool {
+            // Keep LOAD/PREPARE and residency independent per half even when
+            // the two ready kernels are later submitted as one compute pair.
+            ggml_tensor ensure_node = cut_node;
+            for (int k = 1; k < GGML_MAX_SRC; ++k) {
+                ensure_node.src[k] = nullptr;
+            }
+            const pipeline_observation pipe_obs =
+                pipeline_begin(part.wbm_idx);
+            const bool had_pipeline_pin =
+                pipe_obs.valid && pipeline_issued[pipe_obs.pos];
+            if (!ensure_node_srcs_resident(&ensure_node)) return false;
+            evict_to_current_budget();
+            sample_pipeline_budget();
+            pipeline_finish_observation(pipe_obs);
+            if (pipe_obs.valid) {
+                stage_pipeline_after(pipe_obs.pos, {part.wbm_idx});
+                evict_to_current_budget();
+                sample_pipeline_budget();
+                if (had_pipeline_pin && defer_pipeline_release &&
+                    deferred_positions) {
+                    deferred_positions->push_back(pipe_obs.pos);
+                } else if (had_pipeline_pin) {
+                    release_pipeline_pins(
+                        pipeline_units[pipe_obs.pos]);
+                }
+            }
+            return true;
+        };
+
+        // Decode GEMV writes each row range directly into a disjoint output
+        // region, so two half-tensor kernels can execute concurrently. Prompt
+        // GEMM still uses the shared transpose/output scratch and remains on
+        // the sequential path.
+        if (cut_dual_compute_mode != 0) {
+            est->cut_dual_candidates++;
+            const bool dual_shape =
+                parts.size() == 2 && output_columns == 1;
+            if (!dual_shape) {
+                est->cut_dual_shape_fallbacks++;
+            } else if (cut_dual_compute_mode == 2 ||
+                       ensure_cut_compute_queue()) {
+                std::vector<int> pair_indices;
+                std::unordered_set<int> pair_seen;
+                size_t missing_bytes = 0;
+                for (const auto & part : parts) {
+                    if (!pair_seen.insert(part.wbm_idx).second) continue;
+                    const elastic::block_meta * bm =
+                        elastic::wbm_get(&est->wbm, part.wbm_idx);
+                    if (!bm) continue;
+                    pair_indices.push_back(part.wbm_idx);
+                    if (!bm->resident) missing_bytes += bm->byte_size;
+                }
+                acquire_pipeline_pins(pair_indices);
+                auto release_pair_pins = [&]() {
+                    release_pipeline_pins(pair_indices);
+                    pair_indices.clear();
+                };
+                std::vector<size_t> deferred_pipeline_positions;
+                auto release_deferred_pipeline_pins = [&]() {
+                    for (size_t pos : deferred_pipeline_positions) {
+                        release_pipeline_pins(pipeline_units[pos]);
+                    }
+                    deferred_pipeline_positions.clear();
+                };
+
+                const size_t target = current_weight_target();
+                const size_t reserve_target =
+                    target == SIZE_MAX
+                        ? SIZE_MAX
+                        : (target > missing_bytes
+                               ? target - missing_bytes
+                               : 0);
+                bool pair_fits =
+                    target == SIZE_MAX ||
+                    evict_to_explicit_target(reserve_target);
+                if (pair_fits) {
+                    std::vector<ggml_tensor> weight_parts(2);
+                    std::vector<ggml_tensor> cut_nodes(2);
+                    for (size_t p = 0; p < 2; ++p) {
+                        build_cut_node(
+                            parts[p], weight_parts[p], cut_nodes[p]);
+                        if (fine_grained_cut &&
+                            !prepare_cut_part(
+                                parts[p], cut_nodes[p], true,
+                                &deferred_pipeline_positions)) {
+                            release_deferred_pipeline_pins();
+                            release_pair_pins();
+                            return false;
+                        }
+                    }
+                    evict_to_current_budget();
+                    pair_fits =
+                        target == SIZE_MAX ||
+                        est->wbm.resident_bytes <= target;
+                    sample_pipeline_budget();
+
+                    if (pair_fits) {
+                        if (cut_dual_compute_mode == 2) {
+                            if (!compute_cut_fused(
+                                    cut_nodes[0], cut_nodes[1])) {
+                                est->cut_dual_queue_errors++;
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            if (fine_grained_cut &&
+                                (!complete_granularity_unit() ||
+                                 !complete_granularity_unit())) {
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            for (const auto & part : parts) {
+                                elastic::wbm_touch(
+                                    &est->wbm, part.wbm_idx,
+                                    est->current_token);
+                                if (fine_grained_cut) {
+                                    est->granularity_units += 1;
+                                    est->granularity_peak_unit_bytes =
+                                        std::max(
+                                            est->granularity_peak_unit_bytes,
+                                            part.byte_size);
+                                }
+                            }
+                            release_deferred_pipeline_pins();
+                            release_pair_pins();
+                            evict_to_current_budget();
+                            sample_pipeline_budget();
+                            est->cut_dual_calls++;
+                            if (fine_grained_cut) {
+                                est->granularity_cut_ops += 1;
+                            }
+                            return true;
+                        }
+                        cl_command_queue primary = backend_ctx->queue;
+                        cl_command_queue auxiliary =
+                            est->cut_compute_queue;
+                        cl_event inputs_ready = nullptr;
+                        cl_event auxiliary_done = nullptr;
+                        cl_int err = clEnqueueMarkerWithWaitList(
+                            primary, 0, nullptr, &inputs_ready);
+                        if (err == CL_SUCCESS) err = clFlush(primary);
+                        if (err == CL_SUCCESS) {
+                            err = clEnqueueBarrierWithWaitList(
+                                auxiliary, 1, &inputs_ready, nullptr);
+                        }
+                        if (err != CL_SUCCESS) {
+                            if (inputs_ready) {
+                                clReleaseEvent(inputs_ready);
+                            }
+                            est->cut_dual_queue_errors++;
+                            release_deferred_pipeline_pins();
+                            release_pair_pins();
+                            evict_to_current_budget();
+                            // No Cut kernel was submitted, so the ordinary
+                            // sequential path below is still a safe fallback.
+                        } else {
+                            if (!ggml_cl_compute_forward(
+                                    backend, &cut_nodes[0])) {
+                                clReleaseEvent(inputs_ready);
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            backend_ctx->queue = auxiliary;
+                            const bool second_ok =
+                                ggml_cl_compute_forward(
+                                    backend, &cut_nodes[1]);
+                            backend_ctx->queue = primary;
+                            if (!second_ok) {
+                                clReleaseEvent(inputs_ready);
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            err = clEnqueueMarkerWithWaitList(
+                                auxiliary, 0, nullptr, &auxiliary_done);
+                            if (err == CL_SUCCESS) err = clFlush(auxiliary);
+                            if (err == CL_SUCCESS) {
+                                err = clEnqueueBarrierWithWaitList(
+                                    primary, 1, &auxiliary_done, nullptr);
+                            }
+                            clReleaseEvent(inputs_ready);
+                            if (auxiliary_done) {
+                                clReleaseEvent(auxiliary_done);
+                            }
+                            if (err != CL_SUCCESS) {
+                                est->cut_dual_queue_errors++;
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            if (fine_grained_cut &&
+                                (!complete_granularity_unit() ||
+                                 !complete_granularity_unit())) {
+                                release_deferred_pipeline_pins();
+                                release_pair_pins();
+                                return false;
+                            }
+                            for (const auto & part : parts) {
+                                elastic::wbm_touch(
+                                    &est->wbm, part.wbm_idx,
+                                    est->current_token);
+                                if (fine_grained_cut) {
+                                    est->granularity_units += 1;
+                                    est->granularity_peak_unit_bytes =
+                                        std::max(
+                                            est->granularity_peak_unit_bytes,
+                                            part.byte_size);
+                                }
+                            }
+                            release_deferred_pipeline_pins();
+                            release_pair_pins();
+                            evict_to_current_budget();
+                            sample_pipeline_budget();
+                            est->cut_dual_calls++;
+                            if (fine_grained_cut) {
+                                est->granularity_cut_ops += 1;
+                            }
+                            return true;
+                        }
+                    }
+                }
+                if (!pair_fits) {
+                    est->cut_dual_budget_fallbacks++;
+                    release_deferred_pipeline_pins();
+                    release_pair_pins();
+                    evict_to_current_budget();
+                }
+            }
+        }
+
+        for (const auto &part : parts) {
+            ggml_tensor weight_part{};
+            ggml_tensor cut_node{};
+            build_cut_node(part, weight_part, cut_node);
+            if (fine_grained_cut &&
+                !prepare_cut_part(
+                    part, cut_node, false, nullptr)) return false;
+
+            ggml_tensor_extra_cl scratch_extra{};
+            const bool direct_output = output_columns == 1;
+            if (!direct_output) {
+                const size_t scratch_bytes = (size_t) part.row_count *
+                    (size_t) output_columns * sizeof(float);
+                if (scratch_bytes > est->cut_output_scratch_bytes) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    if (est->cut_output_scratch) {
+                        CL_CHECK(clReleaseMemObject(est->cut_output_scratch));
+                    }
+                    cl_int err = CL_SUCCESS;
+                    est->cut_output_scratch = clCreateBuffer(
+                        backend_ctx->context, CL_MEM_READ_WRITE,
+                        scratch_bytes, nullptr, &err);
+                    if (err != CL_SUCCESS || !est->cut_output_scratch) return false;
+                    est->cut_output_scratch_bytes = scratch_bytes;
+                }
+                scratch_extra.reset();
+                scratch_extra.data_device = est->cut_output_scratch;
+                scratch_extra.actual_size = est->cut_output_scratch_bytes;
+                cut_node.extra = &scratch_extra;
+                cut_node.view_offs = 0;
+            }
+
+            if (!ggml_cl_compute_forward(backend, &cut_node)) return false;
+            if (!direct_output) {
+                const size_t part_row_bytes =
+                    (size_t) part.row_count * sizeof(float);
+                const size_t dst_base = (size_t) original_dst_extra->offset +
+                    node->view_offs + (size_t) part.row_start * sizeof(float);
+                for (int64_t column = 0; column < output_columns; ++column) {
+                    const size_t src_offset = (size_t) column * part_row_bytes;
+                    const size_t dst_offset = dst_base +
+                        (size_t) column * node->nb[1];
+                    const cl_int err = clEnqueueCopyBuffer(
+                        backend_ctx->queue, est->cut_output_scratch,
+                        original_dst_extra->data_device,
+                        src_offset, dst_offset, part_row_bytes,
+                        0, nullptr, nullptr);
+                    if (err != CL_SUCCESS) return false;
+                }
+            }
+            if (fine_grained_cut &&
+                !complete_granularity_unit()) return false;
+            elastic::wbm_touch(&est->wbm, part.wbm_idx, est->current_token);
+            evict_to_current_budget();
+            if (fine_grained_cut) {
+                est->granularity_units += 1;
+                est->granularity_peak_unit_bytes = std::max(
+                    est->granularity_peak_unit_bytes, part.byte_size);
+            }
+        }
+        if (fine_grained_cut) est->granularity_cut_ops += 1;
+        return true;
+    };
+
+    auto ensure_tiled_weight_parts =
+        [&](ggml_tensor * node,
+            const std::vector<elastic_q4_cut_part> & parts) -> bool {
+        if (!node || !node->src[0]) return false;
+        for (const auto & part : parts) {
+            ggml_tensor weight_part = *node->src[0];
+            weight_part.ne[1] = part.row_count;
+            weight_part.ne[2] = 1;
+            weight_part.ne[3] = 1;
+            weight_part.nb[2] =
+                weight_part.nb[1] * (size_t) weight_part.ne[1];
+            weight_part.nb[3] = weight_part.nb[2];
+            weight_part.view_src = nullptr;
+            weight_part.view_offs = 0;
+            weight_part.data =
+                static_cast<unsigned char *>(node->src[0]->data) +
+                part.byte_offset;
+            weight_part.extra = part.extra;
+
+            ggml_tensor ensure_node = *node;
+            ensure_node.src[0] = &weight_part;
+            for (int k = 1; k < GGML_MAX_SRC; ++k) {
+                ensure_node.src[k] = nullptr;
+            }
+            if (!ensure_node_srcs_resident(&ensure_node)) return false;
+        }
+        return true;
+    };
+
+    int multi_weights_remaining = 0;
+    size_t multi_pipeline_pos = SIZE_MAX;
+    std::vector<std::pair<int, bool>> multi_unit_pins;
+    auto release_multi_unit_pins = [&]() {
+        for (const auto &entry : multi_unit_pins) {
+            elastic::wbm_set_pinned(&est->wbm, entry.first, entry.second);
+        }
+        multi_unit_pins.clear();
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        auto tiled_weight =
+            node && node->src[0]
+                ? est->q4_cut_parts.find(node->src[0])
+                : est->q4_cut_parts.end();
+        const auto & mixed_binding =
+            mixed_binding_for_weight(
+                node && node->src[0] ? node->src[0] : nullptr);
+        const bool mixed_current = mixed_binding.planned;
+        const bool fine_cut_current =
+            mixed_current
+                ? mixed_binding.fine_cut
+                : est->granularity.mode ==
+                    elastic::granularity_mode::CUT;
+        size_t mixed_pipeline_pos = SIZE_MAX;
+        if (mixed_current && node && node->src[0]) {
+            auto found =
+                mixed_pipeline_pos_by_weight.find(node->src[0]);
+            if (found != mixed_pipeline_pos_by_weight.end()) {
+                mixed_pipeline_pos = found->second;
+            }
+        }
+        const bool grouped_current =
+            mixed_current
+                ? mixed_pipeline_pos != SIZE_MAX &&
+                    mixed_pipeline_pos <
+                        mixed_nodes_by_pipeline_pos.size() &&
+                    mixed_nodes_by_pipeline_pos[
+                        mixed_pipeline_pos].size() > 1
+                : est->granularity.mode ==
+                        elastic::granularity_mode::MULTI ||
+                    est->granularity.mode ==
+                        elastic::granularity_mode::MULTI_FUSED;
+
+        if (granularity_active &&
+            fine_cut_current &&
+            node && node->op == GGML_OP_MUL_MAT && node->src[0]) {
+            if (tiled_weight != est->q4_cut_parts.end()) {
+                sync_with_other_backends(backend);
+                if (!run_cut_matmul(
+                        node, tiled_weight->second, true)) {
+                    return GGML_STATUS_FAILED;
+                }
+                continue;
+            }
+        }
+
+        const bool current_weight_matmul = is_weight_matmul(node);
+        pipeline_observation pipe_obs;
+        std::vector<int> current_pipeline_indices;
+        std::vector<int> current_execution_indices;
+        std::unordered_set<int> current_execution_seen;
+        bool current_execution_pin = false;
+        bool current_prefetch_pin = false;
+        auto acquire_current_source_pins = [&](ggml_tensor * current_node) {
+            if (!elastic_active || !current_node) return;
+            std::vector<int> added;
+            for (int src_pos = 0; src_pos < GGML_MAX_SRC; ++src_pos) {
+                ggml_tensor * src = current_node->src[src_pos];
+                if (!src || !src->extra) continue;
+                auto src_tiled = est->q4_cut_parts.find(src);
+                if (src_tiled != est->q4_cut_parts.end()) {
+                    for (const auto & part : src_tiled->second) {
+                        if (part.wbm_idx >= 0 &&
+                            current_execution_seen.insert(
+                                part.wbm_idx).second) {
+                            added.push_back(part.wbm_idx);
+                        }
+                    }
+                    continue;
+                }
+                const int src_idx = ggml_opencl_get_wbm_idx(src);
+                if (src_idx >= 0 &&
+                    current_execution_seen.insert(src_idx).second) {
+                    added.push_back(src_idx);
+                }
+            }
+            if (!added.empty()) {
+                acquire_pipeline_pins(added);
+                current_execution_indices.insert(
+                    current_execution_indices.end(),
+                    added.begin(), added.end());
+                current_execution_pin = true;
+            }
+        };
+        if (granularity_active && unit_pipeline_enabled && current_weight_matmul) {
+            int current_idx = ggml_opencl_get_wbm_idx(node->src[0]);
+            if (mixed_pipeline_pos != SIZE_MAX &&
+                mixed_pipeline_pos < pipeline_units.size() &&
+                !pipeline_units[mixed_pipeline_pos].empty()) {
+                current_idx =
+                    pipeline_units[mixed_pipeline_pos].front();
+            }
+            if (!grouped_current || multi_weights_remaining == 0) {
+                pipe_obs = pipeline_begin(current_idx);
+                if (pipe_obs.valid) current_pipeline_indices = pipeline_units[pipe_obs.pos];
+            }
+            // pipeline_begin() only observes an existing lookahead pin; the
+            // first unit in a graph (and any repeated consumer) historically
+            // had no protection of its own.  During a sharp budget decrease
+            // the post-ensure budget pass could therefore select the just
+            // touched current Tensor unit as the MRU victim, clear its SOA
+            // q/d handles, and then submit its GEMV with a null cl_mem.
+            //
+            // Give every non-Multi consumer one execution reference from
+            // before ensure through kernel submission.  A separately issued
+            // lookahead reference is consumed after the same submission.
+            // Multi already protects the complete group with
+            // multi_unit_pins and retires it at the group boundary.
+            if (!grouped_current) {
+                auto current_pos = pipeline_pos_by_wbm.find(current_idx);
+                if (current_pos != pipeline_pos_by_wbm.end()) {
+                    current_pipeline_indices =
+                        pipeline_units[current_pos->second];
+                    current_prefetch_pin =
+                        pipe_obs.valid &&
+                        pipeline_issued[current_pos->second];
+                    for (int idx : current_pipeline_indices) {
+                        if (current_execution_seen.insert(idx).second) {
+                            current_execution_indices.push_back(idx);
+                        }
+                    }
+                    if (!current_execution_indices.empty()) {
+                        acquire_pipeline_pins(
+                            current_execution_indices);
+                        current_execution_pin = true;
+                    }
+                }
+            }
+        }
+        // Every WBM source consumed by the current operator must remain valid
+        // through kernel submission, not only src[0] of MUL_MAT.  In
+        // particular RMS_NORM->MUL consumes a small norm weight as MUL src[1].
+        // MRU budget enforcement could otherwise evict that just-ensured
+        // source while reserving the following matrix unit and submit a null
+        // cl_mem to the fused/non-fused elementwise kernel.
+        acquire_current_source_pins(node);
+        auto release_current_execution_pins = [&]() {
+            if (current_execution_pin) {
+                release_pipeline_pins(current_execution_indices);
+                current_execution_pin = false;
+            }
+            if (current_prefetch_pin) {
+                release_pipeline_pins(current_pipeline_indices);
+                current_prefetch_pin = false;
+            }
+        };
+        // LLAMA_ELASTIC_FORCE_PLAN_EVICT runs with NO_AUTO_EVICT so that the
+        // placement plan, rather than the backend's MRU policy, chooses normal
+        // victims.  A current execution unit is different: if it is missing,
+        // ensure_node_srcs_resident() must materialize it before the next plan
+        // callback.  Reserve those bytes explicitly while the unit is pinned,
+        // otherwise resident_bytes transiently grows by one Tensor unit on
+        // every miss and violates the advertised weight budget.
+        //
+        // Pipeline positions use the actual Cut/Tensor/Multi storage indices.
+        // Fall back to the node binding only for the first, not-yet-observed
+        // graph.
+        if (granularity_active && current_weight_matmul &&
+            !grouped_current) {
+            if (current_pipeline_indices.empty()) {
+                auto current_tiled =
+                    est->q4_cut_parts.find(node->src[0]);
+                if (current_tiled != est->q4_cut_parts.end()) {
+                    for (const auto & part : current_tiled->second) {
+                        current_pipeline_indices.push_back(part.wbm_idx);
+                    }
+                } else {
+                    const int current_idx =
+                        ggml_opencl_get_wbm_idx(node->src[0]);
+                    if (current_idx >= 0) {
+                        current_pipeline_indices.push_back(current_idx);
+                    }
+                }
+            }
+            size_t current_missing_bytes = 0;
+            std::unordered_set<int> current_seen;
+            for (int idx : current_execution_indices) {
+                if (!current_seen.insert(idx).second) continue;
+                const elastic::block_meta * bm =
+                    elastic::wbm_get(&est->wbm, idx);
+                if (bm && !bm->resident) {
+                    current_missing_bytes += bm->byte_size;
+                }
+            }
+            if (current_missing_bytes > 0) {
+                const size_t target = current_weight_target();
+                const size_t aligned_target =
+                    target <= SIZE_MAX - weight_budget_alignment_slack
+                        ? target + weight_budget_alignment_slack
+                        : SIZE_MAX;
+                const size_t reserve_target =
+                    target == SIZE_MAX
+                        ? SIZE_MAX
+                        : (aligned_target > current_missing_bytes
+                               ? aligned_target - current_missing_bytes
+                               : 0);
+                if (target != SIZE_MAX &&
+                    !evict_to_explicit_target(reserve_target)) {
+                    release_current_execution_pins();
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+        if (granularity_active && current_weight_matmul &&
+            grouped_current &&
+            multi_weights_remaining == 0) {
+            std::unordered_set<const ggml_tensor *> seen;
+            size_t unit_bytes = 0;
+            std::vector<ggml_tensor *> future_nodes;
+            if (mixed_current &&
+                mixed_pipeline_pos <
+                    mixed_nodes_by_pipeline_pos.size()) {
+                future_nodes =
+                    mixed_nodes_by_pipeline_pos[mixed_pipeline_pos];
+            } else {
+                for (int j = i; j < cgraph->n_nodes &&
+                     (int) seen.size() <
+                        est->granularity.multi_tensors; ++j) {
+                    ggml_tensor * future = cgraph->nodes[j];
+                    if (is_weight_matmul(future) &&
+                        seen.insert(future->src[0]).second) {
+                        future_nodes.push_back(future);
+                    }
+                }
+                seen.clear();
+            }
+            for (ggml_tensor * future : future_nodes) {
+                if (!is_weight_matmul(future) ||
+                    !seen.insert(future->src[0]).second) continue;
+                const int future_idx = ggml_opencl_get_wbm_idx(future->src[0]);
+                auto future_tiled =
+                    est->q4_cut_parts.find(future->src[0]);
+                std::vector<int> future_indices;
+                if (future_tiled != est->q4_cut_parts.end()) {
+                    for (const auto & part : future_tiled->second) {
+                        future_indices.push_back(part.wbm_idx);
+                    }
+                } else if (future_idx >= 0) {
+                    future_indices.push_back(future_idx);
+                }
+                for (int idx : future_indices) {
+                    const elastic::block_meta *future_bm =
+                        elastic::wbm_get(&est->wbm, idx);
+                    if (!future_bm) continue;
+                    multi_unit_pins.push_back(
+                        {idx, future_bm->is_pinned});
+                    elastic::wbm_set_pinned(
+                        &est->wbm, idx, true);
+                }
+                if (!ensure_node_srcs_resident(future)) return GGML_STATUS_FAILED;
+                if (future_tiled != est->q4_cut_parts.end() &&
+                    !ensure_tiled_weight_parts(
+                        future, future_tiled->second)) {
+                    return GGML_STATUS_FAILED;
+                }
+                unit_bytes += weight_bytes(future);
+            }
+            multi_weights_remaining = (int) seen.size();
+            est->granularity_units += 1;
+            est->granularity_peak_unit_bytes = std::max(
+                est->granularity_peak_unit_bytes, unit_bytes);
+        }
 
         // 当前 node 的 src 先 ensure；fused 分支命中时再补本 i+1/i+2 节点的 src。
         if (!ensure_node_srcs_resident(node)) return GGML_STATUS_FAILED;
+        if (tiled_weight != est->q4_cut_parts.end() &&
+            !fine_cut_current &&
+            !ensure_tiled_weight_parts(node, tiled_weight->second)) {
+            return GGML_STATUS_FAILED;
+        }
+        if (granularity_active && current_weight_matmul &&
+            !grouped_current) {
+            const size_t target = current_weight_target();
+            const size_t aligned_target =
+                target <= SIZE_MAX - weight_budget_alignment_slack
+                    ? target + weight_budget_alignment_slack
+                    : SIZE_MAX;
+            if (aligned_target != SIZE_MAX &&
+                !evict_to_explicit_target(aligned_target)) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
+        } else {
+            evict_to_current_budget();
+        }
+        sample_pipeline_budget();
+        pipeline_finish_observation(pipe_obs);
+        if (pipe_obs.valid) {
+            stage_pipeline_after(pipe_obs.pos, current_pipeline_indices);
+            evict_to_current_budget();
+            sample_pipeline_budget();
+            if (grouped_current) {
+                // The execution-unit pin was acquired while this pipeline pin
+                // was already set.  Release them in reverse nesting order at
+                // the Multi boundary; restoring the execution pin first and
+                // immediately dropping the pipeline pin recovers the true
+                // original bit instead of permanently pinning the model.
+                multi_pipeline_pos = pipe_obs.pos;
+            }
+        }
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
         //       dependencies.
         sync_with_other_backends(backend);
 
+        // Dynamic Tensor/Multi plans use the same independently resident base
+        // tiles as CUT, but group their LOAD/PREPARE/retire boundaries above.
+        // Compute both halves here (normally one dual GEMV dispatch) instead
+        // of accidentally executing only the first tile referenced by the
+        // original tensor->extra.
+        if (granularity_active &&
+            tiled_weight != est->q4_cut_parts.end() &&
+            node && node->op == GGML_OP_MUL_MAT &&
+            !fine_cut_current) {
+            std::vector<std::pair<int, bool>> tensor_tile_pins;
+            if (!grouped_current) {
+                for (const auto & part : tiled_weight->second) {
+                    const elastic::block_meta * bm =
+                        elastic::wbm_get(&est->wbm, part.wbm_idx);
+                    if (!bm) continue;
+                    tensor_tile_pins.push_back(
+                        {part.wbm_idx, bm->is_pinned});
+                    elastic::wbm_set_pinned(
+                        &est->wbm, part.wbm_idx, true);
+                }
+            }
+            const bool tiled_ok =
+                run_cut_matmul(node, tiled_weight->second, false);
+            for (const auto & pin : tensor_tile_pins) {
+                elastic::wbm_set_pinned(
+                    &est->wbm, pin.first, pin.second);
+            }
+            if (!tiled_ok) {
+                return GGML_STATUS_FAILED;
+            }
+            if (!grouped_current) {
+                if (!complete_granularity_unit()) {
+                    return GGML_STATUS_FAILED;
+                }
+                est->granularity_units += 1;
+                est->granularity_peak_unit_bytes = std::max(
+                    est->granularity_peak_unit_bytes,
+                    weight_bytes(node));
+            } else {
+                if (multi_weights_remaining > 0) {
+                    --multi_weights_remaining;
+                }
+                if (multi_weights_remaining == 0) {
+                    if (!complete_granularity_unit()) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    release_multi_unit_pins();
+                    if (multi_pipeline_pos != SIZE_MAX) {
+                        release_pipeline_pins(
+                            pipeline_units[multi_pipeline_pos]);
+                        multi_pipeline_pos = SIZE_MAX;
+                    }
+                }
+            }
+            // All kernels consuming the current coarse Tensor unit have now
+            // been queued.  It is safe for the next budget pass to retire the
+            // unit; retained-pool reuse still waits on its queue marker.
+            release_current_execution_pins();
+            continue;
+        }
+
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            release_current_execution_pins();
             continue;
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
-            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
-            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) return GGML_STATUS_FAILED;
+            acquire_current_source_pins(cgraph->nodes[i+1]);
+            acquire_current_source_pins(cgraph->nodes[i+2]);
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            release_current_execution_pins();
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
-            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
-            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) return GGML_STATUS_FAILED;
+            acquire_current_source_pins(cgraph->nodes[i+1]);
+            acquire_current_source_pins(cgraph->nodes[i+2]);
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+2])) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            release_current_execution_pins();
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) return GGML_STATUS_FAILED;
+            acquire_current_source_pins(cgraph->nodes[i+1]);
+            if (!ensure_node_srcs_resident(cgraph->nodes[i+1])) {
+                release_current_execution_pins();
+                return GGML_STATUS_FAILED;
+            }
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            release_current_execution_pins();
             i++;
             continue;
         }
@@ -4875,6 +7375,65 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 opencl_profile_compute(node, i, ms, ok ? 1 : 0);
             }
         }
+
+        if (granularity_active && current_weight_matmul) {
+            if (mixed_current) {
+                if (!grouped_current) {
+                    if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+                    est->granularity_units += 1;
+                    est->granularity_peak_unit_bytes = std::max(
+                        est->granularity_peak_unit_bytes, weight_bytes(node));
+                } else {
+                    if (multi_weights_remaining > 0) --multi_weights_remaining;
+                    if (multi_weights_remaining == 0) {
+                        if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+                        release_multi_unit_pins();
+                        if (multi_pipeline_pos != SIZE_MAX) {
+                            release_pipeline_pins(
+                                pipeline_units[multi_pipeline_pos]);
+                            multi_pipeline_pos = SIZE_MAX;
+                        }
+                    }
+                }
+            } else {
+                switch (est->granularity.mode) {
+                    case elastic::granularity_mode::TENSOR:
+                        if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+                        est->granularity_units += 1;
+                        est->granularity_peak_unit_bytes = std::max(
+                            est->granularity_peak_unit_bytes, weight_bytes(node));
+                        break;
+                    case elastic::granularity_mode::MULTI:
+                    case elastic::granularity_mode::MULTI_FUSED:
+                        if (multi_weights_remaining > 0) --multi_weights_remaining;
+                        if (multi_weights_remaining == 0) {
+                            if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+                            release_multi_unit_pins();
+                            if (multi_pipeline_pos != SIZE_MAX) {
+                                release_pipeline_pins(
+                                    pipeline_units[multi_pipeline_pos]);
+                                multi_pipeline_pos = SIZE_MAX;
+                            }
+                        }
+                        break;
+                    case elastic::granularity_mode::CUT:
+                        // Non-Q4 or otherwise unsplittable model weights retain a
+                        // real one-tensor fallback unit and are reported explicitly.
+                        if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+                        est->granularity_units += 1;
+                        est->granularity_fallback_ops += 1;
+                        est->granularity_peak_unit_bytes = std::max(
+                            est->granularity_peak_unit_bytes, weight_bytes(node));
+                        break;
+                }
+            }
+        }
+
+        // Keep the current unit pinned through ggml_cl_compute_forward(), not
+        // merely through its LOAD/PREPARE stages.  Releasing here preserves
+        // overlap while preventing a budget transition from evicting a
+        // weight between ensure and kernel submission.
+        release_current_execution_pins();
 
         // Elastic baseline (F4-event)：op 派发后插一个 marker event 到 compute
         // queue 当前位置，写到所有被本 op 用过的 WBM 权重的 last_use_event。
@@ -5052,7 +7611,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                         }
                         auto pf_t0 = (est->profile || est->timing) ? std::chrono::steady_clock::now()
                                                                   : std::chrono::steady_clock::time_point{};
-                        int rc = cit->second.reload_fn();
+                        int rc = elastic::wbmcl_reload_soa_sync(&est->octx, se_wbm_idx);
                         if (est->profile || est->timing) {
                             auto pf_t1 = std::chrono::steady_clock::now();
                             double ms = std::chrono::duration<double, std::milli>(pf_t1 - pf_t0).count();
@@ -5085,6 +7644,48 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             }
         }
     }
+
+    if (granularity_active && multi_weights_remaining > 0) {
+        if (!complete_granularity_unit()) return GGML_STATUS_FAILED;
+        release_multi_unit_pins();
+        if (multi_pipeline_pos != SIZE_MAX) {
+            release_pipeline_pins(
+                pipeline_units[multi_pipeline_pos]);
+            multi_pipeline_pos = SIZE_MAX;
+        }
+    }
+
+    if (!pending_cross_graphs.empty()) {
+        // Move exactly the successor-chain references to persistent state.
+        for (const auto & transfer : pending_cross_pin_refs) {
+            auto local = pipeline_pins.find(transfer.first);
+            if (local == pipeline_pins.end() ||
+                local->second.refs == 0) {
+                continue;
+            }
+            auto & cross =
+                est->unit_pipeline_cross_pins[transfer.first];
+            if (cross.refs == 0) {
+                cross.original = local->second.original;
+            }
+            const size_t moved =
+                std::min(local->second.refs, transfer.second);
+            local->second.refs -= moved;
+            cross.refs += moved;
+            if (local->second.refs == 0) pipeline_pins.erase(local);
+            elastic::wbm_set_pinned(&est->wbm, transfer.first, true);
+        }
+        while (!pending_cross_graphs.empty()) {
+            est->unit_pipeline_cross_graphs.push_back(
+                std::move(pending_cross_graphs.front()));
+            pending_cross_graphs.pop_front();
+        }
+    }
+    for (const auto & pin : pipeline_pins) {
+        elastic::wbm_set_pinned(
+            &est->wbm, pin.first, pin.second.original);
+    }
+    pipeline_pins.clear();
 
     // 一次 graph_compute 收尾：把单步 metrics 落盘
     if (elastic_active && est->metrics_inited) {
@@ -5384,6 +7985,110 @@ ggml_backend_t ggml_backend_opencl_init(void) {
 
 bool ggml_backend_is_opencl(ggml_backend_t backend) {
     return backend && backend->iface.get_name == ggml_backend_opencl_name;
+}
+
+bool ggml_backend_opencl_get_working_set_state(
+        ggml_backend_t backend,
+        ggml_backend_opencl_working_set_state * out) {
+    if (!out || !ggml_backend_is_opencl(backend)) return false;
+    ggml_opencl_elastic_state * state = ggml_opencl_elastic();
+    if (!state) return false;
+    std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+    out->active_capacity = state->moe_cache_active_capacity;
+    out->pending_capacity = state->moe_cache_pending_capacity;
+    out->target_capacity = state->moe_cache_plan_capacity;
+    out->observed_required_capacity = state->moe_cache_required_high_water;
+    out->hits = state->moe_cache_hits;
+    out->misses = state->moe_cache_misses;
+    out->accesses = out->hits + out->misses;
+    out->capacity_changes = state->moe_cache_grow_resizes;
+    out->resident_bytes = state->moe_cache_bytes;
+    return true;
+}
+
+bool ggml_backend_opencl_set_working_set_target(ggml_backend_t backend, int target_capacity) {
+    if (!ggml_backend_is_opencl(backend) || target_capacity < -1) return false;
+    ggml_opencl_elastic_state * state = ggml_opencl_elastic();
+    if (!state) return false;
+    std::lock_guard<std::mutex> lock(state->moe_cache_mtx);
+    state->moe_cache_plan_capacity = target_capacity;
+    state->moe_cache_required_high_water = 0;
+    state->moe_cache_pending_capacity = -1;
+    state->moe_cache_pending_hits = 0;
+    return true;
+}
+
+bool ggml_backend_opencl_get_granularity_state(
+        ggml_backend_t backend,
+        ggml_backend_opencl_granularity_state * out) {
+    if (!out || !ggml_backend_is_opencl(backend)) return false;
+    ggml_opencl_elastic_state * state = ggml_opencl_elastic();
+    if (!state || !state->wbm_inited) return false;
+    out->mode = static_cast<int>(state->granularity.mode);
+    out->units = state->granularity_units;
+    out->nonresident_units =
+        state->unit_pipeline_current_missing_units;
+    out->pipeline_issued = state->unit_pipeline_issued;
+    out->pipeline_ready = state->unit_pipeline_ready;
+    out->pipeline_waits = state->unit_pipeline_waits;
+    out->pipeline_wait_us = state->unit_pipeline_wait_us;
+    out->reloads = state->n_reloads_total;
+    out->reload_bytes = state->bytes_reloaded_total;
+    uint64_t soa_prepare_calls = 0;
+    uint64_t soa_prepare_ok = 0;
+    uint64_t soa_prepare_us = 0;
+    size_t soa_prepare_bytes = 0;
+    elastic::wbmcl_get_soa_prepare_state(
+        &state->octx,
+        &soa_prepare_calls,
+        &soa_prepare_ok,
+        &soa_prepare_us,
+        &soa_prepare_bytes);
+    (void) soa_prepare_ok;
+    out->prepare_us = soa_prepare_calls > 0 ?
+        soa_prepare_us : state->octx.stage_xform_us;
+    out->direct_read_calls = state->octx.direct_read_calls;
+    out->direct_read_us = state->octx.direct_read_us;
+    out->direct_read_bytes = state->octx.direct_read_bytes;
+    out->load_calls =
+        state->octx.stage_load_calls +
+        state->octx.foreground_direct_read_calls;
+    out->load_us =
+        state->octx.stage_load_us +
+        state->octx.foreground_direct_read_us;
+    out->load_bytes =
+        state->octx.stage_load_bytes +
+        state->octx.foreground_direct_read_bytes;
+    out->prepare_calls = soa_prepare_calls > 0 ?
+        soa_prepare_calls : state->octx.stage_xform_calls;
+    out->prepare_bytes = soa_prepare_calls > 0 ?
+        soa_prepare_bytes : state->octx.stage_xform_bytes;
+    // Production OpenCL runs intentionally avoid per-kernel event profiling:
+    // enabling it changes queue retirement and pipeline overlap.  Keep the
+    // phase unavailable instead of manufacturing a residual compute time.
+    out->compute_calls = 0;
+    out->compute_us = 0;
+    out->compute_timing_available = 0;
+    out->pipeline_residency_us = 0;
+    out->pipeline_unissued_us = 0;
+    out->pipeline_stage_us = 0;
+    out->pipeline_retire_us = 0;
+    out->evict_us = 0;
+    out->resident_bytes = state->wbm.resident_bytes;
+    return true;
+}
+
+bool ggml_backend_opencl_synchronize_elastic_pipeline(
+        ggml_backend_t backend) {
+    if (!ggml_backend_is_opencl(backend)) return false;
+    ggml_opencl_elastic_state * state = ggml_opencl_elastic();
+    if (!state || !state->wbm_inited) return false;
+    elastic::wbmcl_wait_async_idle(&state->octx);
+    // The host PREPARE worker may have enqueued OpenCL work after an earlier
+    // generic backend synchronization. Drain that work only at the explicit
+    // phase boundary, after the host queues are idle.
+    ggml_backend_opencl_synchronize(backend);
+    return true;
 }
 
 //
@@ -5799,7 +8504,11 @@ static void ggml_opencl_elastic_register_soa(
     if (tensor && tensor->name[0]) {
         std::lock_guard<std::mutex> lk(s->sched_mtx);
         s->name_to_wbm[tensor->name] = idx;
+        s->name_to_wbms[tensor->name].push_back(idx);
         s->wbm_to_name[idx] = tensor->name;
+        if (tensor->type == GGML_TYPE_Q4_0 && ggml_opencl_is_moe_expert_weight(tensor)) {
+            s->moe_q4_packed_indices.insert(idx);
+        }
     }
     if (tensor && tensor->name[0]) {
         llama_weight_runtime_mark_resident(tensor->name, LLAMA_WEIGHT_RUNTIME_GPU);
@@ -5814,7 +8523,10 @@ static void ggml_opencl_elastic_register_soa(
     if (!s_pin_policy.empty()) {
         const std::string suffix = ggml_opencl_tensor_suffix(tensor->name);
         auto contains = [&](const char *tok) {
-            return s_pin_policy == "all" || s_pin_policy.find(tok) != std::string::npos;
+            if (s_pin_policy == "all") return true;
+            const std::string delimited = "," + s_pin_policy + ",";
+            return delimited.find(
+                "," + std::string(tok) + ",") != std::string::npos;
         };
         bool should_pin = false;
         if (contains("norm") && (suffix == "attn_norm" || suffix == "ffn_norm" || suffix == "output_norm")) should_pin = true;
@@ -5822,7 +8534,17 @@ static void ggml_opencl_elastic_register_soa(
         if (contains("v") && suffix == "attn_v") should_pin = true;
         if (contains("q") && suffix == "attn_q") should_pin = true;
         if (contains("o") && suffix == "attn_output") should_pin = true;
-        if (should_pin) elastic::wbm_set_pinned(&s->wbm, idx, true);
+        if (contains("token_embd") && suffix == "token_embd") should_pin = true;
+        if (contains("output") && suffix == "output") should_pin = true;
+        if (should_pin) {
+            elastic::wbm_set_pinned(&s->wbm, idx, true);
+            if (suffix == "token_embd" || suffix == "output") {
+                GGML_LOG_INFO(
+                    "ggml_opencl elastic: pin %s inside weight budget "
+                    "(%.2f MiB)\n",
+                    suffix.c_str(), nbytes / 1024.0 / 1024.0);
+            }
+        }
     }
     static const bool s_embed_out = []() {
         const char *e = std::getenv("GGML_ELASTIC_EMBED_OUTSIDE_BUDGET");
@@ -5861,10 +8583,9 @@ static void ggml_opencl_elastic_register_soa(
 
 // 公共 reload helper：pool 命中复用 parent / 否则 alloc。
 // 调用方负责后续 sub-buffer 创建 + convert kernel + mark_resident。
-// 诊断: 追踪 SOA pool 里的 parent buffer, 检测 double-evict (同一 buffer 被 push 两次
-// → 之后会被发给两个 resident tensor → 互相覆盖数据 → corruption)。
-static std::unordered_map<cl_mem, char> s_soa_pooled_parents;
-static uint64_t s_soa_double_evict = 0, s_soa_double_handout = 0;
+// SOA parent ownership diagnostics live in wbm_opencl_ctx. Keeping the
+// container in runtime state avoids a static-destruction race with the async
+// layout worker at process exit.
 
 static bool ggml_opencl_elastic_evict_during_load_enabled() {
     const char * e = std::getenv("GGML_ELASTIC_EVICT_DURING_LOAD");
@@ -6204,6 +8925,90 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
+        // CUT is materialized here, on the real model loading path.  Each row
+        // partition receives its own OpenCL parent, SOA conversion, WBM block,
+        // and evict/reload callback.  The recursive call reuses the exact Q4_0
+        // preparation path below; the guard prevents a part being split again.
+        static thread_local bool s_registering_cut_part = false;
+        const elastic::granularity_config granularity = elastic::granularity_from_env();
+        auto * cut_bctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        const bool cut_candidate =
+            !s_registering_cut_part &&
+            (elastic::granularity_dynamic_prepare_cut() ||
+             (granularity.explicitly_enabled &&
+              granularity.mode == elastic::granularity_mode::CUT)) &&
+            cut_bctx->mode == ggml_backend_opencl_buffer_context::MODE_ELASTIC &&
+            offset == 0 && size == ggml_nbytes(tensor) && tensor->view_src == nullptr &&
+            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+            ggml_opencl_is_weight_tensor(tensor->name) &&
+            ggml_opencl_tensor_suffix(tensor->name) != "token_embd";
+        if (cut_candidate) {
+            const auto rows = elastic::granularity_partition_rows(
+                tensor->ne[1], granularity.cut_parts, 64);
+            if (!rows.empty()) {
+                const size_t row_bytes = tensor->nb[1];
+                const int original_slot = extra_orig->ctx_slot;
+                cl_mem original_parent = extra_orig->data_device;
+                if (original_slot >= 0 && (size_t) original_slot < cut_bctx->buffer.size()) {
+                    cut_bctx->buffer[original_slot] = nullptr;
+                }
+                extra_orig->reset();
+                if (original_parent) CL_CHECK(clReleaseMemObject(original_parent));
+
+                std::vector<elastic_q4_cut_part> cut_parts;
+                cut_parts.reserve(rows.size());
+                for (const auto & row : rows) {
+                    const size_t byte_offset = (size_t) row.row_start * row_bytes;
+                    const size_t part_bytes = (size_t) row.row_count * row_bytes;
+                    cl_int part_err = CL_SUCCESS;
+                    cl_mem part_parent = clCreateBuffer(
+                        context, CL_MEM_READ_WRITE, part_bytes, nullptr, &part_err);
+                    CL_CHECK(part_err);
+
+                    const int part_slot = (int) cut_bctx->buffer.size();
+                    cut_bctx->buffer.push_back(part_parent);
+                    cut_bctx->wbm_idx_per_slot.push_back(-1);
+                    ggml_tensor_extra_cl * part_orig =
+                        cut_bctx->ggml_opencl_alloc_temp_tensor_extra();
+                    part_orig->data_device = part_parent;
+                    part_orig->offset = 0;
+                    part_orig->actual_size = part_bytes;
+                    part_orig->ctx_slot = part_slot;
+
+                    ggml_tensor part_tensor = *tensor;
+                    part_tensor.ne[1] = row.row_count;
+                    part_tensor.ne[2] = 1;
+                    part_tensor.ne[3] = 1;
+                    part_tensor.nb[2] = part_tensor.nb[1] * (size_t) part_tensor.ne[1];
+                    part_tensor.nb[3] = part_tensor.nb[2];
+                    part_tensor.view_src = nullptr;
+                    part_tensor.view_offs = 0;
+                    part_tensor.data = const_cast<unsigned char *>(
+                        static_cast<const unsigned char *>(data) + byte_offset);
+                    part_tensor.extra = part_orig;
+
+                    s_registering_cut_part = true;
+                    ggml_backend_opencl_buffer_set_tensor(
+                        buffer, &part_tensor, part_tensor.data, 0, part_bytes);
+                    s_registering_cut_part = false;
+
+                    auto * part_extra =
+                        (ggml_tensor_extra_cl_q4_0 *) part_tensor.extra;
+                    GGML_ASSERT(part_extra && part_extra->wbm_idx >= 0);
+                    cut_parts.push_back({row.row_start, row.row_count,
+                                         byte_offset, part_bytes,
+                                         part_extra, part_extra->wbm_idx});
+                }
+
+                auto * state = ggml_opencl_elastic();
+                state->q4_cut_parts[tensor] = cut_parts;
+                state->granularity_cut_tensors += 1;
+                state->granularity_cut_parts += cut_parts.size();
+                tensor->extra = cut_parts.front().extra;
+                return;
+            }
+        }
+
         // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
         ggml_tensor_extra_cl_q4_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_0();
@@ -6324,50 +9129,33 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_command_queue cap_q = queue;
 
             auto evict_fn = [octx, cap_extra, cap_q, nbytes]() -> int {
+                // Pool ownership can change concurrently with the async layout
+                // worker. Protect only pool bookkeeping; do not serialize
+                // eviction against the later transfer/convert work.
+                std::lock_guard<std::mutex> pool_guard(octx->soa_pool_mtx);
                 int idx = cap_extra->wbm_idx;
+                if (cap_extra->reset_owned_images()) {
+                    ggml_opencl_elastic()->cut_dual_image_releases++;
+                }
                 // SOA pool: parent + d + q 一起入池，不 reset extra (sub-buffer 还活着)
                 if (octx->retain_cl_mem && cap_extra->parent_buffer) {
-                    // pool cap 满则 FIFO 释放最老的 entry (跟 size pool 共用 cached_bytes)
-                    if (octx->cache_byte_limit > 0) {
-                        while (octx->cached_bytes + nbytes > octx->cache_byte_limit &&
-                               !octx->retain_order_sizes.empty()) {
-                            size_t old_sz = octx->retain_order_sizes.front();
-                            octx->retain_order_sizes.pop_front();
-                            auto pit = octx->soa_pool_by_size.find(old_sz);
-                            if (pit != octx->soa_pool_by_size.end() && !pit->second.empty()) {
-                                auto e = pit->second.back(); pit->second.pop_back();
-                                if (e.ready_event) {
-                                    cl_event ready = (cl_event) e.ready_event;
-                                    clWaitForEvents(1, &ready);
-                                    clReleaseEvent(ready);
-                                }
-                                if (e.q) clReleaseMemObject((cl_mem)e.q);
-                                if (e.d) clReleaseMemObject((cl_mem)e.d);
-                                if (e.parent) {
-                                    s_soa_pooled_parents.erase((cl_mem)e.parent);
-                                    clReleaseMemObject((cl_mem)e.parent);
-                                }
-                                octx->n_releases += 3;
-                                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-                            } else {
-                                // 也可能是普通 size pool 的 entry
-                                auto sit = octx->retained_buffers_by_size.find(old_sz);
-                                if (sit != octx->retained_buffers_by_size.end() && !sit->second.empty()) {
-                                    cl_mem ob = (cl_mem)sit->second.back(); sit->second.pop_back();
-                                    clReleaseMemObject(ob);
-                                    octx->n_releases += 1;
-                                    octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-                                }
-                            }
-                        }
-                    }
+                    // SOA triples and ordinary cl_mem entries share one byte
+                    // cap/FIFO, so trimming must use the unified helper.
+                    elastic::wbmcl_retain_pool_trim_locked(octx, nbytes);
                     elastic::soa_pool_entry e;
                     e.parent = cap_extra->parent_buffer;
                     e.d      = cap_extra->d;
                     e.q      = cap_extra->q;
+                    // A pooled parent and its q/d sub-buffers may still be
+                    // referenced by commands already queued for compute.
+                    // Record a completion marker before making the entry
+                    // reusable; otherwise a later reload can release the old
+                    // sub-buffers while clCreateImage is using them and the
+                    // driver reports CL_INVALID_MEM_OBJECT.  Unsafe immediate
+                    // reuse remains available only as an explicit diagnostic.
                     static const bool s_defer_reuse = []() {
                         const char *defer = std::getenv("GGML_ELASTIC_EVICT_DEFER_REUSE");
-                        return defer && *defer && *defer != '0';
+                        return !(defer && *defer == '0');
                     }();
                     if (s_defer_reuse) {
                         cl_event ready = nullptr;
@@ -6377,7 +9165,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     }
                     // double-evict 检测: 该 parent 已在 pool 里? (= bug: 它仍被某 resident
                     // tensor 使用却被当成可复用) → 跳过 push 避免 double-handout。
-                    if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
+                    if (!octx->soa_pooled_parents.insert({e.parent, 1}).second) {
                         bool actually_in_pool = false;
                         auto pit = octx->soa_pool_by_size.find(nbytes);
                         if (pit != octx->soa_pool_by_size.end()) {
@@ -6389,7 +9177,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             }
                         }
                         if (actually_in_pool) {
-                            s_soa_double_evict++;
+                            octx->soa_double_evict++;
                             std::fprintf(stderr, "[soa-pool] DOUBLE-EVICT parent=%p idx=%d (already pooled, skip)\n",
                                          (void*)e.parent, idx);
                             // 不重复入池; 但仍需 mark_evicted + 清 extra 指针
@@ -6401,8 +9189,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         // was released while trimming the cache and the driver
                         // later reused the same cl_mem handle value. Recover the
                         // set and keep this resident buffer eligible for reuse.
-                        s_soa_pooled_parents.erase((cl_mem)e.parent);
-                        s_soa_pooled_parents.insert({(cl_mem)e.parent, 1});
+                        octx->soa_pooled_parents.erase(e.parent);
+                        octx->soa_pooled_parents.insert({e.parent, 1});
                     }
                     octx->soa_pool_by_size[nbytes].push_back(e);
                     octx->retain_order_sizes.push_back(nbytes);
@@ -6436,6 +9224,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     elastic::wbmcl_record_stage_detail(octx, kind, detail_now_us() - t0, bytes);
                 };
                 std::lock_guard<std::mutex> staging_guard(octx->soa_staging_mtx);
+                std::unique_lock<std::mutex> pool_guard(octx->soa_pool_mtx);
                 // 诊断: GGML_ELASTIC_POOL_SYNC=1 → reload 前 drain compute queue,
                 // 确保被复用 buffer 上任何 in-flight GPU op 已完成 (验证 use-after-evict race)。
                 static const bool s_pool_sync = []() {
@@ -6465,7 +9254,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             clReleaseEvent(ready);
                         }
                         new_parent     = (cl_mem)e.parent;
-                        s_soa_pooled_parents.erase((cl_mem)e.parent);   // 出池
+                        octx->soa_pooled_parents.erase(e.parent);   // 出池
                         // 默认只复用 parent, q/d sub-buffer 每次 reload 重建。
                         // OP12/Adreno 在 dynamic plan 切换后复用旧 sub-buffer
                         // 偶发 CL_INVALID_MEM_OBJECT; GGML_ELASTIC_POOL_PARENT_ONLY=0
@@ -6507,6 +9296,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
                     cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
                 }
+                pool_guard.unlock();
                 // 诊断 GGML_ELASTIC_POOL_COHERE=1: 复用 parent 时 convert 前 clEnqueueFillBuffer
                 // 全写一遍, 逼 driver 重置该 cl_mem 残留的 image-aliasing 状态。
                 static const bool s_pool_cohere = []() {
@@ -7011,40 +9801,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_command_queue cap_q = queue;
 
             auto evict_fn = [octx, cap_extra, cap_q, nbytes]() -> int {
+                std::lock_guard<std::mutex> pool_guard(octx->soa_pool_mtx);
                 int idx = cap_extra->wbm_idx;
                 if (octx->retain_cl_mem && cap_extra->parent_buffer) {
-                    if (octx->cache_byte_limit > 0) {
-                        while (octx->cached_bytes + nbytes > octx->cache_byte_limit &&
-                               !octx->retain_order_sizes.empty()) {
-                            size_t old_sz = octx->retain_order_sizes.front();
-                            octx->retain_order_sizes.pop_front();
-                            auto pit = octx->soa_pool_by_size.find(old_sz);
-                            if (pit != octx->soa_pool_by_size.end() && !pit->second.empty()) {
-                                auto e = pit->second.back(); pit->second.pop_back();
-                                if (e.ready_event) {
-                                    cl_event ready = (cl_event) e.ready_event;
-                                    clWaitForEvents(1, &ready);
-                                    clReleaseEvent(ready);
-                                }
-                                if (e.q) clReleaseMemObject((cl_mem)e.q);
-                                if (e.d) clReleaseMemObject((cl_mem)e.d);
-                                if (e.parent) {
-                                    s_soa_pooled_parents.erase((cl_mem)e.parent);
-                                    clReleaseMemObject((cl_mem)e.parent);
-                                }
-                                octx->n_releases += 3;
-                                octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-                            } else {
-                                auto sit = octx->retained_buffers_by_size.find(old_sz);
-                                if (sit != octx->retained_buffers_by_size.end() && !sit->second.empty()) {
-                                    cl_mem ob = (cl_mem)sit->second.back(); sit->second.pop_back();
-                                    clReleaseMemObject(ob);
-                                    octx->n_releases += 1;
-                                    octx->cached_bytes -= std::min(octx->cached_bytes, old_sz);
-                                }
-                            }
-                        }
-                    }
+                    elastic::wbmcl_retain_pool_trim_locked(octx, nbytes);
                     elastic::soa_pool_entry e;
                     e.parent = cap_extra->parent_buffer;
                     e.d      = cap_extra->d;
@@ -7056,7 +9816,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (clEnqueueMarkerWithWaitList(cap_q, 0, nullptr, &ready) == CL_SUCCESS && ready) {
                         e.ready_event = ready;
                     }
-                    if (!s_soa_pooled_parents.insert({(cl_mem)e.parent, 1}).second) {
+                    if (!octx->soa_pooled_parents.insert({e.parent, 1}).second) {
                         bool actually_in_pool = false;
                         auto pit = octx->soa_pool_by_size.find(nbytes);
                         if (pit != octx->soa_pool_by_size.end()) {
@@ -7068,15 +9828,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                             }
                         }
                         if (actually_in_pool) {
-                            s_soa_double_evict++;
+                            octx->soa_double_evict++;
                             std::fprintf(stderr, "[soa-pool-q8] DOUBLE-EVICT parent=%p idx=%d (already pooled, skip)\n",
                                          (void*)e.parent, idx);
                             cap_extra->parent_buffer = nullptr; cap_extra->d = nullptr; cap_extra->q = nullptr;
                             elastic::wbm_mark_evicted(octx->wbm, idx);
                             return 0;
                         }
-                        s_soa_pooled_parents.erase((cl_mem)e.parent);
-                        s_soa_pooled_parents.insert({(cl_mem)e.parent, 1});
+                        octx->soa_pooled_parents.erase(e.parent);
+                        octx->soa_pooled_parents.insert({e.parent, 1});
                     }
                     octx->soa_pool_by_size[nbytes].push_back(e);
                     octx->retain_order_sizes.push_back(nbytes);
@@ -7106,6 +9866,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     elastic::wbmcl_record_stage_detail(octx, kind, detail_now_us() - t0, bytes);
                 };
                 std::lock_guard<std::mutex> staging_guard(octx->soa_staging_mtx);
+                std::unique_lock<std::mutex> pool_guard(octx->soa_pool_mtx);
                 uint64_t detail_t0 = detail_now_us();
                 cl_mem new_parent = nullptr;
                 bool soa_hit = false;
@@ -7133,7 +9894,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         }
                         new_parent = (cl_mem)e.parent;
                         parent_from_pool = true;
-                        s_soa_pooled_parents.erase((cl_mem)e.parent);
+                        octx->soa_pooled_parents.erase(e.parent);
                         static const bool s_parent_only = []() {
                             const char *e2 = std::getenv("GGML_ELASTIC_POOL_PARENT_ONLY");
                             return !(e2 && *e2 == '0');
@@ -7170,6 +9931,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 if (cap_extra->ctx_slot >= 0 && (size_t)cap_extra->ctx_slot < cap_bctx->buffer.size()) {
                     cap_bctx->buffer[cap_extra->ctx_slot] = new_parent;
                 }
+                pool_guard.unlock();
                 detail_t0 = detail_now_us();
                 cl_mem staging = ggml_opencl_elastic_get_staging(octx, cap_ctx, nbytes);
                 detail_record(elastic::wbmcl_stage_detail_kind::STAGING_ALLOC, detail_t0, nbytes);
@@ -7396,6 +10158,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (tensor && tensor->name[0]) {
                         std::lock_guard<std::mutex> lk(s->sched_mtx);
                         s->name_to_wbm[tensor->name] = idx;
+                        s->name_to_wbms[tensor->name].push_back(idx);
                         s->wbm_to_name[idx] = tensor->name;
                     }
                     if (tensor && tensor->name[0]) {
@@ -7441,8 +10204,12 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         return e ? std::string(e) : std::string("norm,k,v");
                     }();
                     auto contains = [&](const char *tok) {
-                        return pin_policy == "all" ||
-                               pin_policy.find(tok) != std::string::npos;
+                        if (pin_policy == "all") return true;
+                        const std::string delimited =
+                            "," + pin_policy + ",";
+                        return delimited.find(
+                            "," + std::string(tok) + ",") !=
+                            std::string::npos;
                     };
                     const std::string suffix = ggml_opencl_tensor_suffix(tensor->name);
                     bool should_pin = false;
@@ -7453,8 +10220,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     if (contains("v") && suffix == "attn_v") should_pin = true;
                     if (contains("q") && suffix == "attn_q") should_pin = true;
                     if (contains("o") && suffix == "attn_output") should_pin = true;
+                    if (contains("token_embd") &&
+                        suffix == "token_embd") should_pin = true;
+                    if (contains("output") &&
+                        suffix == "output") should_pin = true;
                     if (should_pin) {
                         elastic::wbm_set_pinned(&s->wbm, idx, true);
+                        if (suffix == "token_embd" ||
+                            suffix == "output") {
+                            GGML_LOG_INFO(
+                                "ggml_opencl elastic: pin %s inside "
+                                "weight budget (%.2f MiB)\n",
+                                suffix.c_str(),
+                                size / 1024.0 / 1024.0);
+                        }
                     }
 
                     // GGML_ELASTIC_EMBED_OUTSIDE_BUDGET=1：把 token_embd（501 MB
@@ -11602,7 +14381,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
     elastic_moe_q4_cache_view moe_cache_view;
     const bool use_moe_q4_cache = src0->type == GGML_TYPE_Q4_0 &&
-        ggml_opencl_prepare_moe_q4_cache(backend_ctx, src0, src2, offset2, &moe_cache_view);
+        ggml_opencl_prepare_moe_q4_cache(backend_ctx, src0, src2, offset2,
+                                         id_mask, extra_mask->data_device, offset_mask, mask_nb1,
+                                         &moe_cache_view);
     cl_mem expert_slots = use_moe_q4_cache ? moe_cache_view.route_slots : extra2->data_device;
     const int has_expert_slots = use_moe_q4_cache ? 1 : 0;
     const cl_ulong expert_slot_stride = use_moe_q4_cache ? moe_cache_view.slot_stride : 0;

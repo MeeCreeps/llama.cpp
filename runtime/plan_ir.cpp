@@ -172,6 +172,58 @@ bool plan_to_json_string(const ExecPlan & plan, std::string & out) {
     j["misc_bytes"]        = plan.misc_bytes;
     j["pred_per_token_ms"] = plan.pred_per_token_ms;
     j["bottleneck"]        = plan.bottleneck;
+    if (plan.working_unit.enabled) {
+        json jwu = {
+            {"enabled",        true},
+            {"mode",           plan.working_unit.mode},
+            {"cut_parts",      plan.working_unit.cut_parts},
+            {"multi_tensors",  plan.working_unit.multi_tensors},
+            {"policy",         plan.working_unit.policy},
+            {"state_aware",    plan.working_unit.state_aware},
+            {"predicted_ms",   plan.working_unit.predicted_ms},
+            {"switch_cost_ms", plan.working_unit.switch_cost_ms},
+        };
+        if (!plan.working_unit.units.empty()) {
+            jwu["units"] = json::array();
+            for (const auto & unit : plan.working_unit.units) {
+                json ju = {
+                    {"unit_id", unit.unit_id},
+                    {"fuse_layout", unit.fuse_layout},
+                    {"fuse_compute", unit.fuse_compute},
+                    {"tiles", json::array()},
+                };
+                for (const auto & tile : unit.tiles) {
+                    ju["tiles"].push_back({
+                        {"weight_id", tile.weight_id},
+                        {"weight_name", tile.weight_name},
+                        {"row_start", tile.row_start},
+                        {"row_count", tile.row_count},
+                        {"byte_offset", tile.byte_offset},
+                        {"byte_size", tile.byte_size},
+                    });
+                }
+                jwu["units"].push_back(std::move(ju));
+            }
+        }
+        j["working_unit"] = std::move(jwu);
+    }
+    if (!plan.working_sets.empty()) {
+        json jws = json::array();
+        for (const auto & ws : plan.working_sets) {
+            jws.push_back({
+                {"name",            ws.name},
+                {"kind",            ws.kind},
+                {"target_capacity", ws.target_capacity},
+                {"budget_capacity", ws.budget_capacity},
+                {"min_capacity",    ws.min_capacity},
+                {"max_capacity",    ws.max_capacity},
+                {"policy",          ws.policy},
+                {"state_aware",     ws.state_aware},
+                {"coupled_to_core", ws.coupled_to_core},
+            });
+        }
+        j["working_sets"] = std::move(jws);
+    }
     if (!plan.schedule_kind.empty() || !plan.schedule_events.empty()) {
         json js;
         js["kind"]         = plan.schedule_kind;
@@ -268,10 +320,75 @@ bool plan_from_json_string(const std::string & s, ExecPlan & out, std::string * 
         out.misc_bytes        = j.value("misc_bytes", (size_t) 0);
         out.pred_per_token_ms = j.value("pred_per_token_ms", 0.0);
         out.bottleneck        = j.value("bottleneck", std::string());
+        if (j.contains("working_unit") && j["working_unit"].is_object()) {
+            const auto & wu = j["working_unit"];
+            out.working_unit.enabled =
+                wu.value("enabled", true);
+            out.working_unit.mode =
+                wu.value("mode", std::string("tensor"));
+            out.working_unit.cut_parts =
+                std::max(2, wu.value("cut_parts", 2));
+            out.working_unit.multi_tensors =
+                std::max(2, wu.value("multi_tensors", 2));
+            out.working_unit.policy =
+                wu.value("policy", std::string());
+            out.working_unit.state_aware =
+                wu.value("state_aware", false);
+            out.working_unit.predicted_ms =
+                wu.value("predicted_ms", 0.0);
+            out.working_unit.switch_cost_ms =
+                wu.value("switch_cost_ms", 0.0);
+            for (const auto & ju :
+                 wu.value("units", json::array())) {
+                SuperTensorUnitPlan unit;
+                unit.unit_id = ju.value(
+                    "unit_id",
+                    (int) out.working_unit.units.size());
+                unit.fuse_layout =
+                    ju.value("fuse_layout", false);
+                unit.fuse_compute =
+                    ju.value("fuse_compute", false);
+                for (const auto & jt :
+                     ju.value("tiles", json::array())) {
+                    WorkingUnitTilePlan tile;
+                    tile.weight_id =
+                        jt.value("weight_id", -1);
+                    tile.weight_name =
+                        jt.value("weight_name", std::string());
+                    tile.row_start =
+                        jt.value("row_start", (int64_t) 0);
+                    tile.row_count =
+                        jt.value("row_count", (int64_t) -1);
+                    tile.byte_offset =
+                        jt.value("byte_offset", (size_t) 0);
+                    tile.byte_size =
+                        jt.value("byte_size", (size_t) 0);
+                    unit.tiles.push_back(std::move(tile));
+                }
+                if (!unit.tiles.empty()) {
+                    out.working_unit.units.push_back(
+                        std::move(unit));
+                }
+            }
+        }
+        for (const auto & jws : j.value("working_sets", json::array())) {
+            WorkingSetPlan ws;
+            ws.name            = jws.value("name", std::string());
+            ws.kind            = jws.value("kind", std::string());
+            ws.target_capacity = jws.value("target_capacity", -1);
+            ws.budget_capacity = jws.value("budget_capacity", ws.target_capacity);
+            ws.min_capacity    = jws.value("min_capacity", 0);
+            ws.max_capacity    = jws.value("max_capacity", -1);
+            ws.policy          = jws.value("policy", std::string());
+            ws.state_aware     = jws.value("state_aware", false);
+            ws.coupled_to_core = jws.value("coupled_to_core", false);
+            out.working_sets.push_back(std::move(ws));
+        }
         if (j.contains("schedule") && j["schedule"].is_object()) {
             const auto & js = j["schedule"];
             out.schedule_kind         = js.value("kind", std::string());
-            out.schedule_status       = js.value("status", std::string());
+            out.schedule_status       = (js.contains("status") and js["status"].is_string())
+                                      ? js["status"].get<std::string>() : std::string();
             out.schedule_objective_ms = (js.contains("objective_ms") and not js["objective_ms"].is_null())
                                       ? js["objective_ms"].get<double>() : 0.0;
             for (const auto & je : js.value("events", json::array())) {
@@ -376,6 +493,57 @@ bool plan_from_make_plan_file(const std::string & path, ExecPlan & out, std::str
         out.budget_mib        = (int64_t) llround(j.value("budget_mib", 0.0));
         out.pred_per_token_ms = j.value("per_token_ms", 0.0);
         out.bottleneck        = j.value("bottleneck", std::string());
+        if (j.contains("working_unit") && j["working_unit"].is_object()) {
+            const auto & wu = j["working_unit"];
+            out.working_unit.enabled =
+                wu.value("enabled", true);
+            out.working_unit.mode =
+                wu.value("mode", std::string("tensor"));
+            out.working_unit.cut_parts =
+                std::max(2, wu.value("cut_parts", 2));
+            out.working_unit.multi_tensors =
+                std::max(2, wu.value("multi_tensors", 2));
+            out.working_unit.policy =
+                wu.value("policy", std::string());
+            out.working_unit.state_aware =
+                wu.value("state_aware", false);
+            out.working_unit.predicted_ms =
+                wu.value("predicted_ms", 0.0);
+            out.working_unit.switch_cost_ms =
+                wu.value("switch_cost_ms", 0.0);
+            for (const auto & ju :
+                 wu.value("units", json::array())) {
+                SuperTensorUnitPlan unit;
+                unit.unit_id = ju.value(
+                    "unit_id",
+                    (int) out.working_unit.units.size());
+                unit.fuse_layout =
+                    ju.value("fuse_layout", false);
+                unit.fuse_compute =
+                    ju.value("fuse_compute", false);
+                for (const auto & jt :
+                     ju.value("tiles", json::array())) {
+                    WorkingUnitTilePlan tile;
+                    tile.weight_id =
+                        jt.value("weight_id", -1);
+                    tile.weight_name =
+                        jt.value("weight_name", std::string());
+                    tile.row_start =
+                        jt.value("row_start", (int64_t) 0);
+                    tile.row_count =
+                        jt.value("row_count", (int64_t) -1);
+                    tile.byte_offset =
+                        jt.value("byte_offset", (size_t) 0);
+                    tile.byte_size =
+                        jt.value("byte_size", (size_t) 0);
+                    unit.tiles.push_back(std::move(tile));
+                }
+                if (!unit.tiles.empty()) {
+                    out.working_unit.units.push_back(
+                        std::move(unit));
+                }
+            }
+        }
 
         // 1) 先用 resident_in_memory 决定每个 weight 的 location(gpu/cpu);
         //    其余出现在 routes 里、但不常驻的 → DISK(流式)。

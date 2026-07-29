@@ -126,6 +126,12 @@ struct wbm_opencl_ctx {
     // SOA: per-idx 回调 + 按 size 复用 parent+d+q triple + 共享 staging buffer.
     std::unordered_map<int, soa_callbacks>             soa_per_idx;
     std::unordered_map<size_t, std::vector<soa_pool_entry>> soa_pool_by_size;
+    // Diagnostic ownership set for SOA parents currently held by the pool.
+    // Keep it in octx (rather than a translation-unit static) so the async
+    // workers are joined before this container is destroyed.
+    std::unordered_map<void *, char> soa_pooled_parents;
+    uint64_t                         soa_double_evict = 0;
+    std::mutex                       soa_pool_mtx;
     cl_mem            soa_staging          = nullptr;
     size_t            soa_staging_capacity = 0;
     cl_event          soa_staging_last_use_ev = nullptr;
@@ -161,12 +167,18 @@ struct wbm_opencl_ctx {
     bool async_load_shutdown = false;
     std::mutex async_load_mtx;
     std::condition_variable async_load_cv;
-    std::deque<int> async_load_queue;
+    // Queue one complete logical working unit at a time.  Keeping the tensor
+    // indices together is what makes Multi different from two Tensor tasks in
+    // the real pipeline (the worker publishes unit completion only after all
+    // members have completed).
+    std::deque<std::vector<int>> async_load_queue;
     std::unordered_map<int, int> async_load_state;
     std::unordered_map<int, size_t> async_load_bytes_by_idx;
     std::thread async_load_worker;
     uint64_t async_load_enqueued = 0;
     uint64_t async_load_completed = 0;
+    uint64_t async_load_units_enqueued = 0;
+    uint64_t async_load_units_completed = 0;
     uint64_t async_load_waits = 0;
     uint64_t async_load_wait_us = 0;
     size_t   async_load_pending_bytes = 0;
@@ -180,12 +192,16 @@ struct wbm_opencl_ctx {
     // submit the existing SOA reload callback at a TRANSFER anchor and let the
     // eventual XFORM/compute consumer wait only if it catches up.
     bool async_soa_reload_worker_started = false;
+    bool async_soa_reload_shutdown = false;
     std::mutex async_soa_reload_mtx;
     std::condition_variable async_soa_reload_cv;
-    std::deque<int> async_soa_reload_queue;
+    std::deque<std::vector<int>> async_soa_reload_queue;
     std::unordered_map<int, int> async_soa_reload_state; // 1=queued/running, 2=ok, <0=failed
+    std::thread async_soa_reload_worker;
     uint64_t async_soa_reload_enqueued = 0;
     uint64_t async_soa_reload_completed = 0;
+    uint64_t async_soa_reload_units_enqueued = 0;
+    uint64_t async_soa_reload_units_completed = 0;
     uint64_t async_soa_reload_waits = 0;
     uint64_t async_soa_reload_wait_us = 0;
 
@@ -214,6 +230,16 @@ struct wbm_opencl_ctx {
     uint64_t stage_xform_ok    = 0;
     uint64_t stage_xform_us    = 0;
     size_t   stage_xform_bytes = 0;
+
+    // Complete SOA PREPARE service measured around the real materialization
+    // callback.  The callback also resolves its host source; when detailed
+    // stage timing is enabled, HOST_SRC is subtracted so disk/staging LOAD is
+    // not charged to layout preparation a second time.
+    std::mutex soa_prepare_stats_mtx;
+    uint64_t soa_prepare_calls = 0;
+    uint64_t soa_prepare_ok    = 0;
+    uint64_t soa_prepare_us    = 0;
+    size_t   soa_prepare_bytes = 0;
 
     uint64_t soa_pool_hit       = 0;
     uint64_t soa_pool_miss      = 0;
@@ -260,6 +286,11 @@ void wbmcl_record_stage_detail(wbm_opencl_ctx *octx,
                                uint64_t us,
                                size_t bytes);
 void wbmcl_dump_stage_detail(wbm_opencl_ctx *octx, FILE *out);
+void wbmcl_get_soa_prepare_state(wbm_opencl_ctx *octx,
+                                 uint64_t *calls,
+                                 uint64_t *ok,
+                                 uint64_t *us,
+                                 size_t *bytes);
 
 // 阻塞确保 block idx 驻留：
 //   - 已驻留 → no-op，返回 0
@@ -284,12 +315,25 @@ int  wbmcl_prefetch(wbm_opencl_ctx *octx, int idx);
 // 旧 ensure_resident 仍是完整兼容路径。
 int  wbmcl_load_host(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_load_host_async(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_load_host_async_unit(wbm_opencl_ctx *octx,
+                                const int *indices, size_t n_indices);
 int  wbmcl_wait_host_load(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_reload_soa_sync(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_transfer_soa_sync(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_xform_soa_sync(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_soa_reload_async(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_soa_reload_async_unit(wbm_opencl_ctx *octx,
+                                 const int *indices, size_t n_indices);
 int  wbmcl_wait_soa_reload(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_prepare_backend(wbm_opencl_ctx *octx, int idx);
+int  wbmcl_prepare_backend_unit(wbm_opencl_ctx *octx,
+                                const int *indices, size_t n_indices);
 int  wbmcl_dma_to_backend(wbm_opencl_ctx *octx, int idx);
 int  wbmcl_transform_backend(wbm_opencl_ctx *octx, int idx);
+// Wait until the host LOAD and SOA PREPARE queues contain no queued or
+// in-flight work. This does not stop the persistent workers and is intended
+// only for measurement boundaries, never per graph/token.
+void wbmcl_wait_async_idle(wbm_opencl_ctx *octx);
 
 // 真正的异步 prefetch：在 xfer_queue 上发非阻塞 clEnqueueWriteBuffer，把 write
 // 的 cl_event 存到 block_meta::prefetch_event。block 此时 backend_handle 已分配
@@ -314,7 +358,12 @@ int  wbmcl_evict_batch(wbm_opencl_ctx *octx,
 // 取 idx 的 cl_mem（已驻留返回非空；未驻留返回 nullptr）
 cl_mem wbmcl_get_buffer(const wbm_opencl_ctx *octx, int idx);
 
+// Caller holds octx->soa_pool_mtx. Trim the unified retained-buffer FIFO,
+// including both ordinary cl_mem entries and SOA parent+d+q triples.
+void wbmcl_retain_pool_trim_locked(wbm_opencl_ctx *octx, size_t incoming_bytes);
+
 // 收尾：把还驻留的 block 全 evict 掉，释放未消费的 event。
+void wbmcl_stop_async_workers(wbm_opencl_ctx *octx);
 void wbmcl_shutdown(wbm_opencl_ctx *octx);
 
 }  // namespace elastic

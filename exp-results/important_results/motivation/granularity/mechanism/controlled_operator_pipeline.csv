@@ -1,0 +1,5 @@
+weight_budget_mib,resident_ratio,multi_s,tensor_s,cut_s,fastest,evidence_scope
+216,0.25,4.357,4.748,4.319,cut,controlled_operator_pipeline_only
+432,0.50,3.061,3.389,3.314,multi,controlled_operator_pipeline_only
+648,0.75,1.718,2.063,2.245,multi,controlled_operator_pipeline_only
+864,1.00,0.401,0.676,1.217,multi,controlled_operator_pipeline_only
